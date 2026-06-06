@@ -1,0 +1,17 @@
+{
+  "name": "@pockly/relay",
+  "private": false,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PocklyApp/Pockly.git",
+    "directory": "relay"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "validate": "node --test"
+  },
+  "devDependencies": {}
+}

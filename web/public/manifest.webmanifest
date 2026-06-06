@@ -1,0 +1,18 @@
+{
+  "name": "Pockly",
+  "short_name": "Pockly",
+  "description": "Remote companion for Claude Code and Codex sessions.",
+  "start_url": "/sessions",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f7f7f2",
+  "theme_color": "#050505",
+  "icons": [
+    {
+      "src": "/pockly-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

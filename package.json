@@ -1,0 +1,25 @@
+{
+  "name": "pockly",
+  "version": "0.1.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PocklyApp/Pockly.git"
+  },
+  "type": "module",
+  "workspaces": [
+    "web",
+    "relay"
+  ],
+  "scripts": {
+    "test": "npm --workspace relay test && npm --workspace web test",
+    "web:dev": "npm --workspace web run dev",
+    "web:build": "npm --workspace web run build",
+    "web:typecheck": "npm --workspace web run typecheck",
+    "relay:test": "npm --workspace relay test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

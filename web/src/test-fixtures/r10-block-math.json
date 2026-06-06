@@ -1,0 +1,23 @@
+{
+  "name": "r10-block-math",
+  "session": {
+    "session_id": "fx-r10-block",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r10-block",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "text": "Pythagoras: $$a^2 + b^2 = c^2$$\n\nAnd inline: the slope \\(m\\) is rise over run."
+      }
+    }
+  ]
+}

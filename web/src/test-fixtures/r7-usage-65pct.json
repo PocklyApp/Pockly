@@ -1,0 +1,25 @@
+{
+  "name": "r7-usage-65pct",
+  "session": {
+    "session_id": "fx-r7-65",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r7-65",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "text": "hi",
+        "input_tokens": 130000,
+        "output_tokens": 100
+      }
+    }
+  ]
+}

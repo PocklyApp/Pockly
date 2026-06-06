@@ -1,0 +1,24 @@
+{
+  "name": "r3-bash",
+  "session": {
+    "session_id": "fx-r3-bash",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r3-bash",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "tool": "Bash",
+        "input": { "command": "ls -la /tmp", "description": "list files" }
+      }
+    }
+  ]
+}

@@ -1,0 +1,38 @@
+{
+  "name": "r5-question-multi",
+  "session": {
+    "session_id": "fx-r5-q-m",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r5-q-m",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "tool": "AskUserQuestion",
+        "input": {
+          "questions": [
+            {
+              "question": "Which to enable",
+              "header": "Features",
+              "multiSelect": true,
+              "options": [
+                { "label": "Alpha", "description": "" },
+                { "label": "Beta",  "description": "" },
+                { "label": "Gamma", "description": "" },
+                { "label": "Delta", "description": "" }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
