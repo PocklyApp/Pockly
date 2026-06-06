@@ -9,31 +9,33 @@ workerd self-hosting, and other edge runtimes through platform bindings.
 
 ## Current Scope
 
-Implemented in this scaffold:
+Implemented:
 
 - `GET /healthz`
 - `GET /api/runtime`
+- web auth/session basics: dev login, session lookup, logout
+- browser device registration plus Ed25519 device challenge verification
+- daemon login-code binding, daemon device auth, remote-access flag updates
+- daemon catalog/turn sync for `claude-code` and `codex`
+- session catalog, session turns, device list, and host presence reads
+- D1-compatible schema for account, device, computer, session, and turn metadata
+- in-memory store for credential-free contract tests and local development
 - method-safe JSON error responses
-- `UserRuntimeDO` placeholder for per-user/session state sharding.
-- initial D1-compatible schema for account/session metadata.
-- credential-free Node tests for the current contract surface
 
 Not implemented yet:
 
-- auth/session issuance
 - daemon control WebSocket
 - browser realtime
-- encrypted turn sync
 - push/STT/release object storage integration
 
 `/api/runtime` only advertises capabilities that are explicitly enabled via
 environment flags. The scaffold defaults realtime, terminal, Web Push, STT, and
-release updates to `false` until those paths are implemented.
+release updates to `false` until those paths are implemented. HTTP catalog sync
+and session reads are available even when realtime is disabled.
 
 ## Local Validation
 
 ```bash
-cd cloudflare
 npm test
 ```
 
