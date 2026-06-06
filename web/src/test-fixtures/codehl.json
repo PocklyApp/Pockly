@@ -1,0 +1,118 @@
+{
+  "name": "codehl",
+  "session": {
+    "session_id": "fx-codehl",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/Users/me/proj",
+    "last_timestamp": "2026-06-03T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "user_message",
+      "timestamp": "2026-06-03T00:00:00Z",
+      "payload": { "text": "Read PairingService.ts and add a guard that rejects an empty deviceId." }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 2,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-06-03T00:00:01Z",
+      "payload": { "text": "Let me read the file first." }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 3,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-06-03T00:00:02Z",
+      "payload": { "tool": "Read", "id": "tu-read-ts", "input": { "file_path": "/Users/me/proj/src/pairing/PairingService.ts" } }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 4,
+      "agent": "claude-code",
+      "kind": "tool_result",
+      "timestamp": "2026-06-03T00:00:03Z",
+      "payload": {
+        "id": "tu-read-ts",
+        "has_result": true,
+        "result": "1\timport { DeviceKeyStore } from \"./DeviceKeyStore\";\n2\timport { PairRequest, PairResult } from \"./types\";\n3\timport { MissingKeyError } from \"./errors\";\n4\t\n5\t// Exchanges a paired device's key for a session token.\n6\texport class PairingService {\n7\t  private static keys = new DeviceKeyStore();\n8\t  private readonly maxAttempts = 3;\n9\t\n10\t  async pair(req: PairRequest): Promise<PairResult> {\n11\t    const key = PairingService.keys.lookup(req.deviceId);\n12\t    if (!key) {\n13\t      throw new MissingKeyError(req.deviceId);\n14\t    }\n15\t    return this.exchange(req, key);\n16\t  }\n17\t}\n"
+      }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 5,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-06-03T00:00:04Z",
+      "payload": { "text": "Now I'll add the guard at the top of `pair()`." }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 6,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-06-03T00:00:05Z",
+      "payload": {
+        "tool": "Edit",
+        "id": "tu-edit-ts",
+        "input": {
+          "file_path": "/Users/me/proj/src/pairing/PairingService.ts",
+          "old_string": "  async pair(req: PairRequest): Promise<PairResult> {\n    const key = PairingService.keys.lookup(req.deviceId);\n    if (!key) {\n      throw new MissingKeyError(req.deviceId);\n    }\n    return this.exchange(req, key);\n  }",
+          "new_string": "  async pair(req: PairRequest): Promise<PairResult> {\n    if (!req.deviceId) {\n      throw new InvalidRequestError(\"deviceId is required\");\n    }\n    const key = PairingService.keys.lookup(req.deviceId);\n    if (!key) {\n      throw new MissingKeyError(req.deviceId);\n    }\n    // re-auth is bound to the device before we exchange the key\n    return this.exchange(req, key);\n  }"
+        }
+      }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 7,
+      "agent": "claude-code",
+      "kind": "tool_result",
+      "timestamp": "2026-06-03T00:00:06Z",
+      "payload": { "id": "tu-edit-ts", "has_result": true, "result": "The file has been updated." }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 8,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-06-03T00:00:07Z",
+      "payload": { "text": "I also tweaked the stylesheet — here's the current rule:" }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 9,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-06-03T00:00:08Z",
+      "payload": { "tool": "Read", "id": "tu-read-css", "input": { "file_path": "/Users/me/proj/src/styles.css" } }
+    },
+    {
+      "session_id": "fx-codehl",
+      "device_id": "fx-device",
+      "seq": 10,
+      "agent": "claude-code",
+      "kind": "tool_result",
+      "timestamp": "2026-06-03T00:00:09Z",
+      "payload": {
+        "id": "tu-read-css",
+        "has_result": true,
+        "result": "42\t.code-view {\n43\t  display: flex;\n44\t  background: var(--code-bg); /* themed */\n45\t  border-radius: 8px;\n46\t  font-size: 12.5px;\n47\t}\n"
+      }
+    }
+  ]
+}

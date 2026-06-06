@@ -1,0 +1,23 @@
+{
+  "name": "r10-currency-only",
+  "session": {
+    "session_id": "fx-r10-cur",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r10-cur",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "text": "Costs about $5 and saves you $100 every month — no math here."
+      }
+    }
+  ]
+}

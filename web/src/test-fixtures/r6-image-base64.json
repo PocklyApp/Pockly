@@ -1,0 +1,24 @@
+{
+  "name": "r6-image-base64",
+  "session": {
+    "session_id": "fx-r6-img",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r6-img",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "image",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "image_media_type": "image/png",
+        "image_data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "r4-plan-pending",
+  "session": {
+    "session_id": "fx-r4-plan-p",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r4-plan-p",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "tool": "ExitPlanMode",
+        "input": {
+          "plan": "## Step 1\n\nFirst do the thing.\n\n## Step 2\n\nThen do the next thing.\n\n- bullet a\n- bullet b\n"
+        }
+      }
+    }
+  ]
+}

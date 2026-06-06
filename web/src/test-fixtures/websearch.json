@@ -1,0 +1,56 @@
+{
+  "name": "websearch",
+  "session": {
+    "session_id": "fx-websearch",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-websearch",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "user_message",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": { "text": "搜一下 open-design 这个开源项目" }
+    },
+    {
+      "session_id": "fx-websearch",
+      "device_id": "fx-device",
+      "seq": 2,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": {
+        "tool": "WebSearch",
+        "id": "ws-1",
+        "input": { "query": "open-design open source project" }
+      }
+    },
+    {
+      "session_id": "fx-websearch",
+      "device_id": "fx-device",
+      "seq": 3,
+      "agent": "claude-code",
+      "kind": "tool_result",
+      "timestamp": "2026-01-01T00:00:02Z",
+      "payload": {
+        "id": "ws-1",
+        "result": "Web search results for query: \"open-design open source project\"\n\nLinks: [{\"title\":\"nexu-io/open-design\",\"url\":\"https://github.com/nexu-io/open-design\"}]",
+        "has_result": true
+      }
+    },
+    {
+      "session_id": "fx-websearch",
+      "device_id": "fx-device",
+      "seq": 4,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:03Z",
+      "payload": { "text": "搜到了几个相关的开源项目，以下是其中最值得关注的。" }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "r7-usage-codex-danger",
+  "session": {
+    "session_id": "fx-r7-codex",
+    "device_id": "fx-device",
+    "agent": "codex",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r7-codex",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "codex",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "text": "...",
+        "input_tokens": 245000
+      }
+    }
+  ]
+}

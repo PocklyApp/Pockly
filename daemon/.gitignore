@@ -1,0 +1,24 @@
+# Build artifacts
+/bin/
+/dist/
+.local/
+/pockly-daemon
+/pockly-claude-wrapper
+/gen-password-hash
+*.exe
+*.test
+*.out
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local config (never commit secrets)
+*.local
+.env
+.env.*
+!.env.example
+
+.wrangler/

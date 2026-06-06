@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+bin/
+*.exe
+*.test
+*.out
+
+# Local runtime state
+.local/
+.wrangler/
+.mf/
+*.db
+*.db-shm
+*.db-wal
+
+# Test artifacts
+playwright-report/
+test-results/
+coverage/
+*.tsbuildinfo
+
+# Secrets and local configuration
+.env
+.env.*
+*.local
+.dev.vars
+wrangler.toml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

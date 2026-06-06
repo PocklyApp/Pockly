@@ -1,0 +1,71 @@
+{
+  "name": "r8-three-pending",
+  "session": {
+    "session_id": "fx-r8",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r8",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "attachment_type": "permission_request",
+        "permission_request_id": "req-1",
+        "permission_tool_name": "Bash",
+        "permission_decision": "pending",
+        "permission_daemon_device_id": "fx-device"
+      }
+    },
+    {
+      "session_id": "fx-r8",
+      "device_id": "fx-device",
+      "seq": 2,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": {
+        "attachment_type": "permission_request",
+        "permission_request_id": "req-2",
+        "permission_tool_name": "Read",
+        "permission_decision": "allow"
+      }
+    },
+    {
+      "session_id": "fx-r8",
+      "device_id": "fx-device",
+      "seq": 3,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:02Z",
+      "payload": {
+        "attachment_type": "permission_request",
+        "permission_request_id": "req-3",
+        "permission_tool_name": "Read",
+        "permission_decision": "pending",
+        "permission_daemon_device_id": "fx-device"
+      }
+    },
+    {
+      "session_id": "fx-r8",
+      "device_id": "fx-device",
+      "seq": 4,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:03Z",
+      "payload": {
+        "attachment_type": "permission_request",
+        "permission_request_id": "req-4",
+        "permission_tool_name": "Bash",
+        "permission_decision": "pending",
+        "permission_daemon_device_id": "fx-device"
+      }
+    }
+  ]
+}

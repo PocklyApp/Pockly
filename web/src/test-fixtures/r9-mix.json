@@ -1,0 +1,44 @@
+{
+  "name": "r9-mix",
+  "session": {
+    "session_id": "fx-r9",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r9",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "thinking",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": { "text": "internal thoughts that should be gateable" }
+    },
+    {
+      "session_id": "fx-r9",
+      "device_id": "fx-device",
+      "seq": 2,
+      "agent": "claude-code",
+      "kind": "tool_call",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": {
+        "tool": "mcp__notion__create_page",
+        "input": { "title": "hello" },
+        "has_result": true,
+        "result": "page created"
+      }
+    },
+    {
+      "session_id": "fx-r9",
+      "device_id": "fx-device",
+      "seq": 3,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:02Z",
+      "payload": { "text": "Done." }
+    }
+  ]
+}

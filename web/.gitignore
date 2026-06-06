@@ -1,0 +1,26 @@
+# Dependencies & build
+node_modules/
+dist/
+.vite/
+design/generated/
+
+# Test / type-check caches
+*.tsbuildinfo
+.local/
+
+# Playwright artifacts (failure screenshots / traces). HTML reporter
+# writes here too; never commit any of it.
+playwright-report/
+test-results/
+.playwright/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local config
+.env
+.env.local
+.env.*.local

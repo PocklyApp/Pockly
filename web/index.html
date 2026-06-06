@@ -1,0 +1,36 @@
+<!--
+  Copyright 2026 Pockly contributors
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <meta name="theme-color" content="#050505" />
+    <script>
+      (() => {
+        const stored = localStorage.getItem("pockly-theme");
+        const mode = stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+        const resolved = mode === "system" ? (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light") : mode;
+        document.documentElement.dataset.themeMode = mode;
+        document.documentElement.dataset.theme = resolved;
+        document.documentElement.classList.toggle("dark", resolved === "dark");
+        const storedLanguage = localStorage.getItem("pockly-language");
+        const language = storedLanguage === "zh-CN" || storedLanguage === "en"
+          ? storedLanguage
+          : (navigator.language || "").toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+        document.documentElement.lang = language;
+      })();
+    </script>
+    <script src="/pockly-runtime-config.js?v=2"></script>
+    <link rel="icon" href="/pockly-icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <title>Pockly</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+{
+  "name": "r1-gfm",
+  "session": {
+    "session_id": "fx-r1-gfm",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-r1-gfm",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "user_message",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": { "text": "Show me a GFM table and a task list" }
+    },
+    {
+      "session_id": "fx-r1-gfm",
+      "device_id": "fx-device",
+      "seq": 2,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": {
+        "text": "Here's a GFM table:\n\n| Col A | Col B | Col C |\n|-------|-------|-------|\n| 1A    | 1B    | 1C    |\n| 2A    | 2B    | 2C    |\n\nAnd a task list:\n\n- [x] done item\n- [ ] todo item\n\nAnd a TS code block:\n\n```typescript\nconst x: number = 42;\n```\n"
+      }
+    }
+  ]
+}

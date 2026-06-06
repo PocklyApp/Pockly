@@ -1,0 +1,147 @@
+{
+  "name": "internal-attachments",
+  "session": {
+    "session_id": "fx-internal-attachments",
+    "device_id": "fx-device",
+    "agent": "claude-code",
+    "cwd": "/tmp",
+    "last_timestamp": "2026-01-01T00:00:00Z"
+  },
+  "turns": [
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 1,
+      "agent": "claude-code",
+      "kind": "user_message",
+      "timestamp": "2026-01-01T00:00:00Z",
+      "payload": {
+        "text": "show visible content only"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 2,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:01Z",
+      "payload": {
+        "attachment_type": "skill_listing",
+        "text": "- internal skill marker SHOULD_NOT_RENDER_SKILL"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 3,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:02Z",
+      "payload": {
+        "attachment_type": "agent_listing_delta",
+        "text": "{\"addedLines\":[\"SHOULD_NOT_RENDER_AGENT\"]}"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 4,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:03Z",
+      "payload": {
+        "attachment_type": "deferred_tools_delta",
+        "text": "{\"addedLines\":[\"SHOULD_NOT_RENDER_TOOL\"]}"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 5,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:04Z",
+      "payload": {
+        "attachment_type": "command_permissions",
+        "text": "{\"allowedTools\":[\"SHOULD_NOT_RENDER_PERMISSION_LIST\"]}"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 6,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:05Z",
+      "payload": {
+        "attachment_type": "permission_request",
+        "text": "Approve Bash?",
+        "permission_request_id": "req-visible",
+        "permission_tool_name": "Bash",
+        "permission_decision": "pending",
+        "permission_daemon_device_id": "fx-device",
+        "permission_input_preview": "Approve Bash?"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 7,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:06Z",
+      "payload": {
+        "attachment_type": "file",
+        "text": "VISIBLE_FILE_ATTACHMENT.md"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 8,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:09Z",
+      "payload": {
+        "attachment_type": "task_reminder",
+        "text": "SHOULD_NOT_RENDER_TASK_REMINDER"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 9,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:10Z",
+      "payload": {
+        "attachment_type": "mcp_instructions_delta",
+        "text": "SHOULD_NOT_RENDER_MCP_INSTRUCTIONS"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 10,
+      "agent": "claude-code",
+      "kind": "attachment",
+      "timestamp": "2026-01-01T00:00:11Z",
+      "payload": {
+        "attachment_type": "future_context_delta",
+        "text": "SHOULD_NOT_RENDER_UNKNOWN_DELTA"
+      }
+    },
+    {
+      "session_id": "fx-internal-attachments",
+      "device_id": "fx-device",
+      "seq": 11,
+      "agent": "claude-code",
+      "kind": "assistant_text",
+      "timestamp": "2026-01-01T00:00:07Z",
+      "payload": {
+        "text": "Visible assistant reply."
+      }
+    }
+  ]
+}
