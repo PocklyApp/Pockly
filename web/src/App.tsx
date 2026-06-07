@@ -85,7 +85,6 @@ import { AppShell, Workspace } from "./components/layout/app-shell";
 import { ThemeToggle } from "./components/layout/theme-toggle";
 import { useTheme, type ThemeMode } from "./theme";
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogTitle, Input, Notice, Select, Textarea } from "./components/ui";
-import { LandingPageV2 } from "./landing";
 import { getSiteContent } from "./content/site";
 import { getDocsSections, type DocsBlock } from "./content/docs";
 import { resolveToolSpec } from "./content/tools/registry";
@@ -136,7 +135,7 @@ type AuthState =
   | { status: "authenticated"; email: string; name: string };
 
 export type Route =
-  | { view: "publicLanding" }
+  | { view: "publicEntry" }
   | { view: "publicDocs" }
   | { view: "publicChangelog" }
   | { view: "login" }
@@ -277,7 +276,7 @@ function routeTelemetryPath(route: Route) {
       return "/docs";
     case "publicChangelog":
       return "/changelog";
-    case "publicLanding":
+    case "publicEntry":
       return "/";
     case "duplexTest":
       return "/duplex-test";
@@ -3959,20 +3958,12 @@ function SplashScreen() {
 }
 
 function PublicSite({ route, auth, onNavigate }: { route: Route; auth: AuthState; onNavigate: (route: Route) => void }) {
-  // Landing page v2: self-contained snap-scroll layout (own header + pages + dots)
-  if (route.view === "publicLanding") {
-    return (
-      <main className="public-site public-site--landing">
-        <LandingPageV2 auth={auth} onNavigate={(r) => onNavigate(r as Route)} />
-      </main>
-    );
-  }
-
-  // Docs / Changelog: keep the classic public-site header layout
   return (
     <main className="public-site">
       <PublicHeader route={route} auth={auth} onNavigate={onNavigate} />
-      {route.view === "publicDocs" ? (
+      {route.view === "publicEntry" ? (
+        <PublicEntry auth={auth} onNavigate={onNavigate} />
+      ) : route.view === "publicDocs" ? (
         <DocsPage />
       ) : (
         <ChangelogPage />
@@ -3984,7 +3975,7 @@ function PublicSite({ route, auth, onNavigate }: { route: Route; auth: AuthState
 function PublicHeader({ route, auth, onNavigate }: { route: Route; auth: AuthState; onNavigate: (route: Route) => void }) {
   return (
     <header className="public-header">
-      <button type="button" className="public-brand" onClick={() => onNavigate({ view: "publicLanding" })}>
+      <button type="button" className="public-brand" onClick={() => onNavigate({ view: "publicEntry" })}>
         <span className="brand-mark" aria-hidden="true"><img src="/pockly-icon.svg" alt="" /></span>
         <span>
           <strong>Pockly</strong>
@@ -3992,7 +3983,7 @@ function PublicHeader({ route, auth, onNavigate }: { route: Route; auth: AuthSta
         </span>
       </button>
       <nav aria-label={tx("public.nav.aria")}>
-        <button type="button" className={route.view === "publicLanding" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicLanding" })}>{tx("public.nav.home")}</button>
+        <button type="button" className={route.view === "publicEntry" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicEntry" })}>{tx("public.nav.home")}</button>
         <button type="button" className={route.view === "publicDocs" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicDocs" })}>{tx("public.nav.docs")}</button>
         <button type="button" className={route.view === "publicChangelog" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicChangelog" })}>{tx("public.nav.changelog")}</button>
       </nav>
@@ -4005,6 +3996,48 @@ function PublicHeader({ route, auth, onNavigate }: { route: Route; auth: AuthSta
         )}
       </div>
     </header>
+  );
+}
+
+function PublicEntry({ auth, onNavigate }: { auth: AuthState; onNavigate: (route: Route) => void }) {
+  return (
+    <section className="public-entry">
+      <div className="public-entry-copy">
+        <span className="public-entry-label">{tx("public.entry.label")}</span>
+        <h1>{tx("public.entry.title")}</h1>
+        <p>{tx("public.entry.body")}</p>
+      </div>
+      <div className="public-entry-actions" aria-label={tx("public.entry.actionsAria")}>
+        <button
+          type="button"
+          className="public-entry-card"
+          onClick={() => onNavigate(auth.status === "authenticated" ? { view: "workspaceSessions" } : { view: "login" })}
+        >
+          <strong>{tx("public.entry.openWorkspace")}</strong>
+          <span>{tx("public.entry.openWorkspaceBody")}</span>
+        </button>
+        <button
+          type="button"
+          className="public-entry-card"
+          onClick={() => onNavigate({ view: "workspaceConnect" })}
+        >
+          <strong>{tx("public.entry.connectNexus")}</strong>
+          <span>{tx("public.entry.connectNexusBody")}</span>
+        </button>
+        <button
+          type="button"
+          className="public-entry-card"
+          onClick={() => onNavigate({ view: "publicDocs" })}
+        >
+          <strong>{tx("public.entry.selfHostingDocs")}</strong>
+          <span>{tx("public.entry.selfHostingDocsBody")}</span>
+        </button>
+        <a className="public-entry-card" href="https://github.com/PocklyApp/Pockly">
+          <strong>{tx("public.entry.github")}</strong>
+          <span>{tx("public.entry.githubBody")}</span>
+        </a>
+      </div>
+    </section>
   );
 }
 
@@ -11976,14 +12009,14 @@ function ReaderEdgeState({
 }
 
 function parseRoute(): Route {
-  if (window.location.pathname === "/") return { view: "publicLanding" };
+  if (window.location.pathname === "/") return { view: "publicEntry" };
   if (window.location.pathname === "/docs") return { view: "publicDocs" };
   if (window.location.pathname === "/changelog") return { view: "publicChangelog" };
   if (window.location.pathname === "/login") return { view: "login" };
   if (window.location.pathname === "/duplex-test") {
     const env = window.POCKLY_CONFIG?.environment || "local";
     if (env === "local") return { view: "duplexTest" };
-    return { view: "publicLanding" };
+    return { view: "publicEntry" };
   }
   if (window.location.pathname === "/cli/login") {
     const deviceCode = new URLSearchParams(window.location.search).get("device_code")?.trim() ?? "";
@@ -12055,12 +12088,12 @@ function parseRoute(): Route {
       deviceId,
     };
   }
-  return { view: "publicLanding" };
+  return { view: "publicEntry" };
 }
 
 function routeToPath(route: Route) {
   switch (route.view) {
-    case "publicLanding":
+    case "publicEntry":
       return "/";
     case "publicDocs":
       return "/docs";
@@ -12102,7 +12135,7 @@ function isReaderRoute(route: Route) {
 }
 
 function isPublicRoute(route: Route) {
-  return route.view === "publicLanding" || route.view === "publicDocs" || route.view === "publicChangelog" || route.view === "duplexTest" || route.view === "mobileJoin";
+  return route.view === "publicEntry" || route.view === "publicDocs" || route.view === "publicChangelog" || route.view === "duplexTest" || route.view === "mobileJoin";
 }
 
 function isAuthenticatedWorkspaceRoute(route: Route) {
