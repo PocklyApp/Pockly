@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Task (subagent) spec.
+// Task (subagent) spec.
 //
 // The Task tool spawns a subagent. The card header should advertise
 // the subagent's description (Claude passes it as input.description)

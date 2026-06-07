@@ -25,17 +25,16 @@ import (
 )
 
 // runDiagnose dispatches the `pockly-daemon diagnose <subcommand>`
-// subcommand family. v0.1.38 ships one subcommand:
+// subcommand family:
 //
 //	pockly-daemon diagnose telemetry [--device-id X] [--session-id Y]
 //	                                 [--source daemon|web] [--since 10m]
 //	                                 [--limit 200] [--json]
 //
 // Self-authenticates via the daemon's device identity (the same
-// keypair used for catalog sync) so no browser bearer is needed —
-// just run it on any paired daemon. Hits the relay's
-// /api/dev/telemetry/recent endpoint (v0.1.38) which only returns
-// rows for devices the caller's user account owns.
+// keypair used for catalog sync) so no browser bearer is needed.
+// Open-source Nexus does not include a diagnostics store; the
+// telemetry command requires a provider-specific query URL.
 func runDiagnose(args []string) error {
 	if len(args) == 0 {
 		return diagnoseUsageErr("diagnose requires a subcommand")
@@ -46,7 +45,7 @@ func runDiagnose(args []string) error {
 	case "sync-session":
 		return runDiagnoseSyncSession(args[1:])
 	case "stress":
-		// v0.1.40: load tests that auto-cross-check with telemetry.
+		// Load tests; optional diagnostics cross-checks require a provider.
 		return runDiagnoseStress(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprintln(os.Stderr, diagnoseUsage())
@@ -60,8 +59,8 @@ func diagnoseUsage() string {
 	return `Usage: pockly-daemon diagnose <subcommand> [flags]
 
 Subcommands:
-  telemetry      Fetch recent observability events for a device.
-  sync-session   Force-upload one local session's plaintext turns to relay.
+  telemetry      Fetch recent diagnostics events from a configured provider.
+  sync-session   Force-upload one local session's turns to Nexus.
   stress         Concurrency stress tests (inject-burst, sse-reconnect).
 
 Run 'pockly-daemon diagnose <subcommand> --help' for subcommand flags.`
@@ -88,16 +87,17 @@ func runDiagnoseSyncSession(args []string) error {
 	fs := flag.NewFlagSet("diagnose sync-session", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	sessionID := fs.String("session-id", "", "Claude Code session id to upload")
-	claudeHome := fs.String("claude-home", defaultClaudeHome, "Claude Code session home")
-	identityFile := fs.String("identity-file", identityPath, "path to device.json")
-	relayStateFile := fs.String("relay-state-file", defaultRelayStatePath, "relay pairing state file path")
-	relayURL := fs.String("relay-url", "", "override relay URL (default: read from relay-state.json)")
+	claudeHome := pathFlag(fs, "claude-home", defaultClaudeHome, "Claude Code session home")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "path to device.json")
+	relayStateFile := pathFlag(fs, "relay-state-file", defaultRelayStatePath, "legacy Nexus pairing state file path")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
+	nexusURL := fs.String("nexus-url", "", "override Nexus URL (default: read from pairing state)")
 	limit := fs.Int("limit", 100, "max recent turns to upload (1-100)")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: pockly-daemon diagnose sync-session --session-id <sid> [flags]
 
-Builds the same plaintext session history payload used by relay sync,
+Builds the same session history payload used by Nexus sync,
 uploads it once with this daemon's identity, and prints a sanitized summary.
 
 Flags:`)
@@ -106,6 +106,7 @@ Flags:`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	*relayURL = firstNonEmptyString(*nexusURL, *relayURL)
 	sid := strings.TrimSpace(*sessionID)
 	if sid == "" {
 		return fmt.Errorf("--session-id is required")
@@ -128,7 +129,7 @@ Flags:`)
 		}
 	}
 	if baseURL == "" {
-		baseURL = "https://pocklyapp.com"
+		baseURL = defaultNexusURL()
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 
@@ -159,7 +160,7 @@ Flags:`)
 	fmt.Printf("Synced session %s to %s\n", sid, baseURL)
 	fmt.Printf("  daemon_device: %s\n", summary.DaemonDevice)
 	fmt.Printf("  request_turns: %d\n", summary.RequestTurns)
-	fmt.Printf("  relay_turns:   %d\n", summary.RelayTurns)
+	fmt.Printf("  nexus_turns:   %d\n", summary.NexusTurns)
 	fmt.Printf("  assistant_text_turns: %d (chars=%d)\n", summary.AssistantTextTurns, summary.AssistantTextChars)
 	fmt.Printf("  last_turn: seq=%d kind=%s text_chars=%d timestamp=%s\n",
 		summary.LastTurn.Seq, summary.LastTurn.Kind, summary.LastTurn.TextChars, summary.LastTurn.Timestamp)
@@ -170,8 +171,8 @@ type syncSessionSummary struct {
 	SessionID          string          `json:"session_id"`
 	DaemonDevice       string          `json:"daemon_device"`
 	RequestTurns       int             `json:"request_turns"`
-	RelayTurns         int             `json:"relay_turns"`
-	RelaySessions      int             `json:"relay_sessions"`
+	NexusTurns         int             `json:"nexus_turns"`
+	NexusSessions      int             `json:"nexus_sessions"`
 	AssistantTextTurns int             `json:"assistant_text_turns"`
 	AssistantTextChars int             `json:"assistant_text_chars"`
 	LastTurn           syncTurnSummary `json:"last_turn"`
@@ -189,8 +190,8 @@ func summarizeSyncSessionResult(sessionID string, req pair.SyncRequest, res pair
 		SessionID:     sessionID,
 		DaemonDevice:  res.DaemonDevice,
 		RequestTurns:  len(req.Turns),
-		RelayTurns:    res.TurnCount,
-		RelaySessions: res.SessionCount,
+		NexusTurns:    res.TurnCount,
+		NexusSessions: res.SessionCount,
 	}
 	for _, turn := range req.Turns {
 		textLen := syncTurnTextLen(turn.Payload)
@@ -228,26 +229,32 @@ func runDiagnoseTelemetry(args []string) error {
 	limit := fs.Int("limit", 200, "max rows (server caps at 1000)")
 	jsonOut := fs.Bool("json", false, "emit raw JSON response instead of the pretty table")
 	identityFile := fs.String("identity-file", "", "path to device.json (default: standard location)")
-	relayURL := fs.String("relay-url", "", "override relay URL (default: read from relay-state.json)")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
+	nexusURL := fs.String("nexus-url", "", "override Nexus URL (default: read from pairing state)")
+	queryURL := fs.String("query-url", os.Getenv("POCKLY_DIAGNOSTICS_QUERY_URL"), "self-hosted diagnostics query endpoint; required because open-source Nexus has no diagnostics store")
+	displayEnvBackedDefault(fs, "query-url", "POCKLY_DIAGNOSTICS_QUERY_URL")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: pockly-daemon diagnose telemetry [flags]
 
-Fetches recent observability events from the relay's telemetry store
-(v0.1.38). Self-authenticates as this daemon — works for any device
-your account owns.
+Fetches recent diagnostics events from a self-hosted provider query endpoint.
+Open-source Nexus accepts optional diagnostics writes but does not store or
+serve telemetry by default, so --query-url or POCKLY_DIAGNOSTICS_QUERY_URL is
+required. Self-authenticates as this daemon when querying through Nexus.
 
 Examples:
-  pockly-daemon diagnose telemetry                          # this daemon, last 30m
-  pockly-daemon diagnose telemetry --since 2h               # last 2h
-  pockly-daemon diagnose telemetry --session-id <chat-uuid> # one chat
-  pockly-daemon diagnose telemetry --device-id dd_OTHER     # another daemon (must be yours)
-  pockly-daemon diagnose telemetry --source web --since 1h  # web errors only
+  POCKLY_DIAGNOSTICS_QUERY_URL=https://your-diagnostics.example/recent \
+    pockly-daemon diagnose telemetry --since 2h
+  pockly-daemon diagnose telemetry --query-url https://your-diagnostics.example/recent --session-id <chat-uuid>
 
 Flags:`)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	diagnosticsURL := strings.TrimSpace(*queryURL)
+	if diagnosticsURL == "" {
+		return fmt.Errorf("diagnostics query is not configured; open-source Nexus does not store diagnostics by default, set --query-url or POCKLY_DIAGNOSTICS_QUERY_URL for your self-hosted provider")
 	}
 
 	// Locate identity file (matches the convention runServe uses —
@@ -267,10 +274,10 @@ Flags:`)
 		return fmt.Errorf("load identity %s: %w", idFile, err)
 	}
 
-	// Resolve relay URL: CLI override → relay-state.json → default.
-	baseURL := strings.TrimSpace(*relayURL)
+	// Resolve Nexus URL: CLI override → legacy relay-state.json → default.
+	baseURL := strings.TrimSpace(firstNonEmptyString(*nexusURL, *relayURL))
 	if baseURL == "" {
-		// relay-state.json lives next to device.json by convention.
+		// relay-state.json is the legacy state filename next to device.json.
 		statePath := filepath.Join(filepath.Dir(idFile), "..", "Application Support", "pockly-daemon", "relay-state.json")
 		// macOS variant: ~/Library/Application Support/pockly-daemon/relay-state.json
 		if home, err := os.UserHomeDir(); err == nil {
@@ -288,7 +295,7 @@ Flags:`)
 		}
 	}
 	if baseURL == "" {
-		baseURL = "https://pocklyapp.com"
+		baseURL = defaultNexusURL()
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 
@@ -301,7 +308,7 @@ Flags:`)
 	}
 
 	// Mint a bearer via challenge/response using this daemon's keypair.
-	// audience=daemonWS — what relay's accepted-audience list expects
+	// audience=daemonWS — what Nexus's accepted-audience list expects
 	// for daemon-flavored requests (matches the catalog sync path).
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -325,7 +332,7 @@ Flags:`)
 	}
 	q.Set("limit", fmt.Sprintf("%d", *limit))
 
-	reqURL := baseURL + "/api/dev/telemetry/recent?" + q.Encode()
+	reqURL := appendQuery(diagnosticsURL, q)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return err
@@ -339,7 +346,7 @@ Flags:`)
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("relay returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return fmt.Errorf("diagnostics provider returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	if *jsonOut {
@@ -378,7 +385,8 @@ func renderTelemetryTable(events []map[string]any, count int, query map[string]a
 	if len(events) == 0 {
 		fmt.Println("  (no events in this window)")
 		fmt.Println("\nIf you expected events:")
-		fmt.Println("  - confirm the daemon is on v0.1.37+ (telemetry events added then)")
+		fmt.Println("  - confirm optional diagnostics are explicitly enabled on this daemon")
+		fmt.Println("  - confirm your self-hosted diagnostics provider stores and serves events")
 		fmt.Println("  - try a wider --since window (default 30m)")
 		fmt.Println("  - check the device_id is correct and yours")
 		return nil
@@ -416,4 +424,23 @@ func renderTelemetryTable(events []map[string]any, count int, query map[string]a
 		fmt.Printf("  %s  %-6s  %s %-26s %s\n", ts, source, statusTag, name, strings.Join(details, "  "))
 	}
 	return nil
+}
+
+func appendQuery(rawURL string, q url.Values) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		sep := "?"
+		if strings.Contains(rawURL, "?") {
+			sep = "&"
+		}
+		return rawURL + sep + q.Encode()
+	}
+	existing := u.Query()
+	for key, values := range q {
+		for _, value := range values {
+			existing.Set(key, value)
+		}
+	}
+	u.RawQuery = existing.Encode()
+	return u.String()
 }

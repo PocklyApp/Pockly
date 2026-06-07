@@ -53,10 +53,10 @@ type SessionRef struct {
 
 // Index maintains a read-optimized in-memory snapshot of local sessions.
 //
-// P1 keeps this pragmatic: start with a full scan, then keep the snapshot
-// warm with fsnotify plus a low-frequency fallback rescan. This eliminates
-// per-request directory walks while avoiding silent drift if a watcher event
-// gets dropped or a root didn't exist at process start.
+// Start with a full scan, then keep the snapshot warm with fsnotify plus a
+// low-frequency fallback rescan. This eliminates per-request directory walks
+// while avoiding silent drift if a watcher event gets dropped or a root did
+// not exist at process start.
 type Index struct {
 	cfg Config
 
@@ -76,7 +76,7 @@ type Index struct {
 	// sessions that disappear from the snapshot get GC'd on refresh.
 	firstMessages map[string]string
 	// firstMessagesFull caches the longer first-message copy (≈800 chars)
-	// the relay uses for title generation. Keyed + GC'd like firstMessages.
+	// Nexus uses for title generation. Keyed + GC'd like firstMessages.
 	firstMessagesFull map[string]string
 }
 
@@ -252,7 +252,7 @@ func (i *Index) refreshLocked() error {
 // IMPORTANT: only non-empty extractions get cached. An empty result
 // might mean "no user message yet" (session is mid-write) — those need
 // to be re-checked on subsequent refreshes so a newly-arrived first
-// message starts encrypting instead of staying frozen as "".
+// message is indexed instead of staying frozen as "".
 // Cache entries for sessions that vanished from the snapshot are
 // dropped so memory doesn't grow unbounded across the daemon's lifetime.
 func (i *Index) populateFirstMessages(projects []agent.Project, sessions map[string]SessionRef) {
@@ -294,7 +294,7 @@ func (i *Index) populateFirstMessages(projects []agent.Project, sessions map[str
 
 // extractRawFirstMessage runs the per-agent first-user-message extractor.
 // Both agents read the first human message straight off the local jsonl,
-// independent of relay turn lazy-loading. Returns "" when none is found
+// independent of Nexus turn lazy-loading. Returns "" when none is found
 // (empty session, parse failure, unsupported agent).
 func extractRawFirstMessage(ref SessionRef) string {
 	switch ref.Agent {
@@ -316,7 +316,7 @@ func cleanFirstMessageText(text string) string {
 }
 
 // firstMessageForTitle cleans like cleanFirstMessageText but keeps a longer
-// prefix (≈800 chars) — the relay summarizes this into a session title and
+// prefix (≈800 chars) — Nexus summarizes this into a session title and
 // wants more context than the 140-char sidebar snippet.
 func firstMessageForTitle(text string) string {
 	return cleanFirstMessageTextCapped(text, 800)
@@ -394,15 +394,11 @@ func (i *Index) notifyChanged() {
 	}
 }
 
-// buildSnapshot constructs the catalog snapshot uploaded to the relay.
+// buildSnapshot constructs the catalog snapshot uploaded to Nexus.
 //
-// IMPORTANT: snippet stays a synthesised, non-sensitive title
-// (project · agent · date · shortId). The catalog rides the relay in
-// plaintext; the per-session encrypted turns are the only path for
-// real prompt content to reach paired browsers. Keeping snippets free
-// of user content is what makes the E2E story honest. If you want
-// human-readable titles in the UI, derive them browser-side after the
-// per-recipient encrypted turns decrypt.
+// The catalog snapshot contains session metadata and title/snippet fields used
+// by Nexus and the web sidebar. Full turn content is synced by the per-session
+// history path.
 func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 	var projects []agent.Project
 	sessions := map[string]SessionRef{}

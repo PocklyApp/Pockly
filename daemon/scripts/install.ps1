@@ -5,15 +5,20 @@ param(
   [string]$Version = $env:POCKLY_DAEMON_VERSION,
   [string]$InstallDir = $env:POCKLY_DAEMON_INSTALL_DIR,
   [string]$BaseUrl = $env:POCKLY_DAEMON_BASE_URL,
-  [string]$RelayUrl = $env:POCKLY_RELAY_URL
+  [string]$NexusUrl = $env:POCKLY_NEXUS_URL,
+  [string]$LegacyRelayUrl = $env:POCKLY_RELAY_URL
 )
 
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($Version)) { $Version = "latest" }
 if ([string]::IsNullOrWhiteSpace($InstallDir)) { $InstallDir = Join-Path $env:LOCALAPPDATA "Pockly\bin" }
-if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $BaseUrl = "https://cdn.pocklyapp.com/pockly-daemon" }
-if ([string]::IsNullOrWhiteSpace($RelayUrl)) { $RelayUrl = "https://pocklyapp.com" }
+if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
+  throw "POCKLY_DAEMON_BASE_URL is required. Set it to the daemon release base URL that contains latest/checksums.txt."
+}
+if ([string]::IsNullOrWhiteSpace($NexusUrl)) { $NexusUrl = $LegacyRelayUrl }
+if ([string]::IsNullOrWhiteSpace($NexusUrl)) { $NexusUrl = "http://127.0.0.1:8787" }
+$ResolvedNexusUrl = $NexusUrl
 
 function Test-PathLocked {
   param([string]$Path)
@@ -94,7 +99,7 @@ function Copy-Binary {
     Copy-Item -LiteralPath $Source -Destination $Target -Force
   }
   catch [System.IO.IOException] {
-    throw "failed to install $Target because it is still in use. Close running Pockly/Claude wrapper processes and retry. Original error: $($_.Exception.Message)"
+    throw "failed to install $Target because it is still in use. Close running Pockly daemon or wrapper processes and retry. Original error: $($_.Exception.Message)"
   }
 }
 
@@ -169,11 +174,11 @@ try {
     Write-Host ""
     Write-Host "pockly install: starting first-run setup"
     Write-Host "pockly install: set POCKLY_DAEMON_NO_SETUP=1 to install without setup"
-    & $target setup --relay-url $RelayUrl
+    & $target setup --nexus-url $ResolvedNexusUrl
   }
   else {
     Write-Host "pockly install: setup skipped because POCKLY_DAEMON_NO_SETUP=1"
-    Write-Host "Run manually when ready: $target setup --relay-url $RelayUrl"
+    Write-Host "Run manually when ready: $target setup --nexus-url $ResolvedNexusUrl"
     if ($stoppedDaemon) {
       Write-Host "pockly install: restart skipped because setup was skipped"
       Write-Host "Restart manually when ready: schtasks /Run /TN PocklyDaemon"

@@ -1,13 +1,13 @@
-# Renderer specs (R1-R10)
+# Renderer Specs
 
-E2E coverage for the R1–R10 renderer series, driven by the dev-only
-fixture mode at `/test/renderer?fixture=<name>`.
+End-to-end rendering coverage driven by the dev-only fixture mode at
+`/test/renderer?fixture=<name>`.
 
 ## Why a separate directory
 
 These specs cover rendering. They mount synthetic SessionTurn lists via the
-fixture mode and assert the resulting DOM. They do not require the relay,
-daemon, Docker, or model provider credentials.
+fixture mode and assert the resulting DOM. They do not require Nexus, a daemon,
+Docker, or model provider credentials.
 
 ## Running locally
 
@@ -52,12 +52,12 @@ name renders a visible `.fixture-error`.
 
 ## What's NOT covered here
 
-- L1 unit tests (`npm test`) own pure helpers — `tokenUsageTier`,
+- Unit tests (`npm test`) own pure helpers — `tokenUsageTier`,
   `parseReaderPreferences`, `hasMathSyntax`, `summarizePendingPermissions`,
-  every `ToolSpec.display`. Specs in this directory only assert what L1
-  cannot (rendered DOM, click gestures, lazy-chunk network behavior).
-- The real inject/wrapper path. Specs that need it (R5-5 effort prefix
-  interceptor) `page.route("**/inject", …)` the request — they don't
-  send a real message through the relay.
-- Full relay/daemon E2E. Those tests should be added back once the
-  worker-native relay local stack is implemented in this monorepo.
+  every `ToolSpec.display`. Specs in this directory only assert what unit
+  tests cannot: rendered DOM, click gestures, and lazy-chunk network behavior.
+- The real inject/wrapper path. Specs that need request interception use
+  `page.route("**/inject", ...)`; they do not send a real message through
+  Nexus.
+- Full Nexus/daemon E2E. Those tests should run through the self-hosted local
+  stack rather than this renderer-only fixture mode.

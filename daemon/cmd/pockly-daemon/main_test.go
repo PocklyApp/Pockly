@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -64,6 +65,54 @@ func TestShouldOpenBrowser(t *testing.T) {
 				t.Fatalf("shouldOpenBrowser() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDefaultNexusURLPrefersNexusEnvThenRelayFallback(t *testing.T) {
+	t.Setenv("POCKLY_NEXUS_URL", "")
+	t.Setenv("POCKLY_RELAY_URL", "")
+	if got := defaultNexusURL(); got != "http://127.0.0.1:8787" {
+		t.Fatalf("defaultNexusURL() = %q", got)
+	}
+
+	t.Setenv("POCKLY_RELAY_URL", "https://legacy-nexus.example")
+	if got := defaultNexusURL(); got != "https://legacy-nexus.example" {
+		t.Fatalf("defaultNexusURL() with relay env = %q", got)
+	}
+
+	t.Setenv("POCKLY_NEXUS_URL", "https://nexus.example")
+	if got := defaultNexusURL(); got != "https://nexus.example" {
+		t.Fatalf("defaultNexusURL() with nexus env = %q", got)
+	}
+
+	if got := resolveNexusURL("https://flag.example"); got != "https://flag.example" {
+		t.Fatalf("resolveNexusURL(flag) = %q", got)
+	}
+}
+
+func TestPathFlagHelpDefaultRedactsHomePath(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "home")
+	t.Setenv("HOME", home)
+	defaultPath := filepath.Join(home, ".config", "pockly-daemon", "device.json")
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	value := pathFlag(fs, "identity-file", defaultPath, "daemon identity file path")
+
+	if *value != defaultPath {
+		t.Fatalf("pathFlag value = %q, want %q", *value, defaultPath)
+	}
+	defValue := fs.Lookup("identity-file").DefValue
+	if strings.Contains(defValue, home) {
+		t.Fatalf("flag default leaked home path: %q", defValue)
+	}
+	if !strings.HasPrefix(defValue, "~") {
+		t.Fatalf("flag default = %q, want redacted home path", defValue)
+	}
+	fs.PrintDefaults()
+	if strings.Contains(buf.String(), home) {
+		t.Fatalf("flag help leaked home path: %s", buf.String())
 	}
 }
 
@@ -252,7 +301,7 @@ func TestHistorySyncSignatureTracksTurnsWhenCatalogSignatureIsStable(t *testing.
 	})
 
 	catalogAfterText := catalog
-	if relaySessionSyncSignature(catalog) != relaySessionSyncSignature(catalogAfterText) {
+	if nexusSessionSyncSignature(catalog) != nexusSessionSyncSignature(catalogAfterText) {
 		t.Fatal("catalog signature should be stable for identical catalog metadata")
 	}
 	if historySyncSignature(first) == historySyncSignature(second) {
@@ -263,7 +312,7 @@ func TestHistorySyncSignatureTracksTurnsWhenCatalogSignatureIsStable(t *testing.
 func TestFormatClaudeCommandStatusAvoidsStableIdentifiers(t *testing.T) {
 	status := claudeStatus{
 		Linked:             true,
-		RelayURL:           "https://pocklyapp.com",
+		RelayURL:           "https://nexus.example",
 		DaemonDeviceID:     "dd_secret",
 		DaemonDeviceName:   "Leo MacBook",
 		UserEmail:          "leo@example.com",
@@ -277,7 +326,7 @@ func TestFormatClaudeCommandStatusAvoidsStableIdentifiers(t *testing.T) {
 			t.Fatalf("Claude command output leaked %q: %s", forbidden, out)
 		}
 	}
-	for _, want := range []string{"Pockly daemon linked", "Remote access: enabled", "https://pocklyapp.com/workspace/sessions"} {
+	for _, want := range []string{"Pockly daemon linked", "Remote access: enabled", "https://nexus.example/workspace/sessions"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("Claude command output missing %q: %s", want, out)
 		}
@@ -298,7 +347,7 @@ func TestClaudeStatusJSONRedactsTokens(t *testing.T) {
 	}
 	writeJSONFile(t, identityFile, id)
 	if err := relay.SaveState(relayStateFile, relay.State{
-		RelayURL:           "https://pocklyapp.com",
+		RelayURL:           "https://nexus.example",
 		DaemonDeviceID:     "dd_test",
 		UserEmail:          "leo@example.com",
 		RemoteAccess:       true,
@@ -354,7 +403,7 @@ func TestInstallClaudeIntegrationRemovesOwnedSlashCommand(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(commandPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	ownedCommand := []byte("allowed-tools: Bash('/tmp/pockly-daemon claude-status --claude-command')\nWorkspace: https://pocklyapp.com/workspace/sessions\n")
+	ownedCommand := []byte("allowed-tools: Bash('/tmp/pockly-daemon claude-status --claude-command')\nWorkspace: https://nexus.example/workspace/sessions\n")
 	if err := os.WriteFile(commandPath, ownedCommand, 0o600); err != nil {
 		t.Fatal(err)
 	}

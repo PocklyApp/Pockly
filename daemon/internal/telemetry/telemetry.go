@@ -22,14 +22,12 @@ import (
 )
 
 type Event struct {
-	Name       string        `json:"name"`
-	Command    string        `json:"command,omitempty"`
-	Status     string        `json:"status,omitempty"`
-	ErrorCode  string        `json:"error_code,omitempty"`
-	// v0.1.41 #4: chat session_id correlation. Empty for events that
-	// aren't per-session (control_connected, sync_completed, ...).
-	// Relay's telemetry_events.session_id column is populated from
-	// this so `diagnose telemetry --session-id X` matches.
+	Name      string `json:"name"`
+	Command   string `json:"command,omitempty"`
+	Status    string `json:"status,omitempty"`
+	ErrorCode string `json:"error_code,omitempty"`
+	// Optional telemetry providers can use this for session-scoped
+	// diagnostics. Empty for events that are not per-session.
 	SessionID  string        `json:"session_id,omitempty"`
 	DurationMS time.Duration `json:"-"`
 }
@@ -55,10 +53,12 @@ type wireRequest struct {
 
 func Enabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("POCKLY_TELEMETRY"))) {
-	case "off", "false", "0", "disabled":
+	case "on", "true", "1", "enabled", "yes":
+		return true
+	case "", "off", "false", "0", "disabled":
 		return false
 	default:
-		return true
+		return false
 	}
 }
 
@@ -71,6 +71,10 @@ func Endpoint(relayURL string) string {
 
 func Send(ctx context.Context, relayURL string, id device.Identity, events ...Event) {
 	if !Enabled() || len(events) == 0 {
+		return
+	}
+	endpoint := Endpoint(relayURL)
+	if strings.TrimSpace(endpoint) == "" {
 		return
 	}
 	installID := installID()
@@ -97,7 +101,7 @@ func Send(ctx context.Context, relayURL string, id device.Identity, events ...Ev
 	if err != nil {
 		return
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, Endpoint(relayURL), bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return
 	}

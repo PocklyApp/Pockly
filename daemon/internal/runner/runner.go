@@ -3,7 +3,7 @@
 
 // Package runner classifies the Claude runner the daemon will hand off to.
 //
-// The runner alias is a display/diagnostic signal that flows daemon -> relay
+// The runner alias is a display/diagnostic signal that flows daemon -> Nexus
 // -> web. It does not influence routing decisions: connection_mode and the
 // PTY duplex gate are derived independently from live terminal presence.
 //

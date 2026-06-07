@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Edit / MultiEdit / ApplyPatch spec.
+// Edit / MultiEdit / ApplyPatch spec.
 //
 // All three are line-diff producers; they share enough input shape
 // (file_path + old/new strings, or edits[] for MultiEdit) that one

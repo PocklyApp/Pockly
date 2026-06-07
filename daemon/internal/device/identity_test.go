@@ -82,7 +82,7 @@ func TestStableComputerIdentitySurvivesDaemonIdentityRecreate(t *testing.T) {
 // against the matrix of (os.Hostname result, error, GOOS) combinations
 // that motivate the COMPUTERNAME fallback. Pre-fix, a Windows install
 // that returned an empty hostname propagated as empty all the way to
-// the relay's device row, causing the web app's dropdown to fall back to
+// Nexus' device row, causing the web app's dropdown to fall back to
 // displaying the raw device_id (e.g. "01ZnxSj01468764").
 func TestResolveHostnameFrom(t *testing.T) {
 	cases := []struct {

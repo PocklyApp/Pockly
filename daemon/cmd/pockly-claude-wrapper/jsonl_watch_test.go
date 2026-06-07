@@ -73,7 +73,7 @@ func TestExtractMessageEventsHidesModelCommandRecords(t *testing.T) {
 			"type": "user",
 			"uuid": "stdout",
 			"message": map[string]any{
-				"content": "<local-command-stdout>Set model to \x1b[1mdeepseek-v4-flash\x1b[22m and saved as your default for new sessions</local-command-stdout>",
+					"content": "<local-command-stdout>Set model to \x1b[1manthropic-compatible-fast\x1b[22m and saved as your default for new sessions</local-command-stdout>",
 			},
 		},
 	}
@@ -309,10 +309,9 @@ func TestExtractMessageTextUserToolResultBlocks(t *testing.T) {
 }
 
 func TestExtractMessageTextAssistantSkipsToolUseAndThinking(t *testing.T) {
-	// The whole point of v0.1.35: only the assistant's *text* parts go
-	// to the chat bubble. tool_use and thinking blocks render via a
-	// separate catalog turn-sync path, and putting them in the
-	// streaming bubble would dump JSON-ish junk over user-readable text.
+	// Only the assistant's text parts go to the chat bubble. tool_use and
+	// thinking blocks render via the separate turn-sync path; putting them
+	// in the streaming bubble would dump JSON-ish junk over user-readable text.
 	rec := map[string]any{
 		"type": "assistant",
 		"message": map[string]any{

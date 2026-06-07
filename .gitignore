@@ -2,8 +2,8 @@
 node_modules/
 
 # Build output
-dist/
-bin/
+/dist/
+/bin/
 *.exe
 *.test
 *.out

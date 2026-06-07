@@ -34,8 +34,9 @@ type Config struct {
 	RefreshInterval   time.Duration
 	TerminalManager   *liveterminal.Manager
 	TerminalEventSink func(DevTerminalEvent)
-	// RelayURL is the relay base URL the daemon is configured to talk to,
-	// or "" if --connect-relay is off. Exposed via /api/status.
+	// RelayURL is the Nexus base URL the daemon is configured to talk to,
+	// or "" if --connect-nexus is off. Exposed via /api/status. The field name
+	// stays RelayURL until internal/wire compatibility aliases are retired.
 	RelayURL string
 	// Profile is the detected Claude runner profile. Exposed via /api/status.
 	Profile runner.Profile
@@ -45,24 +46,17 @@ type Config struct {
 	// publish its result without making this package depend on the
 	// updater. Returns zero value when there's nothing to report.
 	UpdateStatus func() UpdateInfo
-	// ReportTelemetry, when set, is called on certain ingest paths to
-	// emit observability events to the relay. Kept as a function hook
+	// ReportTelemetry, when set, is called on certain ingest paths to emit
+	// optional diagnostics events. Kept as a function hook
 	// (rather than a direct telemetry/device.Identity dependency) so
-	// this package stays free of those imports. v0.1.37 wires it for
-	// the wrapper-event ingest path; the hook is called on a goroutine
-	// so it can't slow down the HTTP handler.
-	//
-	// v0.1.41 #4: sessionID added — was missing, so
-	// `pockly-daemon diagnose telemetry --session-id X` matched
-	// 0 daemon-source rows even when events were firing. Field is
-	// optional (caller passes "" when source isn't a per-session
-	// event).
+	// this package stays free of those imports. The hook is called on a
+	// goroutine so it cannot slow down the HTTP handler. sessionID is
+	// optional because many daemon/global events are not per-session.
 	ReportTelemetry func(name, command, status, errorCode, sessionID string)
-	// v0.2.0: PermissionStore is the in-memory broker between the
+	// PermissionStore is the in-memory broker between the
 	// mcp-permission subprocess (parking on /await) and whoever
-	// supplies the decision (web → relay → control WS → /decide).
-	// Nil disables the new endpoints, falling back to v0.1.42 always-
-	// allow semantics in the MCP server.
+	// supplies the decision (web → Nexus → control WS → /decide).
+	// Nil disables the local permission endpoints.
 	PermissionStore *permission.Store
 	// AgentSettings is the composer-pills surface (model / permission_mode
 	// / effort). The local /api/dev/terminal-sessions/<id>/agent-settings
@@ -72,7 +66,7 @@ type Config struct {
 	// the wrapper reports an UNCLEAN exit_intent (claude crashed or
 	// terminated abnormally). The receiver should spawn an SDK driver
 	// for (claudeSessionID, cwd, agent) so the session stays "live" at
-	// relay level instead of flipping to disconnected and forcing the
+	// Nexus catalog instead of flipping to disconnected and forcing the
 	// next user inject to bootstrap from cold.
 	//
 	// Clean exits (user pressed Ctrl+C / claude exited code 0) do NOT
@@ -285,7 +279,7 @@ func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// handleStatus exposes the daemon's effective relay target and detected
+// handleStatus exposes the daemon's effective Nexus target and detected
 // runner profile so operators can spot environment mismatches between web
 // and daemon (e.g. local web pointing at a daemon connected to production).
 func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -293,6 +287,7 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		"service":             "pockly-daemon",
 		"version":             version.String(),
 		"environment_label":   EnvironmentLabel(s.cfg.RelayURL),
+		"effective_nexus_url": s.cfg.RelayURL,
 		"effective_relay_url": s.cfg.RelayURL,
 		"claude_runner_alias": s.cfg.Profile.AliasFor("claude-code"),
 		"index":               s.index.Status(),
@@ -305,7 +300,7 @@ func (s *server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// EnvironmentLabel classifies a relay URL into a coarse environment bucket.
+// EnvironmentLabel classifies a Nexus URL into a coarse environment bucket.
 // Used by /api/status so the web can flag mismatch with its own bundled env.
 func EnvironmentLabel(rawURL string) string {
 	trimmed := strings.TrimSpace(rawURL)
@@ -318,8 +313,6 @@ func EnvironmentLabel(rawURL string) string {
 	}
 	host := strings.ToLower(u.Hostname())
 	switch {
-	case host == "pocklyapp.com" || strings.HasSuffix(host, ".pocklyapp.com"):
-		return "production"
 	case host == "127.0.0.1" || host == "localhost" || strings.HasSuffix(host, ".localhost"):
 		return "local"
 	default:
@@ -518,8 +511,8 @@ func (s *server) handleDevTerminalSessions(w http.ResponseWriter, r *http.Reques
 }
 
 // handleDevTerminalKeepalive accepts an empty-body POST from a live
-// wrapper and forwards it to the relay (via the TerminalEventSink) as a
-// "keepalive" event so the relay's reaper can distinguish "wrapper is
+// wrapper and forwards it to Nexus (via the TerminalEventSink) as a
+// "keepalive" event so Nexus can distinguish "wrapper is
 // alive, just quiet" from "wrapper died". 404 if the wrapper is talking
 // to a daemon that doesn't recognize its terminal_session_id (post
 // daemon restart) — the wrapper handles that by re-registering and
@@ -545,7 +538,7 @@ func (s *server) handleDevTerminalKeepalive(w http.ResponseWriter, r *http.Reque
 // its own exit (clean vs unclean, with exit code + signal details).
 // Stored on the ExternalSession so daemon's recovery logic (next PR)
 // can ask "did this wrapper exit cleanly?" instead of guessing from
-// 45 seconds of silence. Also forwarded to relay as a terminal event
+// 45 seconds of silence. Also forwarded to Nexus as a terminal event
 // so the catalog reflects the same classification.
 //
 // Body is the JSON shape sent by wrapper's ReportExitIntent. Returns
@@ -580,9 +573,9 @@ func (s *server) handleDevTerminalExitIntent(w http.ResponseWriter, r *http.Requ
 		At:              time.Now().UTC(),
 	})
 	if s.cfg.TerminalEventSink != nil {
-		// Forward to relay as a structured terminal event so the catalog
+		// Forward to Nexus as a structured terminal event so the catalog
 		// + sidebar can show "session ended" vs "agent crashed" without
-		// any additional daemon ↔ relay handshake.
+		// any additional daemon ↔ Nexus handshake.
 		payload, _ := json.Marshal(req)
 		s.cfg.TerminalEventSink(DevTerminalEvent{
 			TerminalSessionID: sessionID,
@@ -612,8 +605,8 @@ func (s *server) handleDevTerminalExitIntent(w http.ResponseWriter, r *http.Requ
 	}
 	// Auto-recovery: when the wrapper died unexpectedly (not user-
 	// initiated Ctrl+C / clean exit), invite main.go's recovery hook to
-	// spawn an SDK driver so the session stays "live" on the relay's
-	// view. Without this, relay's reaper flips the session to
+	// spawn an SDK driver so the session stays "live" in Nexus.
+	// Without this, Nexus flips the session to
 	// disconnected after 45s of silence, and the next user inject pays
 	// the spawn cost from cold — visible as "session disconnected, send
 	// to reconnect" UX flicker.
@@ -684,12 +677,12 @@ func (s *server) handleDevTerminalEvent(w http.ResponseWriter, r *http.Request, 
 			Cwd:               strings.TrimSpace(req.Cwd),
 		})
 	}
-	// v0.1.37: telemetry probe. Wrapper events come through this path at
-	// turn-cadence (1-3 / minute typical, bursty up to ~10/sec during
-	// streaming) so we sample successes 1/200 to keep cloud volume sane.
-	// Error-kind events ALWAYS report so the cloud sees every wrapper-
-	// reported failure. The reporter hook is async-fire-and-forget so a
-	// flaky telemetry endpoint can't slow down the wrapper's HTTP POST.
+	// Diagnostics probe. Wrapper events come through this path at
+	// turn-cadence (1-3/minute typical, bursty during streaming) so we
+	// sample successes 1/200 to keep provider volume sane. Error-kind
+	// events always report when diagnostics are enabled. The reporter
+	// hook is async-fire-and-forget so a flaky provider cannot slow down
+	// the wrapper's HTTP POST.
 	if s.cfg.ReportTelemetry != nil {
 		isErr := req.Kind == "error" || req.Error != ""
 		if isErr || sampleOne(200) {
@@ -1103,7 +1096,7 @@ func (s *server) handlePermissionDecide(w http.ResponseWriter, r *http.Request, 
 //   - 409 session_drifted ({actual_sid: ...})
 //   - 400 unknown_mode / bypass at runtime / unknown_effort
 //
-// This is the canonical home for composer-pills state. The relay's
+// This is the canonical home for composer-pills state. Nexus
 // AGENT_SETTINGS_GET/SET control WS messages call into the same
 // agentsettings.Store via the control-package handler interface — both
 // paths share state.
@@ -1140,11 +1133,11 @@ func (s *server) handleDevTerminalAgentSettings(w http.ResponseWriter, r *http.R
 		// without this a local client could POST `/model <bogus>` and
 		// have it pushed to the PTY + recorded, leaving the pill
 		// disagreeing with the agent. Mirrors agentSettingsAdapter.Set
-		// (the relay path). ReadModelOptions now includes ANTHROPIC_MODEL,
+		// (the Nexus path). ReadModelOptions now includes ANTHROPIC_MODEL,
 		// so an env-default model is accepted here too. (A model the user
 		// switched to mid-session via their own terminal — observable only
 		// from the jsonl, which this dev endpoint can't reach without the
-		// index — would be rejected; the relay/web path handles that case.)
+		// index — would be rejected; the Nexus/web path handles that case.)
 		if err := agentsettings.ValidateModelForCwd(ext.Cwd(), req.Model); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return

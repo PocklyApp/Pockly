@@ -54,7 +54,7 @@ type Summary struct {
 	Cwd             string `json:"cwd,omitempty"`
 	// Driver names which agent driver owns this session: "pty" (wrapper)
 	// or "sdk" (daemon-spawned `claude --resume` headless). Empty
-	// defaults to "pty" at the relay. Consumed by the daemon's
+	// defaults to "pty" in Nexus. Consumed by the daemon's
 	// reconnect re-announce loop so SDK-driven keepalives get tagged
 	// correctly in terminal_sessions.
 	Driver string `json:"driver,omitempty"`

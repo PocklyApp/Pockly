@@ -5,12 +5,10 @@
 
 import { test, expect } from "@playwright/test";
 
-// R4 — ExitPlanMode interactive plan panel.
-// Cases R4-1 (plan markdown), R4-2 (pending footer), R4-3 (resolved
-// drops footer — post-review-fix regression).
+// ExitPlanMode interactive plan panel.
 
-test.describe("R4 ExitPlanMode plan card", () => {
-  test("R4-1 plan markdown renders inside .tool-plan-body", async ({ page }) => {
+test.describe("ExitPlanMode plan card", () => {
+  test("plan markdown renders inside .tool-plan-body", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r4-plan-pending");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {
       (d as HTMLDetailsElement).open = true;
@@ -21,7 +19,7 @@ test.describe("R4 ExitPlanMode plan card", () => {
     await expect(body.locator("h2").first()).toHaveText("Step 1");
   });
 
-  test("R4-2 pending plan shows the pulsing footer", async ({ page }) => {
+  test("pending plan shows the pulsing footer", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r4-plan-pending");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {
       (d as HTMLDetailsElement).open = true;
@@ -40,7 +38,7 @@ test.describe("R4 ExitPlanMode plan card", () => {
     expect(animationName).not.toBe("none");
   });
 
-  test("R4-3 resolved plan drops the footer and shows 'done' state (post-fix regression)", async ({ page }) => {
+  test("resolved plan drops the footer and shows 'done' state", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r4-plan-resolved");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {
       (d as HTMLDetailsElement).open = true;

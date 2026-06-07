@@ -3,7 +3,7 @@
 
 // Package codexapp talks to the Codex CLI app-server JSON-RPC control plane.
 // It is intentionally transport-level and keeps product semantics in callers:
-// Pockly remains the daemon/relay/web bridge, while Codex owns turns,
+// Pockly remains the daemon/Nexus/web bridge, while Codex owns turns,
 // approvals, models, and process PTY details.
 package codexapp
 

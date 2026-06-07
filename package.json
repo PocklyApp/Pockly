@@ -1,5 +1,6 @@
 {
   "name": "pockly",
+  "description": "Open-source remote workspace for local Claude Code and Codex sessions.",
   "version": "0.1.0",
   "private": false,
   "license": "Apache-2.0",
@@ -8,16 +9,26 @@
     "url": "https://github.com/PocklyApp/Pockly.git"
   },
   "type": "module",
+  "keywords": [
+    "pockly",
+    "nexus",
+    "claude-code",
+    "codex",
+    "remote-workspace",
+    "self-hosted"
+  ],
   "workspaces": [
     "web",
-    "relay"
+    "nexus"
   ],
   "scripts": {
-    "test": "npm --workspace relay test && npm --workspace web test",
+    "test": "npm --workspace nexus test && npm --workspace web test",
     "web:dev": "npm --workspace web run dev",
+    "web:lint": "npm --workspace web run lint",
     "web:build": "npm --workspace web run build",
     "web:typecheck": "npm --workspace web run typecheck",
-    "relay:test": "npm --workspace relay test"
+    "nexus:test": "npm --workspace nexus test",
+    "nexus:validate": "npm --workspace nexus run validate"
   },
   "engines": {
     "node": ">=20"

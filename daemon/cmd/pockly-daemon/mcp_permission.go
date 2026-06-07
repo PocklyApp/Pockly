@@ -236,9 +236,9 @@ func (s *mcpPermServer) handleToolCall(ctx context.Context, raw json.RawMessage)
 		return nil, &jrpcErr{Code: -32000, Message: "Pockly permission bridge is not interactive"}
 	}
 
-	// v0.2.0 interactive path. Mint a request_id, register, emit the
-	// event for the web to render, block on /await, then translate the
-	// outcome into the MCP envelope.
+	// Interactive path: mint a request_id, register, emit the event for
+	// the web to render, block on /await, then translate the outcome
+	// into the MCP envelope.
 	reqID := newRequestID()
 	if err := s.registerPermissionRequest(reqID, probe.ToolName, probe.Input); err != nil {
 		fmt.Fprintf(os.Stderr, "[pockly-mcp-permission] register failed (%v)\n", err)
@@ -404,7 +404,7 @@ func (s *mcpPermServer) postPermissionEvent(toolName string, input json.RawMessa
 		"decision":   decision,
 		"reason":     reason,
 		"ts":         time.Now().UTC().Format(time.RFC3339),
-		"request_id": requestID, // empty in legacy mode; v0.2.0 web uses this for /decide
+		"request_id": requestID, // empty in legacy mode; web uses this for /decide
 	}
 	payloadJSON, _ := json.Marshal(payload)
 	body, _ := json.Marshal(map[string]any{

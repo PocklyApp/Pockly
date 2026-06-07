@@ -23,9 +23,9 @@ import (
 )
 
 // `pockly-daemon update` brings the local install up to the latest tagged
-// daemon binary published on cdn.pocklyapp.com. The flow mirrors what the
-// install.sh script does on first install — but without sudo (assumes the
-// existing install lives somewhere writable, which is the only supported
+// daemon binary published by the configured release source. The flow mirrors
+// what the install.sh script does on first install — but without sudo (assumes
+// the existing install lives somewhere writable, which is the only supported
 // layout going forward) and with explicit version pinning support.
 //
 // Why a Go-internal subcommand instead of "just run install.sh again":
@@ -40,26 +40,27 @@ import (
 //     (or print the one-line command for the user).
 //
 // Layout we expect (matches what we ship via install.sh + tarballs):
-//   ~/.local/bin/pockly-daemon          (this binary)
-//   ~/.local/bin/pockly-claude-wrapper  (companion)
+//
+//	~/.local/bin/pockly-daemon          (this binary)
+//	~/.local/bin/pockly-claude-wrapper  (companion)
 //
 // Update writes new binaries to the same paths via os.Rename (atomic on
 // the same filesystem), then either reloads launchd or prints the
 // reload command depending on flags.
 const (
-	updateBaseURL   = "https://cdn.pocklyapp.com/pockly-daemon"
 	updateUserAgent = "pockly-daemon-updater"
 	// downloadTimeout caps the tarball fetch at 5 minutes — a 10 MB
 	// binary on a 1 Mbps link is ~80 s, so 5 min covers worst-case
 	// rural cellular while still failing closed on a stalled mirror.
 	downloadTimeout = 5 * time.Minute
-	// v0.1.32 is the first release that exists primarily to exercise
-	// the web-triggered remote update path end-to-end (web ▶ Update
-	// remotely → relay /api/hosts/{id}/update → daemon control WS
-	// → PerformUpdate → launchctl kickstart). Functionally identical
-	// to v0.1.31; tagging here so future readers don't wonder why a
-	// trivial-looking commit got its own release. — author note
+	// Minimum fallback offered by the web-triggered remote update path
+	// when Nexus does not expose release metadata.
 )
+
+var updateBaseURL = strings.TrimSpace(firstNonEmptyString(
+	os.Getenv("POCKLY_DAEMON_UPDATE_BASE_URL"),
+	os.Getenv("POCKLY_DAEMON_BASE_URL"),
+))
 
 func runUpdate(args []string) error {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
@@ -169,7 +170,7 @@ type PlatformAsset struct {
 
 // PerformUpdateOptions parameterizes PerformUpdate so non-CLI callers
 // (currently the control-WS handler that receives remote update_requests
-// from the relay) can drive the same code path the `pockly-daemon
+// from Nexus) can drive the same code path the `pockly-daemon
 // update` subcommand uses.
 type PerformUpdateOptions struct {
 	// TargetVersion ("v0.1.31") pins a specific release. Empty means
@@ -198,7 +199,7 @@ type PerformUpdateResult struct {
 // PerformUpdate runs the full download → verify → install → reload
 // sequence the `pockly-daemon update` CLI uses, but without flag
 // parsing or stdout printing — suitable for invocation from the
-// control-WS handler when the relay forwards a remote update request.
+// control-WS handler when Nexus forwards a remote update request.
 // All logs go through the standard log package; callers add their own
 // envelope (request_id, etc).
 func PerformUpdate(opts PerformUpdateOptions) (PerformUpdateResult, error) {
@@ -284,6 +285,9 @@ type manifestEntry struct {
 }
 
 func fetchChecksumManifest(channel string, verbose bool) (versionedManifest, error) {
+	if strings.TrimSpace(updateBaseURL) == "" {
+		return versionedManifest{}, errors.New("daemon update base URL is not configured")
+	}
 	url := fmt.Sprintf("%s/%s/checksums.txt", strings.TrimRight(updateBaseURL, "/"), channel)
 	if verbose {
 		fmt.Fprintf(os.Stderr, "GET %s\n", url)

@@ -3,7 +3,7 @@
 
 // Package sdkdriver owns daemon-started headless agent sessions. Claude Code
 // runs as a stream-json subprocess; Codex runs through the official app-server
-// JSON-RPC control plane. Both emit the same terminal.Event surface so relay
+// JSON-RPC control plane. Both emit the same terminal.Event surface so Nexus
 // and web do not need agent-specific transport plumbing.
 //
 // Architectural contract (matches docs/architecture.md, 2026-05-25 entry):
@@ -102,11 +102,10 @@ type Config struct {
 	// at spawn time from agent-settings store via Manager.settings.
 	Model string
 
-	// PermissionMode is the claude --permission-mode flag value:
-	// "default" / "acceptEdits" / "plan". Empty leaves the flag off
-	// so claude picks its built-in default. "bypassPermissions" is
-	// rejected at buildArgs time — the SDK driver always keeps the
-	// permission MCP wired so approval forwarding works.
+	// PermissionMode is the claude --permission-mode flag value. Empty
+	// leaves the flag off so claude picks its built-in default. Pockly
+	// passes native Claude modes through; Claude owns the policy and may
+	// reject modes that are not valid for the current session.
 	PermissionMode string
 
 	// Effort is claude's reasoning-effort level (low/medium/high/xhigh/max).
@@ -134,7 +133,7 @@ type Config struct {
 	NewSession bool
 
 	// PermissionStore is the transient approval broker shared with the web
-	// relay path. Claude uses it through --permission-prompt-tool; Codex uses
+	// approval path. Claude uses it through --permission-prompt-tool; Codex uses
 	// it to answer app-server approval server requests.
 	PermissionStore *permission.Store
 
@@ -349,7 +348,7 @@ func (d *Driver) Start(ctx context.Context) error {
 
 // Session returns the terminal.ExternalSession this driver writes events
 // to. Useful for callers that want to subscribe to the same event stream
-// (e.g. the relay forwarder) without going through the manager.
+// (e.g. the Nexus forwarder) without going through the manager.
 func (d *Driver) Session() *terminal.ExternalSession { return d.session }
 
 // Stop terminates the subprocess and tears down goroutines. Safe to call
@@ -418,19 +417,8 @@ func (d *Driver) buildArgs() ([]string, string, func(), error) {
 	// Permission mode: pass Claude Code's native mode through. Claude owns
 	// the policy and may reject modes that are not valid for this session.
 	switch strings.TrimSpace(d.cfg.PermissionMode) {
-	case "default", "acceptEdits", "plan", "auto":
+	case "default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk":
 		args = append(args, "--permission-mode", d.cfg.PermissionMode)
-	case "bypassPermissions", "dontAsk":
-		// Defense-in-depth: SDK sessions MUST keep canUseTool wired so tool
-		// approvals surface as web permission cards (the whole remote-safety
-		// model). bypassPermissions / dontAsk make claude skip the
-		// permission-prompt-tool, so tools would auto-execute with no remote
-		// approval. The SettingsReader contract says these are rejected, but
-		// nothing enforced it — and req.PermissionMode reaches buildArgs
-		// straight from routeStartTask unchecked. Drop the flag so claude
-		// falls back to its default, which still routes through our MCP
-		// permission tool. Loud-log the downgrade so it's never silent.
-		d.cfg.Logger("sdkdriver: refusing permission-mode %q for SDK session sid=%s (would bypass web approval) — using default", strings.TrimSpace(d.cfg.PermissionMode), d.cfg.SessionID)
 	}
 	if d.cfg.DaemonBinaryPath == "" {
 		return args, "", nil, nil
@@ -555,7 +543,7 @@ func (d *Driver) pumpStdin(ctx context.Context, ready chan<- struct{}) {
 // record to one terminal.Event emission. The mapping is intentionally
 // conservative: structured records (text deltas, tool calls, results)
 // land as MessageAdded events whose payload is the raw record JSON, so
-// the existing relay-side TurnDelta normalizer can consume them without
+// the existing Nexus-side TurnDelta normalizer can consume them without
 // any new path. The wrapper does the same thing via jsonl_watch.go;
 // we're just reading from a pipe instead of an on-disk file.
 func (d *Driver) pumpStdout() {
@@ -587,7 +575,7 @@ func (d *Driver) pumpStdout() {
 
 // handleStreamLine parses one stream-json record. Stream-json records
 // carry a top-level "type" that's one of system/assistant/user/result.
-// We forward the raw line as the MessageAdded payload so the relay
+// We forward the raw line as the MessageAdded payload so Nexus
 // receives the same shape the PTY wrapper sends. The dispatcher in
 // internal/agent/claude knows how to decode this.
 func (d *Driver) handleStreamLine(line []byte) {
@@ -602,7 +590,7 @@ func (d *Driver) handleStreamLine(line []byte) {
 	// claude --resume sometimes emits a `system` init record with the
 	// resolved session_id, which can differ from the requested one when
 	// claude forked a new jsonl. Track that via BindSessionMetadata so
-	// the manager's sidIndex (and relay's prior_session_ids) follow.
+	// the manager's sidIndex (and Nexus prior_session_ids) follow.
 	if probe.SessionID != "" {
 		d.session.BindSessionMetadata(probe.SessionID, "")
 	}

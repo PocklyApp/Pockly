@@ -178,7 +178,7 @@ func TestSetupURLEmbedsNonceInFragment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	u, err := s.SetupURL("https://pocklyapp.com")
+	u, err := s.SetupURL("https://nexus.example")
 	if err != nil {
 		t.Fatal(err)
 	}

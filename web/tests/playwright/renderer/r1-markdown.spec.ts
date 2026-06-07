@@ -5,16 +5,15 @@
 
 import { test, expect } from "@playwright/test";
 
-// R1 — Markdown GFM + code-block language label.
-// Cases R1-1, R1-2, R1-3 from docs/r1-r10-e2e-test-plan.md.
+// Markdown GFM + code-block language label.
 
-test.describe("R1 markdown rendering", () => {
+test.describe("markdown rendering", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/test/renderer?fixture=r1-gfm");
     await expect(page.locator("[data-fixture='r1-gfm']")).toBeVisible();
   });
 
-  test("R1-1 GFM table renders as semantic <table>", async ({ page }) => {
+  test("GFM table renders as semantic <table>", async ({ page }) => {
     const table = page.locator(".markdown-block table").first();
     await expect(table).toBeVisible();
     // 3 header cells per the fixture markdown
@@ -23,7 +22,7 @@ test.describe("R1 markdown rendering", () => {
     await expect(table.locator("tbody tr").first().locator("td").first()).toHaveText("1A");
   });
 
-  test("R1-2 task-list checkboxes render as .task-check spans, no <input>", async ({ page }) => {
+  test("task-list checkboxes render as .task-check spans, no <input>", async ({ page }) => {
     const taskItems = page.locator(".markdown-block li.task-item");
     await expect(taskItems).toHaveCount(2);
     // exactly one of them is checked
@@ -33,7 +32,7 @@ test.describe("R1 markdown rendering", () => {
     await expect(page.locator(".markdown-block input")).toHaveCount(0);
   });
 
-  test("R1-3 fenced code block carries data-lang and renders the label via CSS", async ({ page }) => {
+  test("fenced code block carries data-lang and renders the label via CSS", async ({ page }) => {
     const pre = page.locator("pre[data-lang='typescript']").first();
     await expect(pre).toBeVisible();
     // CSS-driven language label: pre[data-lang]::before should resolve

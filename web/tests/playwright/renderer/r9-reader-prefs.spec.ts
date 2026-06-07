@@ -5,8 +5,7 @@
 
 import { test, expect } from "@playwright/test";
 
-// R9 — reader preferences (autoExpandTools / showThinking /
-// showRawParameters).
+// Reader preferences (autoExpandTools / showThinking / showRawParameters).
 //
 // Post-design-port: narrative-foldable tool calls live inside a
 // ToolNarrativeGroup (.ws-narr). The narrative pill is the
@@ -26,8 +25,8 @@ async function setPrefs(page: import("@playwright/test").Page, prefs: Record<str
   );
 }
 
-test.describe("R9 reader preferences", () => {
-  test("R9-1 defaults: narrative pill collapsed, thinking hidden", async ({ page }) => {
+test.describe("reader preferences", () => {
+  test("defaults: narrative pill collapsed, thinking hidden", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r9-mix");
     await page.evaluate((key) => window.localStorage.removeItem(key), STORAGE_KEY);
     await page.reload();
@@ -46,7 +45,7 @@ test.describe("R9 reader preferences", () => {
     await expect(page.locator(".thinking-block")).toHaveCount(0);
   });
 
-  test("R9-2 autoExpandTools: narrative opens and every nested tool card opens", async ({ page }) => {
+  test("autoExpandTools opens narrative and every nested tool card", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r9-mix");
     await setPrefs(page, { autoExpandTools: true, showThinking: true, showRawParameters: true });
     await page.reload();
@@ -60,7 +59,7 @@ test.describe("R9 reader preferences", () => {
     expect(openCount).toBe(detailsCount);
   });
 
-  test("R9-3 showThinking=false removes the thinking block but other turns remain", async ({ page }) => {
+  test("showThinking=false removes the thinking block but other turns remain", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r9-mix");
     await setPrefs(page, { autoExpandTools: false, showThinking: false, showRawParameters: true });
     await page.reload();
@@ -72,7 +71,7 @@ test.describe("R9 reader preferences", () => {
     await expect(page.locator(".markdown-block")).toContainText("Done.");
   });
 
-  test("R9-4 showRawParameters=false hides input dump but not result", async ({ page }) => {
+  test("showRawParameters=false hides input dump but not result", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r9-mix");
     await setPrefs(page, { autoExpandTools: true, showThinking: true, showRawParameters: false });
     await page.reload();
@@ -86,7 +85,7 @@ test.describe("R9 reader preferences", () => {
     await expect(toolBody.locator(".tool-raw-block")).toContainText("page created");
   });
 
-  test("R9-6 corrupt localStorage → defaults, no app-level error", async ({ page }) => {
+  test("corrupt localStorage falls back to defaults without app-level error", async ({ page }) => {
     const appErrors: string[] = [];
     page.on("console", (msg) => {
       if (msg.type() !== "error") return;

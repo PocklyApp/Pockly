@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R4 — ExitPlanMode tool spec.
+// ExitPlanMode tool spec.
 //
 // Claude Code's plan mode emits ExitPlanMode as a tool_call whose
 // input.plan is a markdown string describing the proposed plan. The
@@ -18,11 +18,10 @@
 // Body="plan" tells ToolCallCard to mount <ToolPlanBody> which feeds
 // input.plan into MarkdownBlock and adds an approval-waiting footer.
 //
-// Approval-button wiring is intentionally NOT in R4. The plan
-// approval channel piggybacks on the existing assistant-text response
-// path (user just sends "approve" / "no, revise" as a message), and
-// the interactive button UX is in scope for R5 (AskUserQuestion)
-// rather than overloading R4.
+// Approval-button wiring intentionally stays out of this spec. The plan
+// approval channel piggybacks on the existing assistant-text response path: the
+// user sends "approve" or "no, revise" as a message. Native permission prompts
+// use their own approval bridge.
 
 import { stringField, truncateMiddle } from "../../../App";
 import type { ToolSpec } from "../types";

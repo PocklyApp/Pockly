@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// Renderer fixture mode — dev-only entry that mounts the real R1–R10
-// rendering components against synthetic SessionTurn data so Playwright
-// L3 specs can assert against deterministic conversation states.
+// Renderer fixture mode — dev-only entry that mounts the real rendering
+// components against synthetic SessionTurn data so Playwright specs can
+// assert against deterministic conversation states.
 //
 // Activation: visit `/test/renderer?fixture=<name>` on the vite dev
 // server. main.tsx branches to `mountRendererFixture` only when
@@ -13,9 +13,9 @@
 // JSON it imports tree-shakes out of production bundles.
 //
 // What this is NOT:
-//   - It does NOT exercise the wrapper / relay / daemon chain. For
-//     that, use the L2 API harness (`npm run e2e`).
-//   - It does NOT cover auth / browser-device handshake / SSE bridges.
+//   - It does NOT exercise the wrapper / Nexus / daemon chain. For
+//     that, use the local self-hosted API or real-agent harness.
+//   - It does NOT cover auth / browser access handshakes / SSE bridges.
 //     The fixture mounts with zero network requests by design.
 //
 // Each JSON fixture under src/test-fixtures/ declares a synthetic
@@ -115,9 +115,8 @@ function hydrateSession(partial: FixtureData["session"]): SessionListItem {
 
 function FixturePage({ fixtureName }: { fixtureName: string }) {
   const fixture = FIXTURES[fixtureName];
-  // turns held in state so test hooks can swap them at runtime
-  // (mainly used for R8's "banner self-hides" case where the test
-  // resolves a pending request without a page reload).
+  // Turns are held in state so test hooks can swap them at runtime, for
+  // example when a test resolves a pending request without a page reload.
   const [turns, setTurns] = useState<SessionTurn[]>(fixture?.turns ?? []);
 
   // Expose a tiny test-only API on window so specs can manipulate

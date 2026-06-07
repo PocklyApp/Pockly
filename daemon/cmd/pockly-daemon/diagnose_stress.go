@@ -25,20 +25,18 @@ import (
 )
 
 // runDiagnoseStress dispatches the `pockly-daemon diagnose stress <kind>`
-// family. v0.1.40 ships two stressors targeted at the two bugs the
-// v0.1.36 → v0.1.39 series fixed (or claimed to fix) — both rely on
-// the v0.1.38 telemetry pipeline to verify the server side actually
-// behaved as we claim.
+// family. The stressors exercise remote inject and SSE behavior. Optional
+// diagnostics cross-checks run only when a self-hosted diagnostics query URL
+// is configured.
 //
 //	inject-burst   Fire N parallel injects against a session, cross-
-//	               check that telemetry shows inject_started ==
-//	               inject_completed for each. Catches relay-side
+//	               optionally check that diagnostics show inject_started ==
+//	               inject_completed for each. Catches Nexus-side
 //	               races + drift detection misfires under load.
 //	sse-reconnect  Subscribe to a terminal_session's SSE stream and
 //	               abort+reopen every N seconds for a duration; count
-//	               events received per cycle. Proves the relay can
-//	               handle the rapid resubscribe pattern v0.1.39's
-//	               browser code now produces.
+//	               events received per cycle. Proves Nexus can handle
+//	               rapid browser resubscribe patterns.
 func runDiagnoseStress(args []string) error {
 	if len(args) == 0 {
 		return diagnoseStressUsageErr("stress requires a subcommand")
@@ -70,7 +68,7 @@ func diagnoseStressUsageErr(msg string) error {
 	return fmt.Errorf("%s\n\n%s", msg, diagnoseStressUsage())
 }
 
-// stressAuth is the shared bring-up: load identity, resolve relay URL,
+// stressAuth is the shared bring-up: load identity, resolve Nexus URL,
 // mint a daemon-WS bearer. Identical to runDiagnoseTelemetry's prologue
 // so the two share the same paired-daemon assumption.
 type stressAuth struct {
@@ -108,7 +106,7 @@ func setupStress(ctx context.Context, identityFile, relayURLOverride string) (*s
 		}
 	}
 	if baseURL == "" {
-		baseURL = "https://pocklyapp.com"
+		baseURL = defaultNexusURL()
 	}
 	baseURL = strings.TrimRight(baseURL, "/")
 	client := pair.NewClient(baseURL)
@@ -130,13 +128,16 @@ func runStressInjectBurst(args []string) error {
 	concurrency := fs.Int("concurrency", 3, "max parallel in-flight injects")
 	textPrefix := fs.String("text", "stress", "prefix for inject text (each numbered stress-1..N)")
 	identityFile := fs.String("identity-file", "", "identity path override")
-	relayURL := fs.String("relay-url", "", "relay URL override")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
+	nexusURL := fs.String("nexus-url", "", "Nexus URL override")
+	diagnosticsQueryURL := fs.String("query-url", os.Getenv("POCKLY_DIAGNOSTICS_QUERY_URL"), "optional self-hosted diagnostics query endpoint for telemetry cross-checks")
+	displayEnvBackedDefault(fs, "query-url", "POCKLY_DIAGNOSTICS_QUERY_URL")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: pockly-daemon diagnose stress inject-burst --session-id <sid> [flags]
 
-Fires --count injects with up to --concurrency in flight at once, then
-queries telemetry to cross-check inject_started/inject_completed/failed
-counts. Pass = HTTP 200 on every send AND telemetry counts match.
+Fires --count injects with up to --concurrency in flight at once. If
+--query-url or POCKLY_DIAGNOSTICS_QUERY_URL is set, also cross-checks
+inject_started/inject_completed/failed counts from that self-hosted provider.
 
 Example: 20 injects, 5 in flight at once:
   pockly-daemon diagnose stress inject-burst --session-id <sid> --count 20 --concurrency 5
@@ -152,7 +153,7 @@ Flags:`)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	auth, err := setupStress(ctx, *identityFile, *relayURL)
+	auth, err := setupStress(ctx, *identityFile, firstNonEmptyString(*nexusURL, *relayURL))
 	if err != nil {
 		return err
 	}
@@ -208,15 +209,22 @@ Flags:`)
 		fmt.Printf("  Last error: %s\n", lastErr)
 	}
 
-	// Cross-check with telemetry. Sleep briefly so the cloud has time
-	// to ingest the inject_completed events (daemon batches telemetry).
-	fmt.Println("\n  Sleeping 3s for telemetry ingest...")
+	queryURL := strings.TrimSpace(*diagnosticsQueryURL)
+	if queryURL == "" {
+		fmt.Println("\n=== diagnostics cross-check ===")
+		fmt.Println("  skipped: set --query-url or POCKLY_DIAGNOSTICS_QUERY_URL for a self-hosted diagnostics provider")
+		return nil
+	}
+
+	// Cross-check with optional diagnostics. Sleep briefly so the provider has
+	// time to ingest the inject_completed events.
+	fmt.Println("\n  Sleeping 3s for diagnostics ingest...")
 	time.Sleep(3 * time.Second)
 
-	fmt.Println("\n=== telemetry cross-check ===")
-	events, err := queryTelemetryForBurst(ctx, auth, targetDevice, startedAt)
+	fmt.Println("\n=== diagnostics cross-check ===")
+	events, err := queryTelemetryForBurst(ctx, auth, queryURL, targetDevice, startedAt)
 	if err != nil {
-		fmt.Printf("  WARN: telemetry query failed: %v\n", err)
+		fmt.Printf("  WARN: diagnostics query failed: %v\n", err)
 		return nil
 	}
 	countByName := map[string]int{}
@@ -233,11 +241,11 @@ Flags:`)
 		countByName["inject_failed"] == 0 &&
 		failCount == 0
 	if pass {
-		fmt.Println("\n  ✓ PASS: zero drops, all injects accepted, telemetry consistent")
+		fmt.Println("\n  PASS: zero drops, all injects accepted, diagnostics consistent")
 	} else {
-		fmt.Println("\n  ✗ FAIL: see counts above")
+		fmt.Println("\n  FAIL: see counts above")
 		if countByName["inject_completed"] < expected {
-			fmt.Printf("    inject_completed (%d) < expected (%d) — relay dropped some injects mid-pipeline\n",
+			fmt.Printf("    inject_completed (%d) < expected (%d) - Nexus dropped some injects mid-pipeline\n",
 				countByName["inject_completed"], expected)
 		}
 		if countByName["inject_failed"] > 0 {
@@ -282,16 +290,16 @@ func injectOnce(ctx context.Context, auth *stressAuth, sessionID, deviceID, text
 	return
 }
 
-// queryTelemetryForBurst fetches events since the burst started, scoped
-// to the daemon device. We don't filter by session in case session_id
-// isn't set on inject_* events (different relay versions vary).
-func queryTelemetryForBurst(ctx context.Context, auth *stressAuth, deviceID string, since time.Time) ([]map[string]any, error) {
+// queryTelemetryForBurst fetches events since the burst started, scoped to the
+// daemon device. We don't filter by session in case session_id isn't set on
+// inject_* events (different provider versions vary).
+func queryTelemetryForBurst(ctx context.Context, auth *stressAuth, queryURL, deviceID string, since time.Time) ([]map[string]any, error) {
 	q := url.Values{}
 	q.Set("device_id", deviceID)
 	q.Set("source", "daemon")
 	q.Set("since", time.Since(since).Round(time.Second).String())
 	q.Set("limit", "1000")
-	reqURL := auth.baseURL + "/api/dev/telemetry/recent?" + q.Encode()
+	reqURL := appendQuery(queryURL, q)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	req.Header.Set("Authorization", "Bearer "+auth.bearer)
 	resp, err := auth.hc.Do(req)
@@ -301,7 +309,7 @@ func queryTelemetryForBurst(ctx context.Context, auth *stressAuth, deviceID stri
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("relay %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("diagnostics provider %d: %s", resp.StatusCode, string(body))
 	}
 	var payload struct {
 		Events []map[string]any `json:"events"`
@@ -322,15 +330,16 @@ func runStressSSEReconnect(args []string) error {
 	duration := fs.Duration("duration", 30*time.Second, "total test runtime")
 	interval := fs.Duration("interval", 5*time.Second, "abort + reconnect cadence")
 	identityFile := fs.String("identity-file", "", "identity path override")
-	relayURL := fs.String("relay-url", "", "relay URL override")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
+	nexusURL := fs.String("nexus-url", "", "Nexus URL override")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: pockly-daemon diagnose stress sse-reconnect [flags]
 
 Subscribes to a terminal_session's SSE stream and abort+reconnects every
 --interval for --duration. Counts events received per cycle so you can
 spot gaps (events that fired during a disconnect window and weren't
-replayed). Simulates the v0.1.39 browser reconnect pattern at the
-server level — proves relay handles rapid resubscribe without leaking.
+replayed). Simulates rapid browser reconnects at the server level and
+proves Nexus handles resubscribe without leaking.
 
 Example: 60s test, reconnect every 5s:
   pockly-daemon diagnose stress sse-reconnect --session-id <sid> \\
@@ -344,7 +353,7 @@ Flags:`)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *duration+30*time.Second)
 	defer cancel()
-	auth, err := setupStress(ctx, *identityFile, *relayURL)
+	auth, err := setupStress(ctx, *identityFile, firstNonEmptyString(*nexusURL, *relayURL))
 	if err != nil {
 		return err
 	}
@@ -414,16 +423,16 @@ Flags:`)
 }
 
 // readSSECycle subscribes to the LOCAL daemon's terminal_session
-// stream (127.0.0.1:8947) — relay's /api/terminal-sessions/.../stream
+// stream (127.0.0.1:8947) — Nexus /api/terminal-sessions/.../stream
 // wants a browser bearer and we have a daemon bearer. The local
-// endpoint broadcasts the same events the relay would forward (in
-// fact, the relay forward IS sourced from this same stream), so this
+// endpoint broadcasts the same events Nexus would forward (in
+// fact, the Nexus forward IS sourced from this same stream), so this
 // gives us a clean view of "what events did the daemon emit per
-// reconnect cycle" without dealing with relay auth.
+// reconnect cycle" without dealing with Nexus auth.
 //
 // Trade-off: this only proves the LOCAL wrapper→daemon side handles
-// rapid resubscribe. The relay → browser path is what v0.1.39 fixed,
-// and that path needs a separate test (or a relay-side relaxation
+// rapid resubscribe. The Nexus → browser path needs a separate test
+// or a Nexus-side relaxation
 // to accept daemon bearers). For the MVP this is the highest-signal
 // per-unit-effort.
 func readSSECycle(ctx context.Context, auth *stressAuth, tsID string) (int, string, error) {
@@ -440,7 +449,7 @@ func readSSECycle(ctx context.Context, auth *stressAuth, tsID string) (int, stri
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, "", fmt.Errorf("relay %d: %s", resp.StatusCode, string(body))
+		return 0, "", fmt.Errorf("Nexus %d: %s", resp.StatusCode, string(body))
 	}
 	var (
 		count          int
@@ -466,7 +475,7 @@ func readSSECycle(ctx context.Context, auth *stressAuth, tsID string) (int, stri
 }
 
 // lookupTerminalSessionID asks the LOCAL daemon (127.0.0.1:8947) for
-// its terminal_sessions table. Relay's /api/terminal-sessions requires
+// its terminal_sessions table. Nexus /api/terminal-sessions requires
 // a browser-flavored bearer (user-session cookie), but the local
 // daemon's /api/dev/terminal-sessions is unauthenticated localhost-only
 // and has the same info — keyed on claude_session_id which is what

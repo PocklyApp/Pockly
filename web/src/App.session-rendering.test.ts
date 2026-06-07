@@ -38,11 +38,11 @@ test("renderDuplexChatMessages ignores raw ANSI text_delta chat output", () => {
 
 test("renderDuplexChatMessages renders clean assistant message_added payloads", () => {
   const messages = renderDuplexChatMessages([
-    terminalEvent("message_added", JSON.stringify({ role: "assistant", text: "POWERSHELL_E2E_OK" })),
+    terminalEvent("message_added", JSON.stringify({ role: "assistant", text: "POWERSHELL_RENDER_OK" })),
   ]);
   assert.equal(messages.length, 1);
   assert.equal(messages[0].role, "assistant");
-  assert.equal(messages[0].text, "POWERSHELL_E2E_OK");
+  assert.equal(messages[0].text, "POWERSHELL_RENDER_OK");
 });
 
 test("renderDuplexChatMessages surfaces session_disconnected as a system notice", () => {
@@ -271,7 +271,7 @@ test("groupConsecutiveTools ignores tool_call without a tool name", () => {
 });
 
 // Regression: "one send shows two bubbles" on SDK sessions. The live turnHub
-// push stamps the user message + assistant reply with the relay's terminal-event
+// push stamps the user message + assistant reply with the Nexus terminal-event
 // seq (small ints), while the jsonl history sync re-stamps the same turns with a
 // block-index seq. When the authoritative GET /turns response merges in,
 // reconcileHydratedTurns must NOT keep both genuine copies (dedupeUserMessageGhosts
@@ -322,7 +322,7 @@ test("reconcileHydratedTurns collapses a no-uuid live user turn into its uuid'd 
   assert.equal(visible.filter((t) => t.kind === "user_message" && String(t.payload?.text ?? "").startsWith("你好")).length, 1);
 });
 
-// The relay can persist the SAME assistant record under two seqs (live SDK
+// Nexus can persist the SAME assistant record under two seqs (live SDK
 // bridge seq + jsonl history-sync seq), both carrying the same uuid. Keyed on
 // seq alone both survive and the reply renders twice. dedupeTurnsByUuid must
 // collapse same-uuid turns to one regardless of seq.

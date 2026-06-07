@@ -96,7 +96,7 @@ test("bestContinuationCandidate prefers PTY-backed paired online session", () =>
   assert.equal(picked?.device_id, "dd_best");
 });
 
-test("daemonUpdateTargets uses relay CDN latest metadata", () => {
+test("daemonUpdateTargets uses release latest metadata", () => {
   const devices = [
     daemonDevice("dd_old", { app_version: "v0.4.36" }),
     daemonDevice("dd_current", { app_version: "v0.4.37" }),
@@ -124,7 +124,7 @@ test("daemonUpdateTargets uses relay CDN latest metadata", () => {
   assert.equal(targets[0].daemon_update_source, "cdn_latest");
 });
 
-test("daemonUpdateTargets falls back to minimum recommended version for old relays", () => {
+test("daemonUpdateTargets falls back to minimum recommended version for old Nexus runtimes", () => {
   const devices = [
     daemonDevice("dd_old", { app_version: "v0.1.36" }),
     daemonDevice("dd_current", { app_version: "v0.1.37" }),
@@ -138,7 +138,7 @@ test("daemonUpdateTargets falls back to minimum recommended version for old rela
   assert.equal(targets[0].daemon_update_source, "minimum_recommended");
 });
 
-test("daemonUpdateTargets can use CDN latest metadata from device records", () => {
+test("daemonUpdateTargets can use release latest metadata from device records", () => {
   const devices = [
     daemonDevice("dd_old", {
       app_version: "v0.4.36",
@@ -188,7 +188,7 @@ test("pickSelection falls back to the global best continuation when route is ful
   assert.deepEqual(picked, { sessionId: "sess_best", deviceId: "dd_best" });
 });
 
-test("devicePresenceStatus trusts relay presence_status when provided", () => {
+test("devicePresenceStatus trusts Nexus presence_status when provided", () => {
   const device = daemonDevice("dd_test");
   const connectingHost = host("dd_test", { presence_status: "connecting" });
   const degradedHost = host("dd_test", { presence_status: "degraded" });
@@ -253,12 +253,12 @@ test("groupSessions merges Claude Code and Codex sessions in the same workspace"
   const sessions = [
     session("sess_claude", "dd_a", {
       agent: "claude-code",
-      cwd: "/Users/liuzheng/Desktop/workspace/Pockly",
+      cwd: "/Users/dev/workspace/Pockly",
       last_timestamp: "2026-06-06T08:00:00Z",
     }),
     session("sess_codex", "dd_a", {
       agent: "codex",
-      cwd: "/Users/liuzheng/Desktop/workspace/Pockly/",
+      cwd: "/Users/dev/workspace/Pockly/",
       last_timestamp: "2026-06-06T08:05:00Z",
     }),
   ];
@@ -324,7 +324,7 @@ test("pickSelection preserves a draft selection even when not in catalog", () =>
 test("pickSelection keeps a just-promoted session_id even before catalog catches up", () => {
   // Regression: after a draft is promoted to a real session_id via the
   // daemon's session_created event, the URL replaces to the new sid.
-  // The next catalog refresh runs before the relay has caught up, so the
+  // The next catalog refresh runs before Nexus has caught up, so the
   // new sid isn't in `sessions` yet. Without this short-circuit, the
   // workspaceSession branch would fall through to bestContinuationCandidate
   // and silently swap the user onto the most-active existing session on

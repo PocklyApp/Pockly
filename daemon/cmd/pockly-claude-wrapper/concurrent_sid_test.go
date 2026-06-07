@@ -10,8 +10,8 @@ import (
 	"time"
 )
 
-// TestConcurrentCLIClaudesRaceMtimeFallback documents the v0.1.36
-// motivating bug.
+// TestConcurrentCLIClaudesRaceMtimeFallback documents why mtime-based
+// discovery is unsafe for concurrent Claude CLI sessions in one directory.
 //
 // Scenario: the user has TWO claude terminals open in the same project
 // directory. Each is a separate `claude` invocation, each wrapped by its
@@ -32,10 +32,9 @@ import (
 //
 // This test makes that wrongness explicit and reproducible: we create
 // two CLI-marked jsonls representing the two concurrent claudes, give B
-// a slightly newer mtime, and assert that the current code returns B.
-// In v0.1.36 the wrapper will lock onto a self-generated UUID before
-// exec'ing claude, so this whole code path goes away — newestJSONLAfter
-// is deleted, and this test becomes the proof of why.
+// a slightly newer mtime, and assert that mtime-only selection returns B.
+// The wrapper now locks onto a generated session id before exec'ing Claude,
+// so active-session discovery must not fall back to this guess.
 func TestConcurrentCLIClaudesRaceMtimeFallback(t *testing.T) {
 	dir := t.TempDir()
 
@@ -78,20 +77,17 @@ func TestConcurrentCLIClaudesRaceMtimeFallback(t *testing.T) {
 	if sid != "bbb" {
 		t.Fatalf("test setup wrong: expected bbb (the newer one), got %q (%s)", sid, path)
 	}
-	// v0.1.36 verification: newestJSONLAfter's wrong-binding behavior
-	// hasn't changed (the function still does mtime-newest semantics —
-	// it's now used for --continue pre-resolution where that's actually
-	// what the user wants). What changed is that resolveActiveSession
-	// no longer FALLS BACK to this function. The next sub-test proves
-	// that: with no PID (= fd-discovery returns nothing), the resolver
-	// returns empty rather than guessing by mtime.
+	// newestJSONLAfter still does mtime-newest selection because --continue
+	// pre-resolution needs that behavior. The active-session resolver must
+	// not fall back to it when PID-scoped discovery fails; with no PID, it
+	// should return empty rather than guessing by mtime.
 	bridge := &daemonBridge{}
 	gotSID, gotPath := bridge.resolveActiveSession(0, dir, startA)
 	if gotSID != "" || gotPath != "" {
-		t.Fatalf("v0.1.36 contract broken: resolveActiveSession(pid=0) must return empty "+
+		t.Fatalf("active-session contract broken: resolveActiveSession(pid=0) must return empty "+
 			"(fd-discovery fails, mtime fallback deleted), got sid=%q path=%q. "+
 			"If this fails, the mtime fallback was reintroduced into the discovery "+
-			"path — undoing the v0.1.36 fix for the concurrent-claude race.",
+			"path — reintroducing the concurrent-claude race.",
 			gotSID, gotPath)
 	}
 }
@@ -105,12 +101,12 @@ func TestConcurrentCLIClaudesRaceMtimeFallback(t *testing.T) {
 // We can't easily simulate "my PID has this jsonl open" in a unit test
 // without spawning real processes, so this test stays as a documented
 // invariant — the production guarantee is "fd discovery, when it works,
-// is authoritative." v0.1.36 makes that the *only* guarantee by removing
-// the mtime fallback that currently masks fd failures.
+// is authoritative." The active-session resolver keeps that as the only
+// automatic binding guarantee instead of masking fd failures with mtime.
 func TestConcurrentCLIClaudesFDDiscoveryIsCorrect(t *testing.T) {
 	t.Log("invariant: activeJSONL(pid, dir) is PID-scoped via lsof or /proc/<pid>/fd; " +
 		"two concurrent claudes in the same project dir never cross-bind because each " +
 		"wrapper only consults its own child PID's open-fd table. " +
 		"The risk is fd-discovery failure (containers, missing lsof) silently falling " +
-		"through to the mtime path — which v0.1.36 eliminates.")
+		"through to the mtime path, which active-session discovery must avoid.")
 }

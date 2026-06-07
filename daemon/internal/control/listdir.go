@@ -12,7 +12,7 @@ import (
 
 const listDirMaxEntries = 500
 
-// handleListDir reads a single directory level on behalf of the relay/web UI.
+// handleListDir reads a single directory level on behalf of the web UI.
 // Empty path resolves to the user's home directory. Dotfiles are hidden by
 // default. Directory symlinks are reported as links and shown as navigable
 // directories so the web picker behaves like a normal file browser.

@@ -3,13 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — per-tool registry unit tests.
+// Per-tool registry unit tests.
 //
 // These are PURE function tests (specs return data, no React) — the
-// goal is to lock in the wire-shape mapping for each tool we ship in
-// R2 so future spec edits can't silently drop a field or regress the
-// rows order. Visual rendering is verified separately via the
-// browser fixture.
+// goal is to lock in the wire-shape mapping for each supported tool so future
+// spec edits can't silently drop a field or regress the rows order. Visual
+// rendering is verified separately via the browser fixture.
 
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
@@ -21,17 +20,16 @@ function payload(tool: string, input: unknown, extra: Partial<ToolPayload> = {})
 }
 
 describe("tool registry", () => {
-  it("Bash → terminal icon + command headerArg + command body (R3)", () => {
+  it("Bash -> terminal icon + command headerArg + command body", () => {
     const spec = resolveToolSpec("Bash");
     const out = spec.display({ command: "ls -la /tmp" }, payload("Bash", null), "");
     assert.equal(out.name, "Bash");
     assert.equal(out.icon, "terminal");
     assert.equal(out.headerArg, "ls -la /tmp");
-    // R3: body switched from rows-and-raw to command so the
-    // ToolCommandBody mounts the terminal-styled block.
+    // body=command mounts the terminal-styled block.
     assert.equal(out.body, "command");
-    // R3: cmd is no longer a row (it lives in the terminal block);
-    // desc / cwd still get rows when present.
+    // cmd is no longer a row because it lives in the terminal block; desc / cwd
+    // still get rows when present.
     assert.equal(out.rows.find((r) => r.key === "cmd"), undefined);
   });
 
@@ -174,7 +172,7 @@ describe("tool registry", () => {
     assert.equal(out.headerArg, "review the diff");
   });
 
-  it("ExitPlanMode → plan body + 'awaiting approval' state (R4)", () => {
+  it("ExitPlanMode -> plan body + 'awaiting approval' state", () => {
     const spec = resolveToolSpec("ExitPlanMode");
     const out = spec.display(
       { plan: "## Step 1\n\nFirst do this.\n\n## Step 2\n\nThen that." },

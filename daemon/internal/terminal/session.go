@@ -37,10 +37,9 @@ const (
 	EventSessionReady   EventKind = "session_ready"
 	EventUserInput      EventKind = "user_input"
 	EventTextDelta      EventKind = "text_delta"
-	// EventMessageAdded is v0.1.35's replacement for text_delta on the
-	// wrapper path. Payload is JSON {role, text, uuid, timestamp}
-	// extracted from one Claude jsonl record. See
-	// cmd/pockly-claude-wrapper/jsonl_watch.go.
+	// EventMessageAdded carries one structured chat message extracted
+	// from an agent JSONL record. Payload is JSON
+	// {role, text, uuid, timestamp}.
 	EventMessageAdded  EventKind = "message_added"
 	EventPromptReady   EventKind = "prompt_ready"
 	EventSessionExited EventKind = "session_exited"

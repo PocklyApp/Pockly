@@ -152,8 +152,8 @@ type jsonlMessageEvent struct {
 // extractMessageEvents pulls user-visible live events out of one jsonl
 // record. It intentionally emits tool_call/tool_result as structured
 // events instead of waiting for catalog sync: live web sessions often show
-// the final assistant text before encrypted history is refreshed, and users
-// must still see the tool that Claude requested/executed.
+// the final assistant text before the full history window is refreshed, and
+// users must still see the tool that Claude requested/executed.
 //
 // kind values map to web-side rendering:
 //
@@ -190,8 +190,8 @@ func extractMessageEvents(rec map[string]any) []jsonlMessageEvent {
 	}
 }
 
-// extractMessageText is kept for older unit tests and helpers. Runtime code
-// uses extractMessageEvents so tool calls are not dropped from the live UI.
+// extractMessageText is kept for compatibility helpers. Runtime code uses
+// extractMessageEvents so tool calls are not dropped from the live UI.
 func extractMessageText(rec map[string]any) (kind string, text string) {
 	t, _ := rec["type"].(string)
 	switch t {

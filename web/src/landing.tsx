@@ -4,9 +4,9 @@
  */
 
 /**
- * Pockly landing page v2 — redesigned via Claude Design.
+ * Pockly landing page v2.
  *
- * Faithful port of "Pockly Landing v2.html": a 4-page snap-scroll site
+ * A 4-page snap-scroll site
  * (Hero · Features · How it works · Install + Footer) with page dots,
  * keyboard nav, a phone/terminal "turntable" in the hero, and the
  * local-setup narrative (install script → sign in to connect this
@@ -22,6 +22,7 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { ThemeToggle } from "./components/layout/theme-toggle";
+import { configuredAuthHostLabel, configuredInstallUnixCommand, configuredInstallWindowsCommand } from "./runtime-config";
 
 // ─── Minimal shared types (mirrors the subset used from App.tsx) ──────────────
 type AuthStatus = "loading" | "anonymous" | "authenticated";
@@ -341,7 +342,7 @@ function Terminal({ paused = false }: { paused?: boolean }) {
           <span />
           <span />
         </div>
-        <div className="landing-mac-title">claude — relay-svc</div>
+        <div className="landing-mac-title">claude — nexus-svc</div>
         <div className="landing-mac-meta">dev-mbp</div>
       </div>
       <div className="landing-terminal" ref={bodyRef}>
@@ -455,7 +456,7 @@ function PhonePreview() {
           <span className="landing-crumb">
             <span className="landing-crumb-dot" />
             <strong>Pockly</strong>
-            <span className="landing-crumb-proj">/ relay-svc</span>
+            <span className="landing-crumb-proj">/ nexus-svc</span>
           </span>
           <span className="landing-btn-soft" aria-hidden="true">
             <svg
@@ -515,13 +516,13 @@ function installTargets(t: (key: string) => string) {
       id: "unix",
       label: t("public.landingV2.installTargets.unix"),
       prompt: "$",
-      cmd: "curl -fsSL https://cdn.pocklyapp.com/install.sh | bash",
+      cmd: configuredInstallUnixCommand(),
     },
     {
       id: "win",
       label: t("public.landingV2.installTargets.windowsShort"),
       prompt: "PS",
-      cmd: "irm https://cdn.pocklyapp.com/install.ps1 | iex",
+      cmd: configuredInstallWindowsCommand(),
     },
   ];
 }
@@ -532,13 +533,13 @@ function bandInstallTargets(t: (key: string) => string) {
       id: "unix",
       label: t("public.landingV2.installTargets.unix"),
       prompt: "$",
-      cmd: "curl -fsSL https://cdn.pocklyapp.com/install.sh | bash",
+      cmd: configuredInstallUnixCommand(),
     },
     {
       id: "win",
       label: t("public.landingV2.installTargets.windows"),
       prompt: "PS",
-      cmd: "irm https://cdn.pocklyapp.com/install.ps1 | iex",
+      cmd: configuredInstallWindowsCommand(),
     },
   ];
 }
@@ -779,7 +780,7 @@ function HowItWorks({ onNext }: { onNext: () => void }) {
           <p>{t("public.landingV2.how.step1.body")}</p>
           <div className="landing-step-cmd">
             <span className="landing-prompt">$ </span>
-            curl -fsSL https://cdn.pocklyapp.com/install.sh | bash
+            {configuredInstallUnixCommand()}
           </div>
         </div>
 
@@ -791,11 +792,11 @@ function HowItWorks({ onNext }: { onNext: () => void }) {
           <div className="landing-auth-card" role="status" aria-live="polite">
             <div className="landing-auth-head">
               <span className="landing-auth-dot" aria-hidden="true" />
-              <span>{t("public.landingV2.how.step2.authHost")}</span>
+              <span>{configuredAuthHostLabel()}</span>
             </div>
             <div>
               <div className="landing-auth-q">{t("public.landingV2.how.step2.authQ")}</div>
-              <div className="landing-auth-dev">cursor-mbp.local · daemon v0.6</div>
+              <div className="landing-auth-dev">cursor-mbp.local · daemon online</div>
             </div>
             <button type="button" className="landing-auth-btn">
               <span className="landing-auth-btn-label">{t("public.landingV2.how.step2.authBtn")}</span>

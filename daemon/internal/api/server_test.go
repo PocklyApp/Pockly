@@ -111,10 +111,10 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
-func TestStatusEndpointReportsRelayAndRunner(t *testing.T) {
+func TestStatusEndpointReportsNexusCompatibilityAndRunner(t *testing.T) {
 	h := NewHandler(Config{
 		RefreshInterval: time.Minute,
-		RelayURL:        "https://pocklyapp.com",
+		RelayURL:        "https://nexus.example",
 		Profile:         runner.Profile{ClaudeAlias: runner.AliasClaudeCCR},
 	})
 	req := loopbackRequest(http.MethodGet, "/api/status", nil)
@@ -127,10 +127,13 @@ func TestStatusEndpointReportsRelayAndRunner(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body["environment_label"] != "production" {
-		t.Errorf("environment_label = %v, want production", body["environment_label"])
+	if body["environment_label"] != "custom" {
+		t.Errorf("environment_label = %v, want custom", body["environment_label"])
 	}
-	if body["effective_relay_url"] != "https://pocklyapp.com" {
+	if body["effective_nexus_url"] != "https://nexus.example" {
+		t.Errorf("effective_nexus_url = %v", body["effective_nexus_url"])
+	}
+	if body["effective_relay_url"] != "https://nexus.example" {
 		t.Errorf("effective_relay_url = %v", body["effective_relay_url"])
 	}
 	if body["claude_runner_alias"] != "claude_ccr" {
@@ -144,11 +147,9 @@ func TestEnvironmentLabel(t *testing.T) {
 		want string
 	}{
 		{"", "disconnected"},
-		{"https://pocklyapp.com", "production"},
-		{"https://staging.pocklyapp.com", "production"},
 		{"http://127.0.0.1:8080", "local"},
 		{"http://localhost:8080", "local"},
-		{"https://relay.example.com", "custom"},
+		{"https://nexus.example.com", "custom"},
 		{":::", "unknown"},
 	}
 	for _, tc := range cases {
@@ -541,8 +542,8 @@ func mustWriteFile(t *testing.T, path string, body string) {
 	}
 }
 
-// TestPermissionRequestsEndToEnd is the v0.2.0 D1 wire-level test
-// for the register → await → decide flow. Spins up the real handler
+// TestPermissionRequestsEndToEnd is the HTTP wire-level test for the
+// register → await → decide flow. Spins up the real handler
 // with a permission.Store, registers via HTTP, parks an Await in a
 // goroutine, POSTs a decide, asserts Await returns allow/deny. Also
 // covers list + cancel + invalid-payload negative paths.

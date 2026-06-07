@@ -81,7 +81,7 @@ func TestAgentSettingsGetSucceedsForSDKHeadless(t *testing.T) {
 }
 
 func TestAgentSettingsGetExposesResolvedModelFromJsonl(t *testing.T) {
-	t.Setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro")
+	t.Setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "anthropic-compatible-pro")
 
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, "claude-projects")
@@ -96,7 +96,7 @@ func TestAgentSettingsGetExposesResolvedModelFromJsonl(t *testing.T) {
 	const sid = "12121212-1212-1212-1212-121212121212"
 	jsonl := strings.Join([]string{
 		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:00Z","type":"user","message":{"role":"user","content":"hi"}}`,
-		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:01Z","type":"assistant","message":{"role":"assistant","model":"deepseek-v4-flash","content":[]}}`,
+		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:01Z","type":"assistant","message":{"role":"assistant","model":"anthropic-compatible-fast","content":[]}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(projectDir, sid+".jsonl"), []byte(jsonl), 0o644); err != nil {
 		t.Fatalf("seed jsonl: %v", err)
@@ -117,13 +117,13 @@ func TestAgentSettingsGetExposesResolvedModelFromJsonl(t *testing.T) {
 	if res.Model != "opus" {
 		t.Fatalf("Model = %q, want selected alias opus", res.Model)
 	}
-	if res.ResolvedModel != "deepseek-v4-flash" {
-		t.Fatalf("ResolvedModel = %q, want jsonl ground truth deepseek-v4-flash", res.ResolvedModel)
+	if res.ResolvedModel != "anthropic-compatible-fast" {
+		t.Fatalf("ResolvedModel = %q, want jsonl ground truth anthropic-compatible-fast", res.ResolvedModel)
 	}
 }
 
 func TestAgentSettingsGetUsesConfirmedModelCommandBeforeNextAssistant(t *testing.T) {
-	t.Setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro")
+	t.Setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "anthropic-compatible-pro")
 
 	tmp := t.TempDir()
 	claudeHome := filepath.Join(tmp, "claude-projects")
@@ -137,8 +137,8 @@ func TestAgentSettingsGetUsesConfirmedModelCommandBeforeNextAssistant(t *testing
 	}
 	const sid = "34343434-3434-3434-3434-343434343434"
 	jsonl := strings.Join([]string{
-		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:00Z","type":"assistant","message":{"role":"assistant","model":"deepseek-v4-flash","content":[]}}`,
-		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:01Z","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mdeepseek-v4-pro\u001b[22m for this session</local-command-stdout>"}}`,
+		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:00Z","type":"assistant","message":{"role":"assistant","model":"anthropic-compatible-fast","content":[]}}`,
+		`{"sessionId":"` + sid + `","cwd":"/tmp/proj","timestamp":"2026-05-25T00:00:01Z","type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1manthropic-compatible-pro\u001b[22m for this session</local-command-stdout>"}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(projectDir, sid+".jsonl"), []byte(jsonl), 0o644); err != nil {
 		t.Fatalf("seed jsonl: %v", err)
@@ -159,8 +159,8 @@ func TestAgentSettingsGetUsesConfirmedModelCommandBeforeNextAssistant(t *testing
 	if res.Model != "opus" {
 		t.Fatalf("Model = %q, want selected alias opus", res.Model)
 	}
-	if res.ResolvedModel != "deepseek-v4-pro" {
-		t.Fatalf("ResolvedModel = %q, want confirmed /model stdout target deepseek-v4-pro", res.ResolvedModel)
+	if res.ResolvedModel != "anthropic-compatible-pro" {
+		t.Fatalf("ResolvedModel = %q, want confirmed /model stdout target anthropic-compatible-pro", res.ResolvedModel)
 	}
 }
 
@@ -183,7 +183,7 @@ func TestModelCommandConfirmationIsScopedToSession(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(projectDir, sidA+".jsonl"), []byte(sessionLine(sidA, "hi")), 0o644); err != nil {
 		t.Fatalf("seed sidA: %v", err)
 	}
-	proStdout := `<local-command-stdout>Set model to \u001b[1mdeepseek-v4-pro\u001b[22m for this session</local-command-stdout>`
+	proStdout := `<local-command-stdout>Set model to \u001b[1manthropic-compatible-pro\u001b[22m for this session</local-command-stdout>`
 	if err := os.WriteFile(filepath.Join(projectDir, sidB+".jsonl"), []byte(sessionLine(sidB, proStdout)), 0o644); err != nil {
 		t.Fatalf("seed sidB: %v", err)
 	}
@@ -192,14 +192,14 @@ func TestModelCommandConfirmationIsScopedToSession(t *testing.T) {
 		t.Fatalf("idx.Refresh: %v", err)
 	}
 	adapter := agentSettingsAdapter{store: agentsettings.New(), terminal: liveterminal.NewManager(), index: idx}
-	gotA, err := adapter.countModelCommandTargetForSession(sidA, "deepseek-v4-pro")
+	gotA, err := adapter.countModelCommandTargetForSession(sidA, "anthropic-compatible-pro")
 	if err != nil {
 		t.Fatalf("count sidA: %v", err)
 	}
 	if gotA != 0 {
 		t.Fatalf("sidA count = %d, want 0; sidB stdout must not confirm sidA", gotA)
 	}
-	gotB, err := adapter.countModelCommandTargetForSession(sidB, "deepseek-v4-pro")
+	gotB, err := adapter.countModelCommandTargetForSession(sidB, "anthropic-compatible-pro")
 	if err != nil {
 		t.Fatalf("count sidB: %v", err)
 	}
@@ -476,34 +476,34 @@ func TestSDKSettingsReaderReadsPermissionMode(t *testing.T) {
 
 func TestParseCodexConfigModel(t *testing.T) {
 	got := parseCodexConfigModel(`
-model = "deepseek-v4-flash"
-model_provider = "deepseek" # comment
+model = "openai-compatible-fast"
+model_provider = "openai-compatible" # comment
 
-[model_providers.deepseek]
-name = "DeepSeek"
-base_url = "https://api.deepseek.com"
-env_key = "DEEPSEEK_API_KEY"
+[model_providers.openai-compatible]
+name = "OpenAI Compatible"
+base_url = "https://llm-gateway.example"
+env_key = "OPENAI_COMPAT_API_KEY"
 `)
-	if got.model != "deepseek-v4-flash" {
-		t.Fatalf("model = %q, want deepseek-v4-flash", got.model)
+	if got.model != "openai-compatible-fast" {
+		t.Fatalf("model = %q, want openai-compatible-fast", got.model)
 	}
-	if got.modelProvider != "deepseek" {
-		t.Fatalf("modelProvider = %q, want deepseek", got.modelProvider)
+	if got.modelProvider != "openai-compatible" {
+		t.Fatalf("modelProvider = %q, want openai-compatible", got.modelProvider)
 	}
 }
 
 func TestCodexConfigModelOption(t *testing.T) {
-	opt := codexConfigModelOption(codexConfigModel{model: "deepseek-v4-flash", modelProvider: "deepseek"})
-	if opt.Value != "deepseek-v4-flash" {
+	opt := codexConfigModelOption(codexConfigModel{model: "openai-compatible-fast", modelProvider: "openai-compatible"})
+	if opt.Value != "openai-compatible-fast" {
 		t.Fatalf("Value = %q", opt.Value)
 	}
-	if opt.ResolvedModel != "deepseek-v4-flash" {
+	if opt.ResolvedModel != "openai-compatible-fast" {
 		t.Fatalf("ResolvedModel = %q", opt.ResolvedModel)
 	}
 	if opt.Source != "codex_config" {
 		t.Fatalf("Source = %q, want codex_config", opt.Source)
 	}
-	if !strings.Contains(opt.Label, "deepseek") {
+	if !strings.Contains(opt.Label, "openai-compatible") {
 		t.Fatalf("Label = %q, want provider hint", opt.Label)
 	}
 }

@@ -5,14 +5,14 @@
 
 import { test, expect } from "@playwright/test";
 
-// R7 — TokenUsagePie context-window indicator.
+// TokenUsagePie context-window indicator.
 // The fixture page now mounts the REAL TokenUsagePie exported from
 // App.tsx (not a stripped copy), so these specs also catch regressions
 // in the SVG arc, the role="img" + localized aria-label, and the
 // tooltip placement — surface that a tier-class-only copy would miss.
 
-test.describe("R7 token usage pie", () => {
-  test("R7-3 warn tier (~65%) → .token-usage-pie-warn + svg arc + tooltip", async ({ page }) => {
+test.describe("token usage pie", () => {
+  test("warn tier around 65% renders .token-usage-pie-warn + svg arc + tooltip", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r7-usage-65pct");
     const pie = page.locator(".token-usage-pie").first();
     await expect(pie).toBeVisible();
@@ -33,7 +33,7 @@ test.describe("R7 token usage pie", () => {
     await expect(pie.locator(".token-usage-pct")).toContainText("65%");
   });
 
-  test("R7-4 codex danger tier uses 272k denominator, semibold red %", async ({ page }) => {
+  test("codex danger tier uses 272k denominator and semibold red percent", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r7-usage-codex");
     const pie = page.locator(".token-usage-pie").first();
     await expect(pie).toHaveClass(/token-usage-pie-danger/);

@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // gen-password-hash prints an argon2id password hash to stdout.
-// Used by local E2E helpers to seed the relay DB with a known password.
+// Used by local E2E helpers to seed the Nexus DB with a known password.
 //
 // Usage: gen-password-hash <password>
 //
-// The hash uses the relay's default parameters (m=65536, t=3, p=1) with
-// no pepper (relay started without --password-pepper in dev/e2e mode).
+// The hash uses Nexus default parameters (m=65536, t=3, p=1) with
+// no pepper (Nexus started without --password-pepper in dev/e2e mode).
 package main
 
 import (

@@ -1,5 +1,6 @@
 {
   "name": "@pockly/web",
+  "description": "Pockly browser workspace UI for local Claude Code and Codex sessions.",
   "private": false,
   "version": "0.0.0-dev",
   "type": "module",
@@ -9,6 +10,13 @@
     "url": "https://github.com/PocklyApp/Pockly.git",
     "directory": "web"
   },
+  "keywords": [
+    "pockly",
+    "web",
+    "claude-code",
+    "codex",
+    "remote-workspace"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -18,8 +26,6 @@
     "test": "tsx --test src/**/*.test.ts"
   },
   "dependencies": {
-    "@grafana/faro-react": "^2.6.3",
-    "@grafana/faro-web-sdk": "^2.6.3",
     "@noble/curves": "^1.8.2",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-slot": "^1.2.4",

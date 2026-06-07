@@ -22,9 +22,9 @@ func reloadCommandPlatform() string {
 // reloadDaemonProcessPlatform restarts the daemon on Windows. We use
 // the scheduled task `PocklyDaemon` (installed by
 // installWindowsScheduledTask). Sequence:
-//   1. schtasks /End — terminates the running instance (which is us)
-//   2. schtasks /Run — launches a fresh instance from the registered
-//      task action, which now resolves to the just-replaced binary.
+//  1. schtasks /End — terminates the running instance (which is us)
+//  2. schtasks /Run — launches a fresh instance from the registered
+//     task action, which now resolves to the just-replaced binary.
 //
 // We start `/End` in the background and exit; the OS handles the
 // re-launch via the scheduled task. We can't wait for /End to return
@@ -66,7 +66,7 @@ func reloadDaemonProcessPlatform() error {
 		// relauncher /Run start a fresh instance. Worst case the user
 		// has two running daemons briefly; the scheduled task's
 		// "InstancesPolicy: 2 (do not start new instance)" prevents
-		// double-binding the relay socket.
+		// double-binding the Nexus socket.
 		fmt.Fprintf(os.Stderr, "schtasks /End warning: %v (output: %s)\n", err, strings.TrimSpace(string(out)))
 	}
 	// Exit cleanly so /End and the relauncher can complete their

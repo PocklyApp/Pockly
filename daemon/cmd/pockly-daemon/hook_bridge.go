@@ -32,28 +32,23 @@ import (
 //	  {decision: "approve"|"block", reason: "<human-readable>"}
 //	stderr: free-form logs (ignored by claude, surfaced to wrapper logs)
 //
-// H1 (this revision): wire the surface — args, stdin parse, telemetry
-// emit, stdout shape — but ALWAYS return empty {} so claude falls
-// through to its built-in terminal prompt. Safe-by-construction: a
-// broken hook can never block a real user-facing decision.
-//
 // Pockly no longer makes hook-level permission decisions. Claude Code's
 // native permission model is authoritative; this command always returns an
 // empty decision so Claude can continue its own permission flow.
 //
 // Design note: this command runs OUTSIDE the daemon process. It
-// reaches the local daemon over loopback HTTP, never reaches the
-// relay directly. That way the daemon's existing identity/keys path
+// reaches the local daemon over loopback HTTP, never reaches Nexus
+// directly. That way the daemon's existing identity/keys path
 // owns the auth boundary.
 func runHookBridge(args []string) error {
 	fs := flag.NewFlagSet("hook-bridge", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	hookType := fs.String("type", "PreToolUse", "claude hook event name (PreToolUse / PostToolUse / Notification)")
-	sessionID := fs.String("session", "", "claude session_id ($CLAUDE_SESSION_ID); used for telemetry correlation + decide routing")
+	sessionID := fs.String("session", "", "claude session_id ($CLAUDE_SESSION_ID); used for optional diagnostics + decide routing")
 	terminalSessionID := fs.String("terminal-session-id", "", "wrapper's terminal_session_id (optional; falls back to env $POCKLY_TERMINAL_SESSION_ID)")
-	daemonURL := fs.String("daemon-url", "http://127.0.0.1:8947", "local pockly-daemon URL for telemetry + permission API")
-	timeout := fs.Duration("timeout", 60*time.Second, "max wait for web decision (H3+); H1 ignores this")
-	relayURL := fs.String("relay-url", "", "relay URL for telemetry; default reads $POCKLY_RELAY_URL")
+	daemonURL := fs.String("daemon-url", "http://127.0.0.1:8947", "local pockly-daemon URL for optional diagnostics + permission API")
+	timeout := fs.Duration("timeout", 60*time.Second, "max wait for web decision")
+	relayURL := fs.String("relay-url", "", "Nexus URL for optional diagnostics; default reads $POCKLY_NEXUS_URL then $POCKLY_RELAY_URL")
 	fs.Usage = func() {
 		fmt.Fprintln(os.Stderr, `Usage: pockly-daemon hook-bridge [flags]
 
@@ -74,6 +69,9 @@ on startup).`)
 	// dynamically re-write settings.json per session.
 	if *terminalSessionID == "" {
 		*terminalSessionID = strings.TrimSpace(os.Getenv("POCKLY_TERMINAL_SESSION_ID"))
+	}
+	if *relayURL == "" {
+		*relayURL = strings.TrimSpace(os.Getenv("POCKLY_NEXUS_URL"))
 	}
 	if *relayURL == "" {
 		*relayURL = strings.TrimSpace(os.Getenv("POCKLY_RELAY_URL"))
@@ -110,9 +108,9 @@ on startup).`)
 		resolvedSession = strings.TrimSpace(payload.SessionID)
 	}
 
-	// Emit "started" telemetry so Loki / diagnose CLI can see how
-	// often the bridge fires + which tools. Best-effort: never
-	// block the hot path on telemetry.
+	// Emit optional diagnostics so self-hosted operators can see how
+	// often the bridge fires + which tools. Best-effort: never block
+	// the hot path.
 	emitTelemetry(*daemonURL, *relayURL, telemetry.Event{
 		Name:      "permission_bridge_started",
 		Command:   payload.ToolName,
@@ -166,8 +164,7 @@ func parseHookPayload(body []byte) (hookPayload, error) {
 
 // writeEmptyDecision writes the literal `{}` so claude treats the
 // hook as having returned no decision and falls through to its
-// built-in permission flow. The H1 default. Returns wrap of the
-// underlying writer error.
+// built-in permission flow. Returns wrap of the underlying writer error.
 func writeEmptyDecision(w io.Writer) error {
 	if _, err := io.WriteString(w, "{}\n"); err != nil {
 		return fmt.Errorf("write stdout: %w", err)
@@ -175,14 +172,13 @@ func writeEmptyDecision(w io.Writer) error {
 	return nil
 }
 
-// emitTelemetry sends one event through the relay so Grafana /
-// `pockly-daemon diagnose telemetry` sees hook activity. Best-effort:
-// silently no-ops if telemetry is disabled (POCKLY_TELEMETRY=off) or
-// the daemon/relay isn't reachable. Hook bridge has a hard SLO —
+// emitTelemetry sends one optional diagnostic event through Nexus.
+// Best-effort: silently no-ops unless telemetry is explicitly enabled or
+// the daemon/Nexus isn't reachable. Hook bridge has a hard SLO —
 // every claude tool call goes through it, so any failure here MUST
 // be invisible to the user.
 //
-// We read the daemon's relay URL via a quick /api/status probe;
+// We read the daemon's Nexus URL via a quick /api/status probe;
 // hook-bridge intentionally doesn't share daemon identity since it's
 // out-of-process. Falls back to no-op if probe fails.
 func emitTelemetry(daemonURL, explicitRelayURL string, evt telemetry.Event) {
@@ -210,8 +206,8 @@ func emitTelemetry(daemonURL, explicitRelayURL string, evt telemetry.Event) {
 }
 
 // probeDaemonStatus hits /api/status to learn (relay_url, device_id)
-// without needing the daemon's keyring. Returns the relay URL plus a
-// best-effort device.Identity (device_id only; the relay accepts
+// without needing the daemon's keyring. Returns the Nexus URL plus a
+// best-effort device.Identity (device_id only; Nexus accepts
 // telemetry with just install_id + device_id, no signing required).
 func probeDaemonStatus(ctx context.Context, daemonURL string) (string, device.Identity, error) {
 	if strings.TrimSpace(daemonURL) == "" {

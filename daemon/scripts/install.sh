@@ -7,8 +7,9 @@ set -euo pipefail
 BIN="${POCKLY_DAEMON_BIN:-pockly-daemon}"
 WRAPPER="${POCKLY_DAEMON_WRAPPER:-pockly-claude-wrapper}"
 VERSION="${POCKLY_DAEMON_VERSION:-latest}"
-BASE_URL="${POCKLY_DAEMON_BASE_URL:-https://cdn.pocklyapp.com/pockly-daemon}"
+BASE_URL="${POCKLY_DAEMON_BASE_URL:-}"
 INSTALL_DIR="${POCKLY_DAEMON_INSTALL_DIR:-${INSTALL_DIR:-/usr/local/bin}}"
+INSTALL_SH_URL="${POCKLY_INSTALL_SH_URL:-https://your-nexus.example/install.sh}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -56,16 +57,16 @@ Aborting before downloading anything.
 
 Fix — download the installer first, then run it with a real terminal:
 
-  curl -fsSL https://cdn.pocklyapp.com/install.sh -o /tmp/pockly-install.sh
+  curl -fsSL "${INSTALL_SH_URL}" -o /tmp/pockly-install.sh
   bash /tmp/pockly-install.sh
 
 Alternative — pre-cache sudo credentials, then keep using the one-liner:
 
-  sudo -v && curl -fsSL https://cdn.pocklyapp.com/install.sh | bash
+  sudo -v && curl -fsSL "${INSTALL_SH_URL}" | bash
 
 Or install into a directory you own (no sudo needed):
 
-  curl -fsSL https://cdn.pocklyapp.com/install.sh | \\
+  curl -fsSL "${INSTALL_SH_URL}" | \\
     POCKLY_DAEMON_INSTALL_DIR="\$HOME/.local/bin" bash
 EOF
   exit 1
@@ -78,7 +79,7 @@ case "$(uname -s)" in
   Linux) goos="linux" ;;
   *)
     echo "pockly install: unsupported OS: $(uname -s)" >&2
-    echo "Use https://cdn.pocklyapp.com/install.ps1 on Windows." >&2
+    echo "Use the Windows install.ps1 from your Pockly release source." >&2
     exit 1
     ;;
 esac
@@ -97,6 +98,16 @@ cleanup() {
   rm -rf "${tmp}"
 }
 trap cleanup EXIT
+
+if [ -z "${BASE_URL}" ]; then
+  cat >&2 <<EOF
+pockly install: POCKLY_DAEMON_BASE_URL is required.
+
+Set it to the daemon release base URL that contains latest/checksums.txt.
+Deployment pipelines should inject this value when serving install.sh.
+EOF
+  exit 1
+fi
 
 release_url="${BASE_URL%/}/${VERSION}"
 checksums_url="${release_url}/checksums.txt"
@@ -178,12 +189,12 @@ case ":${PATH}:" in
 esac
 
 if [ "${POCKLY_DAEMON_NO_SETUP:-}" != "1" ]; then
-  relay_url="${POCKLY_RELAY_URL:-https://pocklyapp.com}"
+  nexus_url="${POCKLY_NEXUS_URL:-${POCKLY_RELAY_URL:-http://127.0.0.1:8787}}"
   echo
   echo "pockly install: starting first-run setup"
   echo "pockly install: set POCKLY_DAEMON_NO_SETUP=1 to install without setup"
-  "${target}" setup --relay-url "${relay_url}"
+  "${target}" setup --nexus-url "${nexus_url}"
 else
   echo "pockly install: setup skipped because POCKLY_DAEMON_NO_SETUP=1"
-  echo "Run manually when ready: ${target} setup --relay-url ${POCKLY_RELAY_URL:-https://pocklyapp.com}"
+  echo "Run manually when ready: ${target} setup --nexus-url ${POCKLY_NEXUS_URL:-${POCKLY_RELAY_URL:-http://127.0.0.1:8787}}"
 fi

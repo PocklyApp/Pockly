@@ -39,7 +39,7 @@ async function loadFixtureAndSetTurns(
   }, turns);
 }
 
-test.describe("R8 permission panel", () => {
+test.describe("permission panel", () => {
   test("pending request renders above the composer area, not in the transcript", async ({ page }) => {
     await loadFixtureAndSetTurns(page, [
       {
@@ -63,7 +63,7 @@ test.describe("R8 permission panel", () => {
     await expect(panel).toBeVisible();
     const card = panel.locator(".permission-card");
     await expect(card.locator(".permission-card-title")).toHaveText(
-      "Allow Claude to run Print working directory?",
+      "Allow agent to run Print working directory?",
     );
     await expect(card.locator(".permission-card-desc")).toHaveText("Print working directory");
     await expect(card.locator(".permission-card-cmd")).toHaveText("pwd");
@@ -74,7 +74,7 @@ test.describe("R8 permission panel", () => {
     ]);
 
     await expect(page.locator(".fixture-turns .permission-card")).toHaveCount(0);
-    await expect(page.locator(".fixture-turns", { hasText: "Allow Claude to run" })).toHaveCount(0);
+    await expect(page.locator(".fixture-turns", { hasText: "Allow agent to run" })).toHaveCount(0);
   });
 
   test("resolved allow/deny permission events stay hidden", async ({ page }) => {
@@ -111,8 +111,8 @@ test.describe("R8 permission panel", () => {
     ]);
 
     await expect(page.locator(".permission-panel")).toHaveCount(0);
-    await expect(page.getByText("Allowed Claude to run Show current user")).toHaveCount(0);
-    await expect(page.getByText("Denied Claude to run Read")).toHaveCount(0);
+    await expect(page.getByText("Allowed agent to run Show current user")).toHaveCount(0);
+    await expect(page.getByText("Denied agent to run Read")).toHaveCount(0);
   });
 
   test("local confirmation notice is read-only and not rendered in transcript", async ({ page }) => {

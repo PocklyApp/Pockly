@@ -4,7 +4,8 @@
  */
 
 import { clearBrowserDeviceState, ensureBrowserDeviceState, loadBrowserDeviceState, persistBrowserTokens, signBrowserChallenge } from "./crypto";
-import { trackEvent } from "./observability";
+import { telemetryNetworkEnabled, trackEvent } from "./observability";
+import { configuredNexusURL } from "./runtime-config";
 
 export type User = {
   user_id: string;
@@ -85,10 +86,11 @@ export type SessionListItem = {
   agent: string;
   runner_alias?: "claude" | "claude_ccr" | "custom";
   cwd: string;
-  // snippet is the plaintext first-user-message preview the relay stores for
-  // the sidebar label (E2E removed — no per-browser encrypted_snippet).
+  // snippet is the first-user-message preview Nexus stores for the sidebar
+  // label. Legacy per-browser snippets are no longer part of the product
+  // model.
   snippet: string;
-  // title is the relay-generated concise label (SiliconFlow, from the first
+  // title is the Nexus-generated concise label (from the first
   // message). Preferred over the snippet-derived name; absent (omitempty)
   // until the async title worker fills it in.
   title?: string;
@@ -106,7 +108,7 @@ export type SessionListItem = {
     // Daemon is offline. The only non-writable state.
     | "read_only"
     | "unknown"
-    // Legacy values from pre-2026-05-25 relays; normalized to read_only /
+    // Legacy values from older Nexus builds; normalized to read_only /
     // unknown by sessionConnectionMode().
     | "read_only_sync"
     | "detached";
@@ -152,10 +154,9 @@ export type SessionTurn = {
     // nestSidechainTurns — holds the subagent's blocks so the renderer
     // can show them collapsed under the Task card. Never sent over the wire.
     _sidechain_items?: SessionTurn[];
-    // v0.2.0: structured fields piggy-backing on the permission_request
-    // attachment so the interactive Approve/Deny card can render without
-    // re-parsing the text. Empty / undefined on legacy v0.1.42 emissions
-    // (which had no request_id and used decision="allow" baked into text).
+    // Structured fields piggy-back on the permission_request attachment so
+    // the interactive Allow/Deny card can render without re-parsing text.
+    // Older events may omit request_id and structured decision fields.
     permission_request_id?: string;
     permission_tool_name?: string;
     permission_input_preview?: string;
@@ -199,7 +200,7 @@ export type SyncSessionEvent = {
   request_id: string;
   session_id: string;
   device_id?: string;
-  stage: "queued" | "locating" | "extracting" | "encrypting" | "uploading" | "completed" | "failed";
+  stage: "queued" | "locating" | "extracting" | "uploading" | "completed" | "failed";
   status: "running" | "completed" | "failed";
   processed?: number;
   total?: number;
@@ -334,8 +335,12 @@ type BrowserDeviceChallenge = {
   nonce: string;
 };
 
+const configuredNexusBaseURL = normalizeConfiguredNexusBaseURL(
+  configuredNexusURL() || import.meta.env?.VITE_POCKLY_NEXUS_URL || import.meta.env?.VITE_POCKLY_RELAY_URL || "",
+);
+
 async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, {
+  const res = await fetch(resolveNexusHTTPURL(url), {
     credentials: "include",
     headers: {
       "Content-Type": "application/json",
@@ -351,14 +356,14 @@ async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
       : looksLikeHTML(text)
         ? `${res.status} ${res.statusText || "service unavailable"}`.trim()
       : text.trim() || `${res.status} ${res.statusText}`.trim();
-    // v0.1.41 #2: distinguish auth expiry from generic errors so callers
-    // (and the top-level app-shell auth hook) can surface a re-login
-    // banner instead of swallowing the failure.
+    // Distinguish auth expiry from generic errors so callers and the
+    // top-level app-shell auth hook can surface a re-login banner instead
+    // of swallowing the failure.
     if (res.status === 401) {
       // The bearer we sent is no longer valid — token expired, device
-      // revoked, or the relay rotated its per-boot signing key on
+      // revoked, or Nexus rotated its per-boot signing key on
       // restart (accessTokenKey = mustRandomBytes). Drop the cached
-      // browser-device token so the NEXT authed call re-handshakes
+      // browser access token so the NEXT authed call re-handshakes
       // instead of replaying the dead token for the rest of the cache
       // window. No-op for cookie-only (non-bearer) 401s.
       invalidateBrowserDeviceToken();
@@ -368,6 +373,34 @@ async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
   }
   if (!data) return undefined as T;
   return data as T;
+}
+
+function resolveNexusHTTPURL(input: string) {
+  if (!configuredNexusBaseURL) return input;
+  const url = new URL(input, window.location.origin);
+  if (url.origin !== window.location.origin || !url.pathname.startsWith("/api/")) return input;
+  return new URL(`${url.pathname}${url.search}${url.hash}`, configuredNexusBaseURL).toString();
+}
+
+function resolveNexusWebSocketURL(path: string) {
+  const base = configuredNexusBaseURL || window.location.origin;
+  const url = new URL(path, base);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url;
+}
+
+function normalizeConfiguredNexusBaseURL(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return "";
+  try {
+    const url = new URL(trimmed);
+    url.pathname = url.pathname.replace(/\/+$/g, "");
+    url.search = "";
+    url.hash = "";
+    return url.toString().replace(/\/+$/g, "");
+  } catch {
+    return "";
+  }
 }
 
 function looksLikeHTML(text: string) {
@@ -410,12 +443,19 @@ export async function logout() {
 }
 
 export async function registerAccount(input: { email: string; name: string; password: string }) {
-  return fetchJSON<{
-    status: "verification_required";
-    email: string;
-    expires_at: string;
-    resend_after_seconds: number;
-  }>("/api/auth/register", {
+  return fetchJSON<
+    | {
+        status: "active";
+        user: User;
+        email: string;
+      }
+    | {
+        status: "verification_required";
+        email: string;
+        expires_at: string;
+        resend_after_seconds: number;
+      }
+  >("/api/auth/register", {
     method: "POST",
     body: JSON.stringify(input),
   });
@@ -570,9 +610,9 @@ export async function claimDaemonSetupGrant(grantId: string, input: {
 }
 
 // claimDaemonLocal completes a daemon-initiated local install. The daemon
-// opened https://pocklyapp.com/local-setup#nonce=…&cb=…&grant=… in this
+// opened <nexus>/local-setup#nonce=…&cb=…&grant=… in this
 // browser; the page reads the grant id + nonce out of the fragment and posts
-// them here. The relay binds the daemon to the current user, mints device
+// them here. Nexus binds the daemon to the current user, mints device
 // tokens, and echoes the nonce so we can hand it to the daemon's loopback
 // callback in a single round trip.
 export async function claimDaemonLocal(input: {
@@ -705,7 +745,7 @@ export async function streamSessionInject(input: {
   text: string;
   model?: string;
   // Optional attachments. When present the request is sent as multipart so the
-  // relay can forward the file bytes to the daemon, which writes them to disk
+  // Nexus can forward the file bytes to the daemon, which writes them to disk
   // and appends @<path> references to the prompt for Claude Code / Codex.
   files?: File[];
   signal?: AbortSignal;
@@ -729,10 +769,10 @@ export async function streamSessionInject(input: {
   );
 }
 
-// Composer-pills surface (v0.3.x): the daemon owns model + permission
-// mode + effort per terminal session. The web reads them on session
-// select and writes them whenever the user picks a different pill
-// value. Effort is now carried explicitly through the relay/daemon
+// Composer-pills surface: the daemon owns model, permission mode, and
+// effort per terminal session. The web reads them on session select and
+// writes them whenever the user picks a different pill value. Effort is
+// carried explicitly through the Nexus/daemon
 // wire path for both existing-session injection and first-message task
 // creation; the daemon maps it to the selected agent's native launch or
 // turn parameter where supported.
@@ -798,11 +838,9 @@ export async function getSessionDiff(input: {
   );
 }
 
-// v0.3: session-less defaults for the draft composer. Returns the
-// available model/permission/effort lists for a given daemon + cwd
-// — used BEFORE a real session exists so the user can pick a custom
-// project-config model (DeepSeek, etc.) on the first message instead
-// of being stuck on the hardcoded sonnet/opus/haiku alias list.
+// Session-less defaults for the draft composer. Returns the available
+// model/permission/effort lists for a daemon + cwd before a real session
+// exists, so the first message can use project/user model aliases.
 export type AgentDefaultsSnapshot = {
   // default_model is the model claude would launch with absent an
   // explicit --model (from project/user config). Empty when no config
@@ -1261,7 +1299,7 @@ export function subscribeToSession(input: {
     clearReconnect();
     reconnectAttempt += 1;
     const delay = Math.min(5000, 800 * reconnectAttempt);
-    input.onStatus("reconnecting", `relay disconnected, retrying in ${Math.round(delay / 1000)}s`);
+    input.onStatus("reconnecting", `Nexus disconnected, retrying in ${Math.round(delay / 1000)}s`);
     reconnectTimer = window.setTimeout(() => {
       void connect();
     }, delay);
@@ -1272,8 +1310,7 @@ export function subscribeToSession(input: {
     input.onStatus(reconnectAttempt > 0 ? "reconnecting" : "connecting");
     try {
       const auth = await authenticateBrowserDevice();
-      const url = new URL("/api/ws", window.location.origin);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const url = resolveNexusWebSocketURL("/api/ws");
       url.searchParams.set("access_token", auth.device_access_token);
 
       const ws = new WebSocket(url.toString());
@@ -1349,7 +1386,7 @@ export function subscribeToSession(input: {
 }
 
 // requestDaemonUpdate triggers a remote `pockly-daemon update` on the
-// given daemon. Relay forwards the request through the daemon's control
+// given daemon. Nexus forwards the request through the daemon's control
 // WS; daemon downloads, verifies, installs, and restarts itself.
 //
 // Returns 202 (dispatched) — actual completion is NOT signaled
@@ -1368,7 +1405,7 @@ export async function requestDaemonUpdate(hostDeviceId: string, toVersion?: stri
   );
 }
 
-// Relay the user's allow/deny click on a pending Claude permission card.
+// Forward the user's allow/deny click on a pending Claude permission card.
 // Pockly forwards this to the daemon and does not persist or infer policy.
 export async function decidePermissionRequest(
   requestId: string,
@@ -1402,7 +1439,7 @@ async function fetchWithBrowserDevice<T>(url: string, query?: Record<string, str
   });
 }
 
-// InjectControlError carries the relay's structured error body alongside
+// InjectControlError carries the Nexus structured error body alongside
 // the message string so callers can branch on details like session_drifted
 // (which ships an actual_sid the UI needs to bounce the user to).
 export class InjectControlError extends Error {
@@ -1414,12 +1451,9 @@ export class InjectControlError extends Error {
   }
 }
 
-// AuthExpiredError flags HTTP 401 from any of the relay's bearer-required
-// endpoints (terminal-sessions list, inject, SSE stream). v0.1.41: pre-this,
-// these surfaced as generic fetch errors that callers silently swallowed
-// (attachExistingLiveSessionBridge's empty catch), so the user saw a frozen
-// workspace with no UI hint that their cookie had expired. App.tsx's top-level
-// auth state hook treats this as "logged out" and re-routes to /login.
+// AuthExpiredError flags HTTP 401 from any Nexus bearer-required endpoint so
+// the top-level auth state hook can show the logged-out path instead of
+// leaving the workspace in a stale state.
 export class AuthExpiredError extends Error {
   status = 401;
   constructor(message = "session expired") {
@@ -1433,7 +1467,7 @@ function buildControlURL(url: string, query: Record<string, string> | undefined)
   if (query) {
     for (const [key, value] of Object.entries(query)) finalURL.searchParams.set(key, value);
   }
-  return finalURL;
+  return new URL(resolveNexusHTTPURL(finalURL.toString()));
 }
 
 async function streamControl<TEvent extends InjectEvent | SyncSessionEvent>(
@@ -1534,12 +1568,12 @@ async function readSSEStream<TEvent>(body: ReadableStream<Uint8Array>, onEvent: 
   }
 }
 
-// reportWebTelemetry ships one observability event to the relay so the
-// cloud has a chance of seeing browser-side failures (SSE disconnects,
-// inject errors, render gaps) that would otherwise be invisible. v0.1.37.
+// reportWebTelemetry optionally ships one diagnostic event to the configured
+// Nexus telemetry provider. Open-source builds default to no network telemetry;
+// self-hosted operators must explicitly enable their own provider.
 //
 // Fire-and-forget: never throws, never blocks, never logs more than once
-// per minute on transport failure. Auth via the existing browser device
+// per minute on transport failure. Auth via the existing browser access
 // bearer (same dance as every other authenticated call); if the bearer
 // dance itself fails we silently drop the event — we don't want telemetry
 // to surface auth errors to a user who was just trying to read their chat.
@@ -1556,6 +1590,7 @@ export function reportWebTelemetry(input: {
   sessionId?: string;
   durationMs?: number;
 }) {
+  if (!telemetryNetworkEnabled()) return;
   // Non-blocking: run the auth + POST on a microtask so the caller never
   // waits on us. Browsers will GC the promise after it resolves/rejects.
   void (async () => {
@@ -1611,14 +1646,14 @@ export function reportWebTelemetry(input: {
   })();
 }
 
-// Browser-device access-token cache. The relay issues a 15-minute
+// Browser-device access-token cache. Nexus issues a 15-minute
 // token (see issueAccessToken); we reuse it for 10 minutes — a 5-minute
 // safety margin so a cached token is always still valid when used, no
 // 401-from-expiry. Before this, EVERY authenticated request (sessions,
 // agent-settings, hosts, turns, …) re-ran the full
 // device-challenge → sign → verify handshake. A burst of concurrent
 // workspace calls therefore fired a burst of challenges, tripping the
-// relay's device-challenge rate limiter (30/min) →
+  // Nexus device-challenge rate limiter (30/min) →
 // "too many challenge requests" → retry storms that stalled the UI for
 // ~10s (most visibly: switching the model pill). Caching the token and
 // de-duping concurrent handshakes collapses that to one handshake per
@@ -1670,7 +1705,7 @@ async function runBrowserDeviceHandshake(): Promise<string> {
     state = loadBrowserDeviceState();
   }
   if (!state?.deviceId) {
-    throw new Error("encrypted access setup failed");
+    throw new Error("device access setup failed");
   }
   let challenge: BrowserDeviceChallenge;
   try {
@@ -1687,7 +1722,7 @@ async function runBrowserDeviceHandshake(): Promise<string> {
     await clearBrowserDeviceState();
     await registerCurrentBrowserDevice();
     state = loadBrowserDeviceState();
-    if (!state?.deviceId) throw new Error("encrypted access setup failed", { cause: error });
+    if (!state?.deviceId) throw new Error("device access setup failed", { cause: error });
     challenge = await fetchJSON<BrowserDeviceChallenge>("/api/device-challenge", {
       method: "POST",
       body: JSON.stringify({

@@ -7,12 +7,12 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
-const relayURL = process.env.POCKLY_RELAY_URL || "http://127.0.0.1:8080";
-const relayWSURL = relayURL.replace(/^http/, "ws");
+const nexusURL = process.env.POCKLY_NEXUS_URL || process.env.POCKLY_RELAY_URL || "http://127.0.0.1:8787";
+const nexusWSURL = nexusURL.replace(/^http/, "ws");
 const daemonURL = process.env.POCKLY_DAEMON_URL || "http://127.0.0.1:8948";
 
-// During dev, the relay is reachable at localhost:8080 by default. The `/api`
-// and `/ws` proxies let `npm run dev` talk to a local relay without CORS
+// During dev, Nexus is reachable at localhost:8787 by default. The `/api`
+// and `/ws` proxies let `npm run dev` talk to a local Nexus without CORS
 // gymnastics.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
@@ -20,11 +20,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: relayURL,
+        target: nexusURL,
         ws: true,
       },
       "/ws": {
-        target: relayWSURL,
+        target: nexusWSURL,
         ws: true,
       },
       "/daemon-api": {

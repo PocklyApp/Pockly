@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { buildNewTaskRequestBody } from "./api";
+import { buildNewTaskRequestBody, reportWebTelemetry } from "./api";
 
 test("new task request body carries codex effort and permission settings", () => {
   assert.deepEqual(
@@ -29,4 +29,26 @@ test("new task request body carries codex effort and permission settings", () =>
       effort: "minimal",
     },
   );
+});
+
+test("web telemetry is network-disabled by default", () => {
+  const globals = globalThis as unknown as {
+    window: { POCKLY_CONFIG?: Record<string, unknown> } | undefined;
+    fetch: typeof fetch | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalFetch = globals.fetch;
+  let fetchCalled = false;
+  globals.window = { POCKLY_CONFIG: {} };
+  globals.fetch = (() => {
+    fetchCalled = true;
+    throw new Error("fetch should not be called");
+  }) as typeof fetch;
+  try {
+    reportWebTelemetry({ name: "web_page_error", errorCode: "test" });
+    assert.equal(fetchCalled, false);
+  } finally {
+    globals.window = originalWindow;
+    globals.fetch = originalFetch;
+  }
 });

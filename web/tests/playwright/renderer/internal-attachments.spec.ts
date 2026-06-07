@@ -15,7 +15,7 @@ test.describe("internal Claude Code attachments", () => {
     // separately), NOT as a generic attachment card.
     await expect(page.locator("[data-permission-request-id='req-visible']")).toBeVisible();
     await expect(page.getByRole("button", { name: "Allow" })).toBeVisible();
-    await expect(page.locator(".permission-card-title", { hasText: /Allow Claude to run/ })).toBeVisible();
+    await expect(page.locator(".permission-card-title", { hasText: /Allow agent to run/ })).toBeVisible();
 
     // Attachments are session-context plumbing and are ALL hidden now —
     // including `file` (the type set is open-ended; chasing each one leaked the

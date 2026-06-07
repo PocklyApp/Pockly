@@ -3,13 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — AskUserQuestion spec.
+// AskUserQuestion spec.
 //
 // Selects body="question" so ToolCallCard mounts ToolQuestionCard
-// with the parsed questions array. R5 will upgrade ToolQuestionCard
-// from "static Q/A list" to "clickable options that inject the
-// answer back into the conversation" — the spec contract doesn't
-// need to change for that work.
+// with the parsed questions array. ToolQuestionCard renders clickable options
+// that inject the answer back into the conversation; the spec contract stays
+// pure display metadata.
 
 import { extractQuestions } from "../../../App";
 import type { ToolSpec } from "../types";

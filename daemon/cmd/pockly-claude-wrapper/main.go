@@ -50,9 +50,8 @@ type config struct {
 
 // claudeInvocation summarizes what the user asked of claude. The wrapper
 // uses this to decide whether it can safely lock onto a session ID
-// *before* exec'ing claude (the v0.1.36 anchor) — or whether claude will
-// be free to pick its own and we have to fall back to fd-based discovery
-// after the fact.
+// *before* exec'ing claude, or whether claude will be free to pick its own
+// and we have to fall back to fd-based discovery after the fact.
 type claudeInvocation struct {
 	// sessionID is the UUID we will guarantee claude binds to. It is
 	// either parsed from --resume / --session-id, pre-resolved from
@@ -62,8 +61,8 @@ type claudeInvocation struct {
 	sessionID string
 	// lockable is true when sessionID was determined before exec. The
 	// wrapper guarantees a `<sessionID>.jsonl` path and never has to
-	// discover anything. False = --fork-session, fall back to the old
-	// fd-discovery + watchActiveSessionID path.
+	// discover anything. False = --fork-session, so discovery happens
+	// after the Claude child starts.
 	lockable bool
 	// injectFlag is true when the wrapper needs to prepend
 	// `--session-id <sessionID>` to the args itself. False when the
@@ -139,12 +138,12 @@ func run(cfg config) error {
 		return execDirect(claudeCmd, cwd, cfg.args, envSnap.Env)
 	}
 
-	// v0.1.36: lock the session id BEFORE exec'ing claude. resolveLockedSessionID
+	// Lock the session id BEFORE exec'ing claude. resolveLockedSessionID
 	// either generates a fresh UUID and prepends `--session-id <uuid>` (bare
 	// `claude`), pre-resolves --continue / value-less --resume to a specific
 	// sid + rewrites to `--resume <sid>`, or passes through unchanged when the
 	// user already supplied --session-id / --resume <sid>. Only --fork-session
-	// hits the legacy fd-discovery path (claude generates a sid we can't know).
+	// uses fd-based discovery because Claude generates a sid we can't know.
 	//
 	// Why pre-bind: with two claude terminals in the same cwd, the wrapper's
 	// post-hoc discovery used to flip-flop between their jsonls when fd-based
@@ -153,14 +152,13 @@ func run(cfg config) error {
 	// authoritative — fileSystem name = UUID, jsonl content sessionId field =
 	// UUID, OS fd table (when available) = UUID.
 	finalArgs, invocation := resolveLockedSessionID(cfg.args, claudeProjectDir(cwd))
-	// v0.1.42: inject MCP permission server so the "Do you want to
-	// proceed?" prompt becomes a structured event the web tab can see
-	// (instead of a TUI 1/2 dialog only visible at the terminal). The
-	// server (`pockly-daemon mcp-permission`) auto-approves everything
-	// in v0.1.42 (read-only observability); v0.2.0 will block on a
-	// web decision. Cleanup of the temp mcp-config file happens via
-	// defer below. Skipped silently if we can't find the daemon
-	// binary — the wrapper still works without the permission relay.
+	// Inject the MCP permission server so Claude's native permission
+	// prompt becomes a structured event the web tab can mirror. The
+	// server (`pockly-daemon mcp-permission`) registers the request,
+	// waits for a web allow/deny decision, and returns that decision to
+	// Claude. Cleanup of the temp mcp-config file happens via defer
+	// below. Skipped silently if we can't find the daemon binary — the
+	// wrapper still works without remote permission mirroring.
 	mcpConfigPath, mcpCleanup, mcpArgs := setupPermissionMCP(invocation.sessionID)
 	if mcpCleanup != nil {
 		defer mcpCleanup()
@@ -171,18 +169,17 @@ func run(cfg config) error {
 			fmt.Fprintf(os.Stderr, "[pockly wrapper] permission MCP enabled via %s\n", mcpConfigPath)
 		}
 	}
-	// v0.3.0 H2: install a PreToolUse hook entry into the user's
-	// ~/.claude/settings.json so claude routes built-in tools
-	// (Bash/Read/Write/Edit/Skill) through `pockly-daemon hook-bridge`.
-	// MCP path (above) only catches MCP-namespaced tools; this catches
-	// the rest. Cleanup defer removes our entries on wrapper exit
-	// even if claude crashed. Self-heals if a prior wrapper crashed
-	// without cleanup. Disabled when POCKLY_DISABLE_PERMISSION_HOOK=1.
+	// Install a compatibility PreToolUse hook entry into the user's
+	// ~/.claude/settings.json. It is a fallback diagnostics/bridge path
+	// for Claude prompts that do not reach the permission-prompt-tool
+	// flow. Cleanup defer removes only Pockly-owned entries on wrapper
+	// exit and self-heals stale entries from prior wrapper crashes.
+	// Disabled when POCKLY_DISABLE_PERMISSION_HOOK=1.
 	hookCleanup, hookErr := setupHookBridge(resolvePocklyDaemonPath())
 	if hookErr != nil && cfg.debug {
-		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge setup: %v (auto-mode disabled for built-in tools)\n", hookErr)
+		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge setup: %v\n", hookErr)
 	} else if hookErr == nil && cfg.debug {
-		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge installed in claude settings.json (v0.3.0 auto-mode)\n")
+		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge installed in claude settings.json\n")
 	}
 	if hookCleanup != nil {
 		defer hookCleanup()
@@ -193,14 +190,14 @@ func run(cfg config) error {
 	// captured time.Now() inside the goroutine instead, fast-write claudes
 	// (fake-claude, claude --print) could finish writing their first event
 	// before the goroutine even runs — making their mtime < startedAt and
-	// the rule `mtime >= startedAt` miss every time. That symptom (relay
-	// stuck at read_only_sync forever) is what this earlier-capture fixes.
+	// the rule `mtime >= startedAt` miss every time. That symptom (Nexus
+	// stuck at read-only sync forever) is what this earlier-capture fixes.
 	size := currentSize()
 	childStartedAt := time.Now()
 	ptmx, err := startPTY(claudeCmd, finalArgs, cwd, envSnap.Env, size)
 	if err != nil {
-		// v0.4.0 W1: on Windows, ConPTY can fail for reasons that are
-		// outside our control (older Windows 10 < 1809, certain
+		// On Windows, ConPTY can fail for reasons that are outside our
+		// control (older Windows 10 < 1809, certain
 		// embedded SKUs, ConHost compatibility flags). When that
 		// happens, fall back to a plain execDirect so the user can
 		// still run claude and the daemon's session sync still
@@ -368,13 +365,11 @@ func run(cfg config) error {
 				}
 				//
 				// Intentionally NOT calling indicator.maybePaint() here.
-				// Pre-v0.1.34 we did, on every PTY read — meaning the
-				// wrapper's "Pockly attached" badge tried to repaint
-				// itself into the bottom-right corner during every
-				// Claude TUI frame. PTY chunks routinely split a Claude
-				// ANSI sequence mid-stream (e.g. one read ends in "\x1b[10;"
-				// and the next starts "5HHello"); inserting our own
-				// ESC[<row>;<col>H ... ESC8 sequence between them
+				// Repainting the "Pockly attached" badge on every PTY
+				// read can split a Claude ANSI sequence mid-stream (for
+				// example, one read ends in "\x1b[10;" and the next starts
+				// "5HHello"). Inserting our own cursor sequence between
+				// those halves corrupts the terminal frame.
 				// fragmented Claude's cursor state and left ghost text
 				// scattered across the screen ("r imits sage kills,…").
 				// Now the indicator only paints on startup, resize, and
@@ -683,21 +678,21 @@ type daemonBridge struct {
 	sessionID string // mutates whenever watchActiveSessionID detects the active jsonl changed
 
 	// lockedSessionID is the UUID the wrapper bound to BEFORE exec'ing
-	// claude (v0.1.36): generated + injected via --session-id, parsed
-	// out of --resume <sid>, or pre-resolved from --continue. When
-	// non-empty the watcher skips fd discovery entirely and tails only
+	// claude: generated + injected via --session-id, parsed out of
+	// --resume <sid>, or pre-resolved from --continue. When non-empty
+	// the watcher skips fd discovery entirely and tails only
 	// projectDir/<lockedSessionID>.jsonl. Empty for --fork-session,
-	// where claude picks the sid and we fall back to legacy discovery.
+	// where Claude picks the sid and the wrapper must discover it.
 	lockedSessionID string
 
 	onStatusChange func(attached bool) // optional: notified after every register/re-register success or failure
 
-	// v0.2.2: in-memory queue of events whose initial Emit attempt (and
-	// retries) failed. Drained by:
+	// In-memory queue of events whose initial Emit attempt and retries
+	// failed. Drained by:
 	//   - next Emit() call (drainPending fires first thing)
 	//   - keepaliveLoop ticker (every 10s, even when no jsonl activity)
 	// Cap is hard-coded at 200 to bound memory if daemon is permanently
-	// down — older entries get dropped (with a stderr warning) once full,
+	// down — oldest entries get dropped (with a stderr warning) once full,
 	// since extreme backpressure means we've lost sync anyway.
 	pendingMu sync.Mutex
 	pending   []pendingEmit
@@ -762,7 +757,7 @@ func maybeStartDaemonBridge(cfg config, cwd string, invocation claudeInvocation,
 	// The old latch-once discovery silently routed inject text into a stale
 	// jsonl after any such rotation; the watcher rebinds on every change.
 	go bridge.watchActiveSessionID(cwd, childPID, childStartedAt)
-	// Keepalive on a slower cadence than rebind polling. The relay marks
+	// Keepalive on a slower cadence than rebind polling. Nexus marks
 	// terminal_sessions disconnected after ~45s without a keepalive so
 	// SIGKILL'd / OOM'd / network-partitioned wrappers stop showing up
 	// as "writable" in the web UI. Picked 10s as the heartbeat per the
@@ -801,8 +796,8 @@ func (b *daemonBridge) registerTerminalSession() (string, error) {
 }
 
 // reregister fetches a fresh id from the (presumably restarted) daemon and
-// replays session_started so the daemon side rebinds metadata and the relay
-// sees the wrapper as live again. Returns the new id on success.
+// replays session_started so the daemon side rebinds metadata and Nexus sees
+// the wrapper as live again. Returns the new id on success.
 func (b *daemonBridge) reregister() error {
 	newID, err := b.registerTerminalSession()
 	if err != nil {
@@ -865,10 +860,9 @@ func (b *daemonBridge) notifyStatus(attached bool) {
 // claude child's open-fd table to discover which jsonl it's currently
 // writing. The basename of that file IS the active session_id. On every
 // change (first discovery OR rotation via in-app /resume etc.) we update
-// the cached sid and Emit so the daemon and relay learn the new binding.
+// the cached sid and Emit so the daemon and Nexus learn the new binding.
 //
-// Replaces the old mtime-based one-shot discovery, which had three fatal
-// gaps:
+// This avoids the stale-binding gaps of one-shot mtime discovery:
 //   - latch-once: a single successful discovery, then never re-checked,
 //     so /resume rotations silently broke the binding;
 //   - 60s deadline: slow-starting claudes never got bound;
@@ -880,13 +874,7 @@ func (b *daemonBridge) notifyStatus(attached bool) {
 // needs to pick it up: `--mcp-config <path>` + `--permission-prompt-tool
 // mcp__pockly__request_permission`. Returns ("", nil, nil) silently
 // when the pockly-daemon binary can't be located — wrapper still works
-// without the permission relay, just without the web "claude is doing X"
-// card.
-//
-// v0.1.42: the MCP server (a subcommand of pockly-daemon) auto-allows
-// every request but POSTs the (tool, input) to the daemon so the web
-// can render it. v0.2.0 will replace auto-allow with a real wait-for-
-// web-decision flow.
+// without remote permission mirroring.
 //
 // claude code spec for permission-prompt-tool: the value must be the
 // MCP tool name in `mcp__<servername>__<toolname>` form. Our server
@@ -907,13 +895,11 @@ func setupPermissionMCP(sessionID string) (string, func(), []string) {
 				"args": []string{
 					"mcp-permission",
 					"--session-id", sessionID,
-					// v0.2.0: enable interactive flow (register → await
-					// web decision → translate to allow/deny). The
-					// daemon needs to be v0.2.0+ to expose the
-					// /api/dev/permission-requests endpoints; if it
-					// isn't, register fails fast and the MCP server
-					// falls back to deny rather than hanging. So
-					// wrapper-version => MCP behavior, not daemon
+					// Enable the interactive flow: register the
+					// permission request, await the web decision, then
+					// translate it to Claude's allow/deny response.
+					// If the daemon endpoint is unavailable, register
+					// fails fast rather than leaving Claude hanging.
 					// version — but daemon version is also auto-
 					// updated, so the matched-pair invariant holds.
 					"--interactive",
@@ -980,7 +966,7 @@ func encodeClaudeProjectDirName(cwd string) string {
 // watchActiveSessionID owns the session-to-jsonl binding for the
 // lifetime of the wrapper. There are two modes:
 //
-//  1. **Locked** (v0.1.36, the happy path): the wrapper pre-bound a UUID
+//  1. **Locked**: the wrapper pre-bound a UUID
 //     before exec'ing claude via resolveLockedSessionID. We know the
 //     jsonl path is `projectDir/<lockedSID>.jsonl` and tail ONLY that
 //     file. No discovery, no rotation, no cross-binding risk even when
@@ -989,9 +975,8 @@ func encodeClaudeProjectDirName(cwd string) string {
 //     UUID, else fail loud (claude version drift, --session-id ignored).
 //
 //  2. **Discovery** (only for `--fork-session`): claude generates its
-//     own sid we can't know ahead of time. Falls back to the legacy
-//     fd-discovery path; rotation is allowed but logged as
-//     session_rebound.
+//     own sid we can't know ahead of time. Falls back to fd discovery;
+//     rotation is allowed but logged as session_rebound.
 func (b *daemonBridge) watchActiveSessionID(cwd string, pid int, childStartedAt time.Time) {
 	projectDir := claudeProjectDir(cwd)
 	if projectDir == "" {
@@ -1007,10 +992,10 @@ func (b *daemonBridge) watchActiveSessionID(cwd string, pid int, childStartedAt 
 	b.watchDiscoveredJSONL(projectDir, pid, childStartedAt)
 }
 
-// watchLockedJSONL is the v0.1.36 happy path: the wrapper-generated UUID +
-// `--session-id <uuid>` flag is the authoritative initial binding, so we tail
-// that one file directly (no mtime newest-wins guessing — that's what avoids
-// cross-binding when N claudes share a cwd).
+// watchLockedJSONL tails the wrapper-generated UUID selected by
+// `--session-id <uuid>`. That file is the authoritative initial binding, so
+// there is no mtime newest-wins guessing and no cross-binding when multiple
+// Claude processes share a cwd.
 //
 // #34: we DO follow in-app rotation (/resume, /clear, /new) — claude keeps the
 // same pid but starts writing a different <sid>.jsonl, and without this the web
@@ -1055,7 +1040,7 @@ func (b *daemonBridge) watchLockedJSONL(projectDir, sid string, pid int) {
 			tailer.reset(jsonlPath)
 		}
 		// Make the initial session_started emit eager (don't wait for
-		// the first jsonl line); the relay needs the binding registered
+		// the first jsonl line); Nexus needs the binding registered
 		// so inject can route. updateClaudeSessionID returns changed=false
 		// on subsequent ticks once already-set.
 		if changed, prev := b.updateClaudeSessionID(sid); changed && prev == "" {
@@ -1225,8 +1210,8 @@ func (b *daemonBridge) startJSONLWatcher(projectDir, matchPath string) (<-chan s
 // resolveActiveSession returns the jsonl that the wrapper's child
 // claude PID currently has an open write fd on, scoped to projectDir.
 //
-// v0.1.36 removed the mtime fallback that used to follow fd-discovery.
-// Reasoning: this function is now only reached by the `--fork-session`
+// This function intentionally has no mtime fallback after fd discovery.
+// Reasoning: it is now only reached by the `--fork-session`
 // path (claude generates a new sid we can't predict). In that mode, if
 // fd-discovery fails — container without lsof / locked-down /proc — the
 // honest answer is "we don't know which jsonl is ours", and the right
@@ -1288,7 +1273,7 @@ func newestJSONLAfter(projectDir string, startedAt time.Time) (string, string, b
 	return sid, bestPath, sid != ""
 }
 
-// Emit posts a single event to the daemon. v0.2.2 hardening:
+// Emit posts a single event to the daemon with retry and bounded backlog:
 //
 //   - First drain any prior failed events queued in `pending` — they
 //     get retried in FIFO order before the fresh event so order is
@@ -1296,14 +1281,11 @@ func newestJSONLAfter(projectDir string, startedAt time.Time) (string, string, b
 //   - 4 attempts with exponential backoff (0, 200ms, 400ms, 800ms) on
 //     transport errors AND 5xx responses. 4xx (other than 404) is
 //     non-retriable (auth/permission won't fix by waiting).
-//   - 404 → re-register + retry (the v0.1.37 daemon-restart path).
+//   - 404 → re-register + retry after daemon restart.
 //   - On final failure, stash in `pending` (capped at 200) and log to
 //     stderr. The wrapper indicator goes yellow but the event isn't
 //     lost — next Emit or 10s keepalive tick drains the queue.
 //
-// Pre-v0.2.2 this method silently dropped events on transport / 5xx,
-// which manifested as #150: web missing turns even though daemon's
-// jsonl index had them.
 func (b *daemonBridge) Emit(kind, sessionStatus, turnStatus, payload, errorText string) {
 	if b == nil {
 		return
@@ -1426,7 +1408,7 @@ func (b *daemonBridge) emitWithRetry(kind, sessionStatus, turnStatus, payload, e
 			continue
 		}
 		if status >= 500 {
-			// 5xx — daemon/relay temporarily wedged. Retry.
+			// 5xx — daemon or Nexus temporarily wedged. Retry.
 			if i == len(backoffs)-1 {
 				b.notifyStatus(false)
 				fmt.Fprintf(os.Stderr, "[pockly-wrapper] emit %d after %d tries: kind=%s\n", status, len(backoffs), kind)
@@ -1489,12 +1471,12 @@ func (b *daemonBridge) drainPending() {
 	}
 }
 
-// keepaliveLoop ticks every 10s to ping the daemon (which forwards to
-// the relay). The relay's stale-terminal reaper looks for keepalives
+// keepaliveLoop ticks every 10s to ping the daemon. Nexus uses forwarded
+// keepalives to detect stale terminal sessions.
 // within the last 45s; missing 4 in a row marks the session
 // disconnected. We use a dedicated endpoint instead of piggy-backing on
-// Emit so the relay can track liveness independently of whether the
-// wrapper has anything to say.
+// Emit so liveness is tracked independently of whether the wrapper has anything
+// to say.
 func (b *daemonBridge) keepaliveLoop() {
 	if b == nil {
 		return
@@ -1510,11 +1492,11 @@ func (b *daemonBridge) keepaliveLoop() {
 			return
 		case <-tick.C:
 			b.sendKeepalive()
-			// v0.2.2: also drain any pending Emit backlog. The Emit
-			// path drains-on-call, but if no jsonl activity happens
-			// for a while (idle session) backlog would just sit. The
-			// keepalive tick is the natural place to retry — it
-			// already requires daemon reachability.
+			// Also drain any pending Emit backlog. The Emit path
+			// drains-on-call, but if no jsonl activity happens for a
+			// while (idle session) backlog would just sit. The keepalive
+			// tick is the natural place to retry because it already
+			// requires daemon reachability.
 			b.drainPending()
 		}
 	}
@@ -1839,9 +1821,8 @@ var tuiOptionRE = regexp.MustCompile(`(?:^|[^\d])([1-9])\.[ \t]+(\S[^\r\n]*)`)
 
 // parseTUIYesNoOptions scans an ANSI-stripped approval frame for the numbered
 // option list and returns the keystroke numbers for the one-time "Yes" and the
-// "No" choices. Replaces the old exact "1. Yes"/"3. No" substring check so a
-// build that renumbers/reorders or lightly rewords the options still detects
-// (and maps the keys correctly). The PERSISTENT yes ("Yes, and always allow…",
+// "No" choices. This keeps working if Claude renumbers, reorders, or lightly
+// rewords the options. The PERSISTENT yes ("Yes, and always allow…",
 // "allow all edits…") is deliberately skipped — Pockly is a remote bridge and
 // must select the one-time grant, never persist a rule. ok is false unless a
 // one-time Yes AND a No are both found.
@@ -2236,14 +2217,14 @@ func (w *tuiPermissionWatcher) handle(prompt tuiPermissionPrompt) {
 		fmt.Fprintf(os.Stderr, "[pockly-wrapper] PTY permission register failed: %v\n", err)
 		return
 	}
-	w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, "pending", "v0.2.x awaiting web approval (PTY)")
+	w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, "pending", "awaiting web approval (PTY)")
 	out, err := w.bridge.awaitPermissionDecision(reqID, w.timeout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[pockly-wrapper] PTY permission await failed: %v\n", err)
 		return
 	}
 	if out.Reason == "timeout" {
-		w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, out.Decision, "v0.2.x web decision timed out (PTY)")
+		w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, out.Decision, "web decision timed out (PTY)")
 		return
 	}
 	key := webPermissionKey(out.Decision, w.bridge.claudeSessionWaitingForPermission(), prompt.AllowKey, prompt.DenyKey)
@@ -2253,11 +2234,11 @@ func (w *tuiPermissionWatcher) handle(prompt tuiPermissionPrompt) {
 		// we were parked on the web decision. Writing the key now would inject a
 		// stray keystroke into Claude's stdin, so drop it — the local answer
 		// already resolved the prompt.
-		w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, out.Decision, "v0.2.x web decision dropped — claude no longer waiting (PTY)")
+		w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, out.Decision, "web decision dropped — claude no longer waiting (PTY)")
 		return
 	}
 	_, _ = w.write([]byte(key))
-	w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, out.Decision, "v0.2.x web decision applied (PTY)")
+	w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, out.Decision, "web decision applied (PTY)")
 }
 
 // tuiDecisionKey maps a web decision to the PTY keystroke that selects the
@@ -2522,7 +2503,7 @@ var (
 // slashCommandRE matches a single "/name" token: one leading slash, a
 // lowercase-letter start, then letters/digits/[-:_]. This recognizes real
 // Claude slash commands ("/model", "/clear", "/pr-comments") while
-// rejecting file paths a user might send as a message ("/Users/x",
+// rejecting file paths a user might send as a message ("/Users/me",
 // "/usr/bin" — embedded slashes or an uppercase start fail the match).
 var slashCommandRE = regexp.MustCompile(`^/[a-z][a-z0-9:_-]*$`)
 
@@ -2921,13 +2902,11 @@ const (
 	statusIndicatorMinInterval   = 200 * time.Millisecond
 )
 
-// statusIndicatorTextAttached / Detached include the wrapper's version
-// suffix ("Pockly v0.1.29 attached" / "Pockly v0.1.29 reconnecting") so
-// users can see at a glance which daemon version is running without
-// shelling out to `pockly-daemon --version` — especially useful after a
-// `pockly-daemon update` to confirm the new bits took. We embed the
-// version in the state text (not a separate badge) so the bottom-right
-// reservation block stays a single rectangle the cursor logic can
+// statusIndicatorTextAttached / Detached include the wrapper's version suffix
+// so users can see at a glance which daemon version is running without
+// shelling out to `pockly-daemon --version`. We embed the version in the state
+// text (not a separate badge) so the bottom-right reservation block stays a
+// single rectangle the cursor logic can
 // rewind over cleanly.
 func statusIndicatorTextAttached() string {
 	return "Pockly v" + version.Version + " attached"

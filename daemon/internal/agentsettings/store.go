@@ -39,7 +39,7 @@ type Settings struct {
 // ModelOption is the structured form of a model pill option. Value is the
 // string the web submits back to Claude (for example "opus"). ResolvedModel is
 // the concrete model that value maps to when known (for example
-// "deepseek-v4-pro" via ANTHROPIC_DEFAULT_OPUS_MODEL).
+// "anthropic-compatible-pro" via ANTHROPIC_DEFAULT_OPUS_MODEL).
 type ModelOption struct {
 	Value         string `json:"value"`
 	Label         string `json:"label,omitempty"`
@@ -89,11 +89,8 @@ const ttySettle = 180 * time.Millisecond
 
 // EffortLevels are the labels the web pill exposes. "none" is the no-op
 // sentinel (don't override — claude uses its built-in default); the rest
-// are claude's real reasoning-effort levels, applied for real via the
-// `/effort <level>` slash command (PTY route) or the `--effort <level>`
-// spawn flag (SDK route) — the same dual-route model as model/permission.
-// (Pre-v0.4.22 these were extended-thinking keywords the web prepended to
-// the prompt; that prompt-prefix hack is gone.)
+// are claude's real reasoning-effort levels, applied via the `/effort <level>`
+// slash command (PTY route) or the `--effort <level>` spawn flag (SDK route).
 var EffortLevels = []string{"none", "low", "medium", "high", "xhigh", "max"}
 
 // claudeEffortLevels is the set claude's --effort / /effort accept. Used to

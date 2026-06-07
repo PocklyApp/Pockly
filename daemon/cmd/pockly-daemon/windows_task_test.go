@@ -14,17 +14,18 @@ import (
 func TestWindowsTaskXMLEmbedsCommandAndArgs(t *testing.T) {
 	xml := windowsTaskXML(
 		`C:\Program Files\Pockly\pockly-daemon.exe`,
-		"https://pocklyapp.com",
+		"https://nexus.example",
 		`C:\Users\me\id.json`,
 		`C:\Users\me\state.json`,
 	)
 	for _, want := range []string{
 		// exe goes in <Command> verbatim — spaces and backslashes are fine.
 		`<Command>C:\Program Files\Pockly\pockly-daemon.exe</Command>`,
-		// flags go in <Arguments>; the quoted relay URL survives as escaped quotes.
-		`serve --connect-relay`,
-		`--relay-url &quot;https://pocklyapp.com&quot;`,
+		// flags go in <Arguments>; the quoted Nexus URL survives as escaped quotes.
+		`serve --connect-nexus`,
+		`--nexus-url &quot;https://nexus.example&quot;`,
 		`--identity-file &quot;C:\Users\me\id.json&quot;`,
+		`--nexus-state-file &quot;C:\Users\me\state.json&quot;`,
 		// daemon-appropriate settings the /TR form couldn't set.
 		`<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`,
 		`<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>`,
@@ -38,9 +39,9 @@ func TestWindowsTaskXMLEmbedsCommandAndArgs(t *testing.T) {
 }
 
 func TestWindowsTaskXMLEscapesSpecialChars(t *testing.T) {
-	// An & in the relay URL must be XML-escaped or the action XML is malformed
+	// An & in the Nexus URL must be XML-escaped or the action XML is malformed
 	// and schtasks rejects it.
-	xml := windowsTaskXML("daemon.exe", "https://relay.example/?a=1&b=2", "id", "state")
+	xml := windowsTaskXML("daemon.exe", "https://nexus.example/?a=1&b=2", "id", "state")
 	if !strings.Contains(xml, "a=1&amp;b=2") {
 		t.Fatalf("ampersand not escaped:\n%s", xml)
 	}

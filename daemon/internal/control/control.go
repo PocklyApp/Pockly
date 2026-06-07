@@ -25,6 +25,7 @@ import (
 
 	"github.com/PocklyApp/Pockly/daemon/internal/agent/codexapp"
 	"github.com/PocklyApp/Pockly/daemon/internal/agentexec"
+	"github.com/PocklyApp/Pockly/daemon/internal/claudelauncher"
 	"github.com/PocklyApp/Pockly/daemon/internal/device"
 	"github.com/PocklyApp/Pockly/daemon/internal/index"
 	"github.com/PocklyApp/Pockly/daemon/internal/pair"
@@ -50,7 +51,7 @@ type InjectRequest struct {
 	Files          []InjectFile `json:"files,omitempty"`
 }
 
-// InjectFile is one attachment the web user added to a prompt. The relay
+// InjectFile is one attachment the web user added to a prompt. Nexus
 // forwards the raw bytes (base64 in JSON); the daemon writes each file to a
 // local temp dir and appends an @<path> reference to the prompt text so the
 // agent (Claude Code / Codex) can read it.
@@ -126,7 +127,7 @@ type TerminalEvent struct {
 	Error             string    `json:"error,omitempty"`
 	Timestamp         time.Time `json:"timestamp,omitempty"`
 	// Populated by daemon when it spontaneously creates a terminal session
-	// for an inject (no preceding TERMINAL_CREATE from relay). The relay
+	// for an inject (no preceding TERMINAL_CREATE from Nexus). Nexus
 	// uses these to upsert a terminal_sessions row so subsequent
 	// deriveSessionConnectionMode lookups report the right mode.
 	SessionID string `json:"session_id,omitempty"`
@@ -134,8 +135,8 @@ type TerminalEvent struct {
 	Cwd       string `json:"cwd,omitempty"`
 	// Driver names which agent driver owns this terminal: "pty" for the
 	// user's interactive wrapper, "sdk" for daemon-spawned headless
-	// claude --resume. Empty defaults to "pty" at the relay (legacy
-	// daemon behavior). The relay groups by driver in the catalog SQL
+	// claude --resume. Empty defaults to "pty" at Nexus (legacy
+	// daemon behavior). Nexus groups by driver in the catalog SQL
 	// so pty_backed_duplex and sdk_running come out distinct.
 	Driver string `json:"driver,omitempty"`
 }
@@ -146,7 +147,7 @@ type ListDirRequest struct {
 }
 
 // UpdateRequest is a remote "go run pockly-daemon update" trigger
-// forwarded by the relay (which in turn was POSTed by an authenticated
+// forwarded by Nexus (which in turn was POSTed by an authenticated
 // browser owner of this daemon). ToVersion is optional — empty means
 // "latest." We deliberately don't allow more knobs (--bin-dir,
 // --no-restart) because every remote-trigger should be "track latest
@@ -156,7 +157,7 @@ type UpdateRequest struct {
 	ToVersion string `json:"to_version,omitempty"`
 }
 
-// UpdateEvent reports update lifecycle back to relay (which forwards to
+// UpdateEvent reports update lifecycle back to Nexus (which forwards to
 // any subscribed browser). Status values:
 //   - "started"   the daemon accepted the request and dispatched a goroutine
 //   - "skipped"   already on the requested version; no-op
@@ -193,13 +194,7 @@ type ListDirResponse struct {
 	Error     string         `json:"error,omitempty"`
 }
 
-type RecipientAdded struct {
-	UserID           string `json:"user_id"`
-	BrowserDeviceID  string `json:"browser_device_id"`
-	BrowserE2EPubKey string `json:"browser_e2e_pubkey"`
-}
-
-// PermissionDecide is the v0.2.0 control WS message the relay sends
+// PermissionDecide is the control WS message Nexus sends
 // when a web user clicks Approve / Deny on a pending permission card.
 // The daemon forwards it to its in-memory permission.Store via
 // PermissionDecider (injected from main.go), which unblocks the MCP
@@ -210,7 +205,7 @@ type PermissionDecide struct {
 	Decision string `json:"decision"`
 }
 
-// PermissionDecideEvent is the daemon's ack back to the relay so the
+// PermissionDecideEvent is the daemon's ack back to Nexus so the
 // browser can confirm the click landed (vs guessing from the resolved
 // permission_request follow-up event). Status: accepted | not_found |
 // invalid. The browser uses this to flip a button from "Approving…"
@@ -221,7 +216,7 @@ type PermissionDecideEvent struct {
 	Error     string `json:"error,omitempty"`
 }
 
-// AgentSettingsGet is the relay → daemon control WS message that
+// AgentSettingsGet is the Nexus → daemon control WS message that
 // triggers the daemon to read its current agent-settings snapshot
 // (model + permission_mode + effort + menu options) for the wrapper
 // bound to the given Claude session_id. The daemon answers with an
@@ -236,7 +231,7 @@ type AgentSettingsGet struct {
 	Agent             string `json:"agent,omitempty"`
 }
 
-// AgentSettingsSet is the relay → daemon message that applies new
+// AgentSettingsSet is the Nexus → daemon message that applies new
 // values via the wrapper PTY (model = `/model <name>`, permission_mode
 // = Shift+Tab cycle). Only non-empty fields are applied. Effort is
 // recorded for the snapshot reply but doesn't touch the PTY — the
@@ -252,7 +247,7 @@ type AgentSettingsSet struct {
 }
 
 // AgentSettingsResult is the daemon's response to both GET and SET.
-// Status: "ok" | "error". On error the relay re-raises the message
+// Status: "ok" | "error". On error Nexus re-raises the message
 // verbatim to the web; the canonical error strings are the same as
 // the inject path ("session_not_attached", "session_drifted current=<sid>").
 type AgentSettingsResult struct {
@@ -365,7 +360,7 @@ type AgentDefaultsHandler interface {
 // PermissionDecider is the bridge between the control package (which
 // doesn't import permission) and the in-memory store wired by main.go.
 // Returns nil on success, an error explaining why the decision was
-// rejected (already-decided, unknown, invalid) for the relay ack.
+// rejected (already-decided, unknown, invalid) for the Nexus ack.
 type PermissionDecider interface {
 	Decide(requestID, decision string) error
 }
@@ -382,19 +377,18 @@ type envelope struct {
 	TerminalEvent   *TerminalEvent      `json:"terminal_event,omitempty"`
 	ListDirRequest  *ListDirRequest     `json:"list_dir_request,omitempty"`
 	ListDirResponse *ListDirResponse    `json:"list_dir_response,omitempty"`
-	RecipientAdded  *RecipientAdded     `json:"recipient_added,omitempty"`
 	UpdateRequest   *UpdateRequest      `json:"update_request,omitempty"`
 	UpdateEvent     *UpdateEvent        `json:"update_event,omitempty"`
-	// v0.2.0: interactive permission decide / ack.
+	// Interactive permission decision routing.
 	PermissionDecide      *PermissionDecide      `json:"permission_decide,omitempty"`
 	PermissionDecideEvent *PermissionDecideEvent `json:"permission_decide_event,omitempty"`
 	// Composer-pills surface (model / effort / permission) — paired GET/SET
-	// requests that the relay forwards verbatim to the daemon.
+	// requests that Nexus forwards verbatim to the daemon.
 	AgentSettingsGet    *AgentSettingsGet    `json:"agent_settings_get,omitempty"`
 	AgentSettingsSet    *AgentSettingsSet    `json:"agent_settings_set,omitempty"`
 	AgentSettingsResult *AgentSettingsResult `json:"agent_settings_result,omitempty"`
-	// v0.3: defaults-only snapshot for the draft composer — no
-	// session required, just a cwd to resolve project model aliases.
+	// Defaults-only snapshot for the draft composer: no session required,
+	// just a cwd to resolve project model aliases.
 	AgentDefaultsGet    *AgentDefaultsGet    `json:"agent_defaults_get,omitempty"`
 	AgentDefaultsResult *AgentDefaultsResult `json:"agent_defaults_result,omitempty"`
 	// Precise git diff for the Diffs drawer (uncommitted changes vs HEAD).
@@ -506,7 +500,7 @@ func Run(ctx context.Context, cfg Client) error {
 			case <-ctx.Done():
 				return nil
 			case <-time.After(2 * time.Second):
-				log.Printf("relay control reconnecting after error: %v", err)
+				log.Printf("Nexus control reconnecting after error: %v", err)
 			}
 		}
 	}
@@ -515,27 +509,32 @@ func Run(ctx context.Context, cfg Client) error {
 const (
 	// controlKeepaliveInterval is how often the daemon proactively pushes a
 	// DAEMON_STATUS frame over the control WS to keep it alive. It must sit
-	// comfortably below the relay's 60s control-WS read deadline; 20s gives a
-	// 3x margin and matches the relay's own server→daemon PING cadence.
+	// comfortably below Nexus's 60s control-WS read deadline; 20s gives a
+	// 3x margin and matches Nexus's own server→daemon PING cadence.
 	controlKeepaliveInterval = 20 * time.Second
 	// controlWriteWait bounds a single control-WS write so a dead or stalled
-	// connection (e.g. a Cloudflare-proxied socket that silently went away)
+	// connection (e.g. a proxied socket that silently went away)
 	// can't wedge the shared writer — and therefore the keepalive — forever.
 	controlWriteWait = 10 * time.Second
 )
 
+var (
+	startTaskEarlyDeathWindow        = 5 * time.Second
+	startTaskPostEvidenceDeathWindow = 2 * time.Second
+)
+
 // controlKeepalive pushes a DAEMON_STATUS over the control WS every interval so
 // an idle daemon (no live wrapped session emitting events) stays "online" at
-// the relay instead of flapping to a perpetual yellow "connecting" dot.
+// Nexus instead of flapping to a perpetual yellow "connecting" dot.
 //
-// Why this is needed: the relay closes the control WS after a 60s read
+// Why this is needed: Nexus closes the control WS after a 60s read
 // deadline without traffic, and it relies on WS PING/PONG control frames to
 // keep an otherwise-idle daemon alive. Those control frames are NOT reliably
-// forwarded through the Cloudflare proxy in front of the relay, so an idle
-// daemon was being cut every ~60s (observed in relay logs as repeated
+// forwarded consistently by every proxy in front of Nexus, so an idle daemon
+// was being cut every ~60s (observed in Nexus logs as repeated
 // `i/o timeout` / `1006 unexpected EOF` disconnects) and reconnecting forever.
 // A DAEMON_STATUS is an ordinary data frame — forwarded reliably — that the
-// relay treats as a liveness touch, so a steady drip keeps the dot green.
+// Nexus treats as a liveness touch, so a steady drip keeps the dot green.
 //
 // It returns when ctx or done is closed, or when write fails; on write failure
 // it invokes onWriteErr (the caller tears the connection down so the read loop
@@ -590,19 +589,9 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 	}
 	telemetry.Send(ctx, cfg.RelayURL, cfg.Identity, telemetry.Event{Name: "control_connected", Command: "serve", Status: "ok"})
 
-	// v0.2.1: re-announce every currently-live external terminal so
-	// the relay can re-populate its in-memory terminalSessions map
-	// after a relay restart. Pre-v0.2.1 the daemon only emitted
-	// TerminalEvents lazily (on next message_added / keepalive), so a
-	// long-idle wrapper became invisible to the web for the gap
-	// between relay deploy and the next event — could be hours, and
-	// the user just saw "session 已退出" with no way to tell it's a
-	// relay-side memory loss, not a real wrapper death.
-	//
-	// Implementation: emit a synthetic keepalive event for every live
-	// summary. The relay's keepalive handler already does the upsert
-	// (it's the same path /api/dev/terminal-sessions/<ts>/keepalive
-	// drives), so no relay-side changes needed — purely additive.
+	// Re-announce every live external terminal after control reconnect so
+	// Nexus can rebuild its in-memory terminal session map. Emit synthetic
+	// keepalive events through the normal terminal-event upsert path.
 	if cfg.Terminal != nil {
 		for _, s := range cfg.Terminal.List() {
 			if s.SessionStatus != "live" && s.SessionStatus != "starting" {
@@ -640,33 +629,25 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 		_ = writeEnvelope(envelope{Type: "SYNC_SESSION_EVENT", SyncEvent: &evt})
 	}
 	sendTerminal := func(evt TerminalEvent) {
-		// v0.1.37: capture WriteJSON err + emit telemetry. The pre-v0.1.37
-		// behavior silently dropped events here when the WS was in the
-		// middle of a reconnect (which happens dozens of times per day per
-		// the err.log heartbeat noise). Web users saw missing message_added
-		// turns and had no way to know the event got eaten — see the
-		// "777/888/999/000 didn't reach mobile" incident that motivated
-		// this telemetry. We log + send a telemetry event so the cloud
-		// metrics show the drop rate per device.
+		// Surface write failures as local logs plus optional diagnostics so
+		// operators can distinguish stream gaps from agent output gaps.
 		if err := writeEnvelope(envelope{Type: "TERMINAL_EVENT", TerminalEvent: &evt}); err != nil {
-			log.Printf("relay terminal_event forward dropped: kind=%s sid=%s err=%v",
+			log.Printf("Nexus terminal_event forward dropped: kind=%s sid=%s err=%v",
 				evt.Kind, evt.TerminalSessionID, err)
 			telemetry.Send(context.Background(), cfg.RelayURL, cfg.Identity, telemetry.Event{
 				Name:      "stream_event_drop",
 				Command:   string(evt.Kind),
 				Status:    "error",
 				ErrorCode: err.Error(),
-				// v0.1.41 #4: chat session_id for diagnose telemetry
-				// --session-id X correlation. control.TerminalEvent
-				// carries the claude session_id in SessionID (set by
-				// the wrapper's bridge in the event payload).
+				// control.TerminalEvent carries the chat session_id in
+				// SessionID so diagnostics can correlate dropped events.
 				SessionID: evt.SessionID,
 			})
 		}
 	}
 	done := make(chan struct{})
 	defer close(done)
-	// Keep an idle control WS alive through the Cloudflare proxy (see
+	// Keep an idle control WS alive through edge/proxy infrastructure (see
 	// controlKeepalive). A failed keepalive write closes the conn so the
 	// ReadJSON loop below unblocks and the outer loop reconnects.
 	go controlKeepalive(ctx, done, controlKeepaliveInterval, cfg.Identity.DeviceID, writeEnvelope, func() { _ = conn.Close() })
@@ -740,16 +721,11 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 				defer sendMu.Unlock()
 				_ = conn.WriteJSON(envelope{Type: "LIST_DIR_RESPONSE", ListDirResponse: &resp})
 			}()
-		case "RECIPIENT_ADDED":
-			if msg.RecipientAdded == nil {
-				continue
-			}
-			log.Printf("recipient added for future session-key wrapping: browser_device_id=%s", msg.RecipientAdded.BrowserDeviceID)
 		case "UPDATE_REQUEST":
 			if msg.UpdateRequest == nil {
 				continue
 			}
-			// Send "started" ack synchronously so the relay (and
+			// Send "started" ack synchronously so Nexus (and
 			// subscribed browser) sees we got the message before we
 			// possibly kill ourselves via launchctl-driven restart.
 			req := *msg.UpdateRequest
@@ -766,7 +742,7 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 			// Run the update in a goroutine so we keep the WS loop
 			// alive long enough to flush the started ack. The handler
 			// itself may kill the daemon (launchctl kickstart), in
-			// which case the relay's WS read returns EOF — the
+			// which case the Nexus WS read returns EOF — the
 			// browser uses /api/sessions polling as the real "did it
 			// land" signal.
 			go func() {
@@ -793,7 +769,7 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 			}
 			if err := cfg.PermissionDecider.Decide(req.RequestID, req.Decision); err != nil {
 				// not_found here means the request was no longer parked when
-				// the relay decide arrived (await already returned — timeout,
+				// the Nexus decide arrived (await already returned — timeout,
 				// client disconnect, or a prior decide). This is the C2
 				// breadcrumb for the "Allow didn't land" reports.
 				log.Printf("permission decide: reqID=%s decision=%s → not_found (%v)", req.RequestID, req.Decision, err)
@@ -869,7 +845,7 @@ func controlURL(baseURL string) (string, error) {
 	case "http":
 		u.Scheme = "ws"
 	default:
-		return "", fmt.Errorf("unsupported relay scheme %q", u.Scheme)
+		return "", fmt.Errorf("unsupported Nexus URL scheme %q", u.Scheme)
 	}
 	return u.String(), nil
 }
@@ -915,7 +891,7 @@ func (r *runner) handle(parent context.Context, cfg Client, req InjectRequest, s
 		return
 	}
 	// The driver (PTY wrapper OR SDK subprocess) will emit message_added
-	// events as Claude streams its reply; the relay correlates them by
+	// events as Claude streams its reply; Nexus correlates them by
 	// session_id. We only acknowledge that the inject was accepted.
 	send(InjectEvent{RequestID: req.RequestID, Type: "inject_completed", SessionID: req.SessionID})
 	telemetry.Send(context.Background(), cfg.RelayURL, cfg.Identity, telemetry.Event{Name: "inject_completed", Command: "serve", Status: "ok"})
@@ -1159,7 +1135,7 @@ func (r *runner) routeStartTask(ctx context.Context, req InjectRequest, send fun
 		})
 		return nil
 	}
-	bin, err := resolveExecutable("claude")
+	spec, err := resolveClaudeLauncher()
 	if err != nil {
 		return fmt.Errorf("claude_binary_missing")
 	}
@@ -1168,8 +1144,8 @@ func (r *runner) routeStartTask(ctx context.Context, req InjectRequest, send fun
 		return err
 	}
 	tsid, session, err := r.terminal.Create(ctx, liveterminal.LaunchConfig{
-		Command:     bin,
-		Args:        args,
+		Command:     spec.Path,
+		Args:        spec.Args(args),
 		Cwd:         cwd,
 		Env:         mergedProcessEnv(),
 		ReadyDelay:  1200 * time.Millisecond,
@@ -1205,7 +1181,7 @@ func (r *runner) routeStartTask(ctx context.Context, req InjectRequest, send fun
 		Type:      "session_created",
 		SessionID: sid,
 	})
-	// Fan terminal events back to relay under the request id so SSE
+	// Fan terminal events back to Nexus under the request id so SSE
 	// subscribers (web's draft session view) see the new session come
 	// alive without any extra catalog round-trip.
 	go func() {
@@ -1279,7 +1255,7 @@ func startTaskClaudeArgs(sessionID, text, model, permissionMode, effort string) 
 }
 
 func waitForStartTaskReady(ctx context.Context, session *liveterminal.Session, events <-chan liveterminal.Event) ([]liveterminal.Event, error) {
-	timer := time.NewTimer(5 * time.Second)
+	timer := time.NewTimer(startTaskEarlyDeathWindow)
 	defer timer.Stop()
 	var pending []liveterminal.Event
 	for {
@@ -1330,7 +1306,7 @@ func waitForStartTaskReady(ctx context.Context, session *liveterminal.Session, e
 }
 
 func waitForEarlyExitAfterStartEvidence(ctx context.Context, session *liveterminal.Session, events <-chan liveterminal.Event) ([]liveterminal.Event, error) {
-	timer := time.NewTimer(2 * time.Second)
+	timer := time.NewTimer(startTaskPostEvidenceDeathWindow)
 	defer timer.Stop()
 	var pending []liveterminal.Event
 	for {
@@ -1461,7 +1437,7 @@ func newUUIDv4() string {
 }
 
 // mapSDKError translates sdkdriver-returned errors to wire-friendly
-// codes that match the relay/web error vocabulary. Kept as a free
+// codes that match the Nexus/web error vocabulary. Kept as a free
 // function (not a method) so it can be unit-tested without spinning up
 // a runner.
 func mapSDKError(err error) error {
@@ -1506,14 +1482,15 @@ func (r *runner) handleTerminalCreate(parent context.Context, cfg Client, req Te
 		r.forwardTerminalEvent(TerminalEvent{RequestID: req.RequestID, TerminalSessionID: req.TerminalSessionID, Kind: "error", SessionStatus: "error", TurnStatus: "idle", Error: err.Error(), Timestamp: time.Now().UTC()})
 		return
 	}
-	bin, err := resolveExecutable("claude")
+	spec, err := resolveClaudeLauncher()
 	if err != nil {
 		r.forwardTerminalEvent(TerminalEvent{RequestID: req.RequestID, TerminalSessionID: req.TerminalSessionID, Kind: "error", SessionStatus: "error", TurnStatus: "idle", Error: err.Error(), Timestamp: time.Now().UTC()})
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
 	_, session, err := r.terminal.CreateWithID(ctx, req.TerminalSessionID, liveterminal.LaunchConfig{
-		Command:     bin,
+		Command:     spec.Path,
+		Args:        spec.Args(nil),
 		Cwd:         cwd,
 		Env:         mergedProcessEnv(),
 		ReadyDelay:  1200 * time.Millisecond,
@@ -1873,8 +1850,7 @@ func (r *runner) handleSyncSession(parent context.Context, cfg Client, req SyncS
 
 	send(SyncSessionEvent{RequestID: req.RequestID, SessionID: req.SessionID, Stage: "queued", Status: "running", Message: "Queued"})
 	client := pair.NewClient(cfg.RelayURL)
-	// E2E removed: history is synced in plaintext — no per-browser
-	// recipient lookup or encryption.
+	// History sync reads local agent logs and uploads the selected window.
 	progress := func(p relaypkg.SyncProgress) {
 		send(SyncSessionEvent{
 			RequestID: req.RequestID,
@@ -1914,10 +1890,7 @@ func syncWindowMeta(sessions []pair.SyncSession) pair.SyncSession {
 
 func syncErrorCode(err error) string {
 	msg := err.Error()
-	if strings.Contains(msg, "no_recipients") {
-		return "recipient_not_ready"
-	}
-	for _, code := range []string{"session_not_found", "recipient_not_ready", "browser_key_missing", "extract_failed", "encrypt_failed"} {
+	for _, code := range []string{"session_not_found", "extract_failed"} {
 		if strings.Contains(msg, code) {
 			return code
 		}
@@ -1931,6 +1904,10 @@ func resolveExecutable(name string) (string, error) {
 		return "", err
 	}
 	return resolved.Path, nil
+}
+
+func resolveClaudeLauncher() (claudelauncher.CommandSpec, error) {
+	return claudelauncher.Resolve("", "")
 }
 
 func mergedProcessEnv() []string {
@@ -2022,7 +1999,6 @@ func parseShellExports(r io.Reader, base map[string]string) map[string]string {
 			continue
 		}
 		if strings.HasPrefix(key, "ANTHROPIC_") ||
-			strings.HasPrefix(key, "DEEPSEEK_") ||
 			strings.HasPrefix(key, "CLAUDE_CODE_") ||
 			strings.HasPrefix(key, "OPENAI_") ||
 			strings.HasPrefix(key, "CODEX_") {

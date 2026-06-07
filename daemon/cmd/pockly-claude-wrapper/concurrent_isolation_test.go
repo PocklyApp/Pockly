@@ -13,19 +13,15 @@ import (
 	"time"
 )
 
-// TestConcurrentLockedSessionsDoNotCrossBind is the v0.1.36 acceptance
-// test for the multi-claude-in-one-cwd scenario. It simulates N
-// concurrent claude processes (each owning its own UUID.jsonl) writing
-// at ~100Hz, with N matching wrappers each tailing only its own locked
-// jsonl. The assertion is that every captured message_added carries
-// text that started with this tailer's sid prefix — i.e. ZERO
-// cross-binding even under heavy interleaved writes.
+// TestConcurrentLockedSessionsDoNotCrossBind covers the
+// multi-claude-in-one-cwd scenario. It simulates N concurrent Claude
+// processes, each owning its own UUID.jsonl, with N matching wrappers
+// each tailing only its own locked JSONL. Every captured message_added
+// must carry text from this tailer's sid prefix.
 //
-// This is the test the architecture review demanded: prove the lock
-// holds under load, don't just argue from design. If a future refactor
-// reintroduces shared-directory peeking (mtime scanning, fd discovery
-// without PID scoping, etc.) this test starts failing with
-// "tailer for sid-A captured cross-binding: from-sid-B-msg-12".
+// If a future refactor reintroduces shared-directory peeking, such as
+// mtime scanning or fd discovery without PID scoping, this test starts
+// failing with a cross-binding message.
 func TestConcurrentLockedSessionsDoNotCrossBind(t *testing.T) {
 	dir := t.TempDir()
 
@@ -172,14 +168,10 @@ func TestConcurrentLockedSessionsDoNotCrossBind(t *testing.T) {
 }
 
 // TestConcurrentLockedSessionsHandleMtimeBumps simulates the worst-case
-// concurrent scenario for the *old* mtime-based fallback: the "loser"
-// jsonl gets its mtime bumped repeatedly to be newer than the "winner".
-// Under v0.1.35's resolveActiveSession (mtime fallback), this would
-// have caused the winner's wrapper to flip its binding to the loser's
-// jsonl. v0.1.36 doesn't even look at mtime for binding decisions —
-// it's pinned to the wrapper-generated UUID — so the test verifies the
-// tailer keeps reading its own file regardless of what mtime says
-// elsewhere in the dir.
+// concurrent scenario for mtime-based fallback: the "loser" JSONL gets
+// its mtime bumped repeatedly to be newer than the "winner". Locked
+// binding is pinned to the wrapper-generated UUID, so the tailer must
+// keep reading its own file regardless of mtime elsewhere in the dir.
 func TestConcurrentLockedSessionsHandleMtimeBumps(t *testing.T) {
 	dir := t.TempDir()
 	sidA := newUUIDv4()
@@ -203,8 +195,8 @@ func TestConcurrentLockedSessionsHandleMtimeBumps(t *testing.T) {
 
 	// Wait long enough for B to bump its mtime past A's, then have A
 	// also write more. Under mtime-newest selection, A's tailer would
-	// at some point have pointed at B.jsonl. With v0.1.36 locking, A's
-	// tailer is hardcoded to pathA — no mtime input.
+	// at some point have pointed at B.jsonl. With locked binding, A's
+	// tailer is hardcoded to pathA with no mtime input.
 	time.Sleep(50 * time.Millisecond)
 	mustAppend(t, pathA, []byte(fmt.Sprintf(
 		`{"type":"assistant","sessionId":"%s","message":{"content":[{"type":"text","text":"alpha-2"}]}}`+"\n", sidA)))

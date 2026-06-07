@@ -5,11 +5,8 @@
 //
 // pockly-daemon runs on the user's dev machine. It watches Claude Code and
 // Codex session jsonl files, exposes them via a local HTTP API, and connects
-// outbound to a relay over WSS so the user's browser at
-// pocklyapp.com can read history and inject prompts back into running agents.
-//
-// This file is the P0 skeleton: version flag + usage. Real subcommands land
-// in P1 (`serve`, `pair`, `status`).
+// outbound to Pockly Nexus over WSS so the user's browser can read history and
+// inject prompts back into running agents.
 package main
 
 import (
@@ -59,6 +56,103 @@ import (
 	"golang.org/x/term"
 )
 
+const defaultPocklyNexusURL = "http://127.0.0.1:8787"
+
+func defaultNexusURL() string {
+	if v := envNexusURL(); v != "" {
+		return v
+	}
+	return defaultPocklyNexusURL
+}
+
+func envNexusURL() string {
+	if v := strings.TrimSpace(os.Getenv("POCKLY_NEXUS_URL")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("POCKLY_RELAY_URL"))
+}
+
+func resolveNexusURL(value string) string {
+	if v := strings.TrimSpace(value); v != "" {
+		return v
+	}
+	if v := envNexusURL(); v != "" {
+		return v
+	}
+	return defaultPocklyNexusURL
+}
+
+func selectedNexusURL(nexusURL, legacyRelayURL string) string {
+	return resolveNexusURL(firstNonEmptyString(nexusURL, legacyRelayURL))
+}
+
+func optionalNexusURL(nexusURL, legacyRelayURL string) string {
+	if v := strings.TrimSpace(firstNonEmptyString(nexusURL, legacyRelayURL)); v != "" {
+		return v
+	}
+	return envNexusURL()
+}
+
+func pathFlag(fs *flag.FlagSet, name, defaultPath, usage string) *string {
+	value := defaultPath
+	pathFlagVar(fs, &value, name, defaultPath, usage)
+	return &value
+}
+
+func pathFlagVar(fs *flag.FlagSet, target *string, name, defaultPath, usage string) {
+	fs.StringVar(target, name, defaultPath, usage)
+	if f := fs.Lookup(name); f != nil {
+		f.DefValue = displayPathDefault(defaultPath)
+	}
+}
+
+func displayEnvBackedDefault(fs *flag.FlagSet, name, envName string) {
+	if f := fs.Lookup(name); f != nil && strings.TrimSpace(f.DefValue) != "" {
+		f.DefValue = "$" + envName
+	}
+}
+
+func nexusStateFileFlag(fs *flag.FlagSet, defaultPath, usage string) *string {
+	value := defaultPath
+	pathFlagVar(fs, &value, "nexus-state-file", defaultPath, usage)
+	pathFlagVar(fs, &value, "relay-state-file", defaultPath, "legacy alias for --nexus-state-file")
+	return &value
+}
+
+func displayPathDefault(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return value
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return value
+	}
+	cleanValue := filepath.Clean(value)
+	cleanHome := filepath.Clean(home)
+	if samePath(cleanValue, cleanHome) {
+		return "~"
+	}
+	homePrefix := cleanHome + string(filepath.Separator)
+	if hasPathPrefix(cleanValue, homePrefix) {
+		return "~" + cleanValue[len(cleanHome):]
+	}
+	return value
+}
+
+func samePath(a, b string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func hasPathPrefix(value, prefix string) bool {
+	if runtime.GOOS == "windows" {
+		return strings.HasPrefix(strings.ToLower(value), strings.ToLower(prefix))
+	}
+	return strings.HasPrefix(value, prefix)
+}
+
 func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
@@ -68,11 +162,11 @@ Usage:
     pockly-daemon [flags] <command>
 
 Commands:
-    setup       scan a mobile QR code, connect this computer, and install the background service
-    serve       run the daemon (watch sessions, connect to relay)
+    setup       connect this computer to Nexus and install the background service
+    serve       run the daemon (watch sessions, connect to Nexus)
     login       log this daemon into a Pockly account
-    remote      enable or disable Remote Access for same-account mobile connect
-    pair        create a pairing grant and confirm browser binding
+    remote      enable or disable Remote Access for same-account browser access
+    pair        create a pairing grant and confirm browser access
     claude-status print local Pockly status for Claude Code
     claude-integrate install, remove, or inspect Claude Code integration
     enable-remote-control  wrap your shell's claude command via the Pockly daemon (opt-in)
@@ -100,104 +194,101 @@ Flags:
 		switch flag.Arg(0) {
 		case "setup":
 			if err := runSetup(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "serve":
 			if err := runServe(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "login":
 			if err := runLogin(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "remote":
 			if err := runRemote(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "pair":
 			if err := runPair(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "claude-status":
 			if err := runClaudeStatus(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "claude-integrate":
 			if err := runClaudeIntegrate(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "enable-remote-control":
 			if err := runEnableRemoteControl(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "disable-remote-control":
 			if err := runDisableRemoteControl(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "remote-control":
 			if err := runRemoteControl(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "debug-pty":
 			if err := runDebugPTY(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "live-attach":
 			if err := runLiveAttach(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "live-open-terminal":
 			if err := runLiveOpenTerminal(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "update", "upgrade":
 			if err := runUpdate(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "diagnose", "debug":
 			if err := runDiagnose(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "mcp-permission":
-			// v0.1.42 read-only MCP permission server (stdio JSON-RPC).
-			// Spawned by claude code as a subprocess via --mcp-config;
-			// not for direct use.
+			// Claude permission-prompt-tool server (stdio JSON-RPC).
+			// Spawned by Claude Code via --mcp-config; not for direct
+			// interactive use.
 			if err := runMCPPermission(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "test-scenario":
-			// v0.1.43 end-to-end scenario runner. Spawns fake-claude
+			// End-to-end scenario runner. Spawns fake-claude
 			// under wrapper, drives a specific test pattern, asserts
 			// pass/fail via telemetry queries.
 			if err := runTestScenario(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		case "hook-bridge":
-			// v0.3.0 claude PreToolUse hook entrypoint. Spawned by
-			// claude as a short-lived process per tool-call when the
-			// wrapper has installed our hook config; bridges decisions
-			// to the web. H1 skeleton returns no-decision so claude
-			// falls through to its terminal prompt; H3 will plug in
-			// the real register-with-daemon + await-web-decision flow.
+			// Claude PreToolUse compatibility hook entrypoint. Spawned
+			// by Claude as a short-lived process when the wrapper has
+			// installed Pockly-owned hook config.
 			if err := runHookBridge(flag.Args()[1:]); err != nil {
-				log.Fatal(err)
+				exitOnCommandError(err)
 			}
 			return
 		}
@@ -205,6 +296,13 @@ Flags:
 
 	flag.Usage()
 	os.Exit(2)
+}
+
+func exitOnCommandError(err error) {
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	log.Fatal(err)
 }
 
 func runDebugPTY(args []string) error {
@@ -656,7 +754,7 @@ func watchTerminalResize(ctx context.Context, send func(cols, rows uint16)) {
 // id" budget for the wrapper-unclean-exit recovery path. Without this,
 // a claude binary that crashes on startup (bad config, OOM, etc.)
 // would respawn → crash → respawn forever, burning the user's tokens
-// and stuffing relay logs.
+// and stuffing Nexus logs.
 //
 // Sliding window: keep last-hour timestamps per sid; Allow drops
 // expired ones and either appends + returns true (proceed) or returns
@@ -706,31 +804,31 @@ func runServe(args []string) (err error) {
 		return err
 	}
 
-	claudeHome := fs.String("claude-home", defaultClaudeHome, "Claude Code session home")
-	codexHome := fs.String("codex-home", defaultCodexHome, "Codex session home")
+	claudeHome := pathFlag(fs, "claude-home", defaultClaudeHome, "Claude Code session home")
+	codexHome := pathFlag(fs, "codex-home", defaultCodexHome, "Codex session home")
 	refreshInterval := fs.Duration("refresh-interval", 2*time.Second, "session index refresh interval")
-	connectRelay := fs.Bool("connect-relay", false, "sync indexed history to the paired relay")
-	relayURL := fs.String("relay-url", "", "override relay base URL for history sync")
+	var connectNexus bool
+	fs.BoolVar(&connectNexus, "connect-nexus", false, "sync indexed history to the paired Nexus")
+	fs.BoolVar(&connectNexus, "connect-relay", false, "legacy alias for --connect-nexus")
+	nexusURL := fs.String("nexus-url", "", "override Nexus base URL for history sync")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
 	identityPath, err := device.DefaultPath()
 	if err != nil {
 		return err
 	}
-	identityFile := fs.String("identity-file", identityPath, "device identity file path")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "daemon identity file path")
 	defaultRelayStatePath, err := relay.DefaultStatePath()
 	if err != nil {
 		return err
 	}
-	relayStateFile := fs.String("relay-state-file", defaultRelayStatePath, "relay pairing state file path")
-	syncInterval := fs.Duration("sync-interval", 2*time.Second, "full history sync interval when relay sync is enabled")
+	relayStateFile := nexusStateFileFlag(fs, defaultRelayStatePath, "Nexus pairing state file path")
+	syncInterval := fs.Duration("sync-interval", 2*time.Second, "full history sync interval when Nexus sync is enabled")
 
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	defer func() {
-		baseURL := strings.TrimSpace(*relayURL)
-		if baseURL == "" {
-			baseURL = "https://pocklyapp.com"
-		}
+		baseURL := selectedNexusURL(*nexusURL, *relayURL)
 		telemetry.Send(context.Background(), baseURL, device.Identity{}, telemetry.CommandFinished("serve", started, err))
 	}()
 
@@ -738,48 +836,47 @@ func runServe(args []string) (err error) {
 	defer stop()
 
 	profile := runner.Detect()
-	effectiveRelayURL := strings.TrimSpace(*relayURL)
-	if effectiveRelayURL == "" && *connectRelay {
-		// Fall back to the URL recorded in the relay state file so /api/status
+	effectiveNexusURL := optionalNexusURL(*nexusURL, *relayURL)
+	if effectiveNexusURL == "" && connectNexus {
+		// Fall back to the URL recorded in the pairing state file so /api/status
 		// reports the same target the sync loop will eventually use.
 		if data, err := os.ReadFile(*relayStateFile); err == nil {
 			var st struct {
 				RelayURL string `json:"relay_url"`
 			}
 			if json.Unmarshal(data, &st) == nil {
-				effectiveRelayURL = strings.TrimSpace(st.RelayURL)
+				effectiveNexusURL = strings.TrimSpace(st.RelayURL)
 			}
 		}
 	}
-	log.Printf("daemon environment: relay=%s label=%s claude_runner=%s",
-		effectiveRelayURL, api.EnvironmentLabel(effectiveRelayURL), profile.ClaudeAlias)
+	log.Printf("daemon environment: nexus=%s label=%s claude_runner=%s",
+		effectiveNexusURL, api.EnvironmentLabel(effectiveNexusURL), profile.ClaudeAlias)
 
-	// Start the update-availability checker. Background goroutine polls
-	// the CDN every 24h; /api/status reads from its snapshot. Never
-	// installs anything — that's the `pockly-daemon update` subcommand's
-	// job. We always start the checker (even when relay is disconnected)
-	// because the CDN is fetched directly, not via relay.
+	// Start the update-availability checker. Background goroutine polls the
+	// configured release source every 24h; /api/status reads from its snapshot.
+	// Never installs anything — that's the `pockly-daemon update` subcommand's
+	// job. If no release source is configured, the checker stays silent.
 	checker := newUpdateChecker(24 * time.Hour)
 	go checker.Run(ctx)
 
-	// Load device identity early so the api.Config telemetry hook can
-	// attribute events. LoadOrCreate is idempotent — if `pockly-daemon
-	// setup` already ran, it just reads the existing file; otherwise it
-	// mints a fresh one (which is harmless: an unpaired device just sends
-	// telemetry to an endpoint that no-ops without a real device_id).
-	// The relay-sync block further down passes this same `id` to control,
-	// so loading here doesn't duplicate work.
-	telemetryID, identityErr := device.LoadOrCreate(*identityFile, "")
-	if identityErr != nil {
-		log.Printf("identity load failed (telemetry will be anonymous): %v", identityErr)
+	// Only load an identity for optional diagnostics when telemetry is
+	// explicitly enabled. Open-source installs default to local logs only,
+	// so serve must not create identity state just for telemetry.
+	telemetryID := device.Identity{}
+	if telemetry.Enabled() {
+		var identityErr error
+		telemetryID, identityErr = device.LoadOrCreate(*identityFile, "")
+		if identityErr != nil {
+			log.Printf("identity load failed (diagnostics will be anonymous): %v", identityErr)
+		}
 	}
 
 	// wrapperRecoveryRef is the late-binding plumbing that lets the api
 	// handler trigger an SDK driver respawn after the wrapper reports an
 	// unclean exit. The actual closure (using sdkManager) is set further
-	// down inside the `if *connectRelay` block where sdkManager exists.
+	// down inside the Nexus-control block where sdkManager exists.
 	// Until then, the hook is a no-op so api.Config can be constructed
-	// independent of the relay-control branch.
+	// independent of the Nexus-control branch.
 	var (
 		wrapperRecoveryMu sync.Mutex
 		wrapperRecoveryFn func(claudeSID, cwd, agent string)
@@ -790,21 +887,14 @@ func runServe(args []string) (err error) {
 		ClaudeHome:      *claudeHome,
 		CodexHome:       *codexHome,
 		RefreshInterval: *refreshInterval,
-		RelayURL:        effectiveRelayURL,
+		RelayURL:        effectiveNexusURL,
 		Profile:         profile,
 		UpdateStatus:    checker.Snapshot,
-		// v0.1.37: per-event telemetry hook. Closes over `telemetryID`
-		// + `effectiveRelayURL` so the api package stays free of those
-		// imports. Background context: telemetry must not cancel when
-		// the originating HTTP handler returns.
-		//
-		// v0.1.41 #4: sessionID threaded all the way through to
-		// telemetry.Event.SessionID → wireEvent → relay → SQLite
-		// telemetry_events.session_id column. That's what makes
-		// `pockly-daemon diagnose telemetry --session-id X` actually
-		// find daemon-source rows.
+		// Optional diagnostic hook. telemetry.Send no-ops unless the
+		// operator explicitly enabled network telemetry, so open-source
+		// installs remain local-log-only by default.
 		ReportTelemetry: func(name, command, status, errorCode, sessionID string) {
-			telemetry.Send(context.Background(), effectiveRelayURL, telemetryID, telemetry.Event{
+			telemetry.Send(context.Background(), effectiveNexusURL, telemetryID, telemetry.Event{
 				Name: name, Command: command, Status: status, ErrorCode: errorCode, SessionID: sessionID,
 			})
 		},
@@ -821,7 +911,7 @@ func runServe(args []string) (err error) {
 			}
 			if !wrapperRespawnTracker.Allow(claudeSID) {
 				log.Printf("wrapper-recovery skipped sid=%s: loop guard (>3 attempts in last hour)", claudeSID)
-				telemetry.Send(context.Background(), effectiveRelayURL, telemetryID, telemetry.Event{
+				telemetry.Send(context.Background(), effectiveNexusURL, telemetryID, telemetry.Event{
 					Name: "wrapper_recovery_skipped", Command: "exit-intent", Status: "ok",
 					ErrorCode: "loop_guard", SessionID: claudeSID,
 				})
@@ -919,8 +1009,8 @@ func runServe(args []string) (err error) {
 	log.Printf("claude home: %s", *claudeHome)
 	log.Printf("codex home:  %s", *codexHome)
 	log.Printf("refresh interval: %s", refreshInterval.String())
-	if *connectRelay {
-		log.Printf("relay sync enabled; state file: %s", *relayStateFile)
+	if connectNexus {
+		log.Printf("Nexus sync enabled; state file: %s", *relayStateFile)
 		id, err := device.LoadOrCreate(*identityFile, "")
 		if err != nil {
 			return err
@@ -928,28 +1018,28 @@ func runServe(args []string) (err error) {
 		state, err := relay.LoadState(*relayStateFile)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				log.Printf("relay sync skipped: no relay state at %s", *relayStateFile)
+				log.Printf("Nexus sync skipped: no pairing state at %s", *relayStateFile)
 			} else {
 				return err
 			}
 		} else {
-			baseURL := strings.TrimSpace(*relayURL)
+			baseURL := optionalNexusURL(*nexusURL, *relayURL)
 			if baseURL == "" {
 				baseURL = state.RelayURL
 			}
 			if baseURL == "" {
-				log.Printf("relay sync skipped: relay URL missing")
+				log.Printf("Nexus sync skipped: Nexus URL missing")
 			} else if state.DaemonDeviceID != "" && state.DaemonDeviceID != id.DeviceID {
-				log.Printf("relay sync skipped: relay state device_id %s does not match local identity %s", state.DaemonDeviceID, id.DeviceID)
+				log.Printf("Nexus sync skipped: pairing state device_id %s does not match local identity %s", state.DaemonDeviceID, id.DeviceID)
 			} else {
 				if state.RemoteAccess {
 					if _, err := pair.NewClient(baseURL).SetRemoteAccess(id, true); err != nil {
 						log.Printf("remote access heartbeat failed: %v", err)
 					}
 				}
-				go startRelaySyncLoop(ctx, pair.NewClient(baseURL), id, idx, *syncInterval, profile)
+				go startNexusSyncLoop(ctx, pair.NewClient(baseURL), id, idx, *syncInterval, profile)
 				// updateHandler bridges incoming control-WS update_request
-				// messages from the relay to the local PerformUpdate
+				// messages from Nexus to the local PerformUpdate
 				// function. We define it here so main has cmd-package
 				// access; control.go gets a clean callback that doesn't
 				// know about CLI layout details.
@@ -1016,14 +1106,14 @@ func runServe(args []string) (err error) {
 					}
 					if _, err := sdkManager.EnsureDriver(ctx, claudeSID, cwd, agent); err != nil {
 						log.Printf("wrapper-recovery failed sid=%s: %v", claudeSID, err)
-						telemetry.Send(context.Background(), effectiveRelayURL, telemetryID, telemetry.Event{
+						telemetry.Send(context.Background(), effectiveNexusURL, telemetryID, telemetry.Event{
 							Name: "wrapper_recovery_failed", Command: "exit-intent", Status: "error",
 							ErrorCode: err.Error(), SessionID: claudeSID,
 						})
 						return
 					}
 					log.Printf("wrapper-recovery spawned SDK driver sid=%s cwd=%s", claudeSID, cwd)
-					telemetry.Send(context.Background(), effectiveRelayURL, telemetryID, telemetry.Event{
+					telemetry.Send(context.Background(), effectiveNexusURL, telemetryID, telemetry.Event{
 						Name: "wrapper_recovery_succeeded", Command: "exit-intent", Status: "ok",
 						SessionID: claudeSID,
 					})
@@ -1039,7 +1129,7 @@ func runServe(args []string) (err error) {
 						Profile:                profile,
 						ExternalTerminalEvents: externalTerminalEvents,
 						UpdateHandler:          updateHandler,
-						// v0.2.0: forward relay-issued permission
+						// Forward Nexus-issued permission
 						// decisions into the local permission.Store
 						// (which unblocks the MCP server's /await).
 						PermissionDecider: permissionDeciderAdapter{store: permissionStore},
@@ -1048,10 +1138,10 @@ func runServe(args []string) (err error) {
 						GitDiff:           agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						SDKDriver:         sdkDriverAdapter{manager: sdkManager, settings: agentSettingsStore},
 					}); err != nil {
-						log.Printf("relay control stopped: %v", err)
+						log.Printf("Nexus control stopped: %v", err)
 					}
 				}()
-				log.Printf("relay sync target: %s", baseURL)
+				log.Printf("Nexus sync target: %s", baseURL)
 			}
 		}
 	}
@@ -1082,36 +1172,38 @@ func runSetup(args []string) (err error) {
 	started := time.Now()
 	fs := flag.NewFlagSet("setup", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	relayURL := fs.String("relay-url", "https://pocklyapp.com", "relay base URL")
-	deviceName := fs.String("device-name", "", "daemon device display name")
-	installService := fs.Bool("install-service", true, "install a user-level background service after mobile connect")
+	nexusURL := fs.String("nexus-url", "", "Nexus base URL")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
+	deviceName := fs.String("device-name", "", "connected computer display name")
+	installService := fs.Bool("install-service", true, "install a user-level background service after connecting this computer")
 	startService := fs.Bool("start", true, "start the background service after installing it")
-	openBrowser := fs.Bool("open-browser", false, "open the browser for Pockly device authorization instead of using QR-first setup")
+	openBrowser := fs.Bool("open-browser", false, "open the browser for Pockly computer authorization instead of using QR-first setup")
 	noOpenBrowser := fs.Bool("no-open-browser", false, "do not open a browser automatically")
-	timeout := fs.Duration("timeout", 10*time.Minute, "device authorization wait timeout")
-	pollInterval := fs.Duration("poll-interval", 2*time.Second, "device authorization poll interval")
+	timeout := fs.Duration("timeout", 10*time.Minute, "computer authorization wait timeout")
+	pollInterval := fs.Duration("poll-interval", 2*time.Second, "computer authorization poll interval")
 	identityPath, err := device.DefaultPath()
 	if err != nil {
 		return err
 	}
-	identityFile := fs.String("identity-file", identityPath, "device identity file path")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "daemon identity file path")
 	relayStatePath, err := relay.DefaultStatePath()
 	if err != nil {
 		return err
 	}
-	relayStateFile := fs.String("relay-state-file", relayStatePath, "relay state file path")
+	relayStateFile := nexusStateFileFlag(fs, relayStatePath, "Nexus state file path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	baseURL := selectedNexusURL(*nexusURL, *relayURL)
 	defer func() {
-		telemetry.Send(context.Background(), *relayURL, device.Identity{}, telemetry.CommandFinished("setup", started, err))
+		telemetry.Send(context.Background(), baseURL, device.Identity{}, telemetry.CommandFinished("setup", started, err))
 	}()
 
 	id, err := device.LoadOrCreate(*identityFile, *deviceName)
 	if err != nil {
 		return err
 	}
-	client := pair.NewClient(*relayURL)
+	client := pair.NewClient(baseURL)
 	fmt.Println("Pockly daemon installed.")
 	local := isLocalInstall()
 
@@ -1122,12 +1214,12 @@ func runSetup(args []string) (err error) {
 		// to our 127.0.0.1 server. No y/N prompt, no device-authorization
 		// polling.
 		fmt.Println("Detected local install — opening the Pockly setup page in your browser.")
-		s, err := runLocalSetupHandshake(client, id, *relayURL, *timeout, *pollInterval, !*noOpenBrowser)
+		s, err := runLocalSetupHandshake(client, id, baseURL, *timeout, *pollInterval, !*noOpenBrowser)
 		if err != nil {
 			return err
 		}
 		state = relay.State{
-			RelayURL:           *relayURL,
+			RelayURL:           baseURL,
 			DaemonDeviceID:     s.DaemonDeviceID,
 			UserEmail:          s.UserEmail,
 			RemoteAccess:       s.RemoteAccessEnabled,
@@ -1142,7 +1234,7 @@ func runSetup(args []string) (err error) {
 		}
 		fmt.Printf("Connected as %s.\n", s.UserEmail)
 		fmt.Printf("Remote Access enabled: %t\n", s.RemoteAccessEnabled)
-		fmt.Printf("Saved relay state to %s\n", *relayStateFile)
+		fmt.Printf("Saved Nexus pairing state to %s\n", *relayStateFile)
 	} else {
 		// Remote install: keep the QR / device-authorization flow with the
 		// y/N prompt on this terminal — the user is on a different machine.
@@ -1152,7 +1244,7 @@ func runSetup(args []string) (err error) {
 			return err
 		}
 		state = relay.State{
-			RelayURL:           *relayURL,
+			RelayURL:           baseURL,
 			DaemonDeviceID:     auth.DaemonDeviceID,
 			UserEmail:          auth.User.Email,
 			RemoteAccess:       auth.RemoteAccessEnabled,
@@ -1167,16 +1259,16 @@ func runSetup(args []string) (err error) {
 		}
 		fmt.Printf("Connected as %s.\n", auth.User.Email)
 		fmt.Printf("Remote Access enabled: %t\n", auth.RemoteAccessEnabled)
-		fmt.Printf("Saved relay state to %s\n", *relayStateFile)
+		fmt.Printf("Saved Nexus pairing state to %s\n", *relayStateFile)
 		printMobileJoinGrantBestEffort(client, id)
 	}
 	if *installService {
-		if err := installUserService(*relayURL, *identityFile, *relayStateFile, *startService); err != nil {
+		if err := installUserService(baseURL, *identityFile, *relayStateFile, *startService); err != nil {
 			return err
 		}
-		fmt.Println("Open https://pocklyapp.com/workspace/sessions on your phone to view and control sessions.")
+		fmt.Printf("Open %s/workspace/sessions on your phone to view and control sessions.\n", strings.TrimRight(baseURL, "/"))
 	} else {
-		fmt.Printf("Start daemon manually with: pockly-daemon serve --connect-relay --relay-url %s\n", *relayURL)
+		fmt.Printf("Start daemon manually with: pockly-daemon serve --connect-nexus --nexus-url %s\n", baseURL)
 	}
 	installClaudeIntegrationBestEffort()
 	installRemoteControlBestEffort()
@@ -1187,34 +1279,36 @@ func runLogin(args []string) (err error) {
 	started := time.Now()
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	relayURL := fs.String("relay-url", "https://pocklyapp.com", "relay base URL")
+	nexusURL := fs.String("nexus-url", "", "Nexus base URL")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
 	loginCode := fs.String("login-code", "", "legacy one-time daemon login code from the Pockly web app")
-	deviceName := fs.String("device-name", "", "daemon device display name")
-	openBrowser := fs.Bool("open-browser", true, "open the browser for Pockly device authorization")
+	deviceName := fs.String("device-name", "", "connected computer display name")
+	openBrowser := fs.Bool("open-browser", true, "open the browser for Pockly computer authorization")
 	noOpenBrowser := fs.Bool("no-open-browser", false, "do not open a browser automatically")
-	timeout := fs.Duration("timeout", 10*time.Minute, "device authorization wait timeout")
-	pollInterval := fs.Duration("poll-interval", 2*time.Second, "device authorization poll interval")
+	timeout := fs.Duration("timeout", 10*time.Minute, "computer authorization wait timeout")
+	pollInterval := fs.Duration("poll-interval", 2*time.Second, "computer authorization poll interval")
 	identityPath, err := device.DefaultPath()
 	if err != nil {
 		return err
 	}
-	identityFile := fs.String("identity-file", identityPath, "device identity file path")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "daemon identity file path")
 	relayStatePath, err := relay.DefaultStatePath()
 	if err != nil {
 		return err
 	}
-	relayStateFile := fs.String("relay-state-file", relayStatePath, "relay state file path")
+	relayStateFile := nexusStateFileFlag(fs, relayStatePath, "Nexus state file path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
+	baseURL := selectedNexusURL(*nexusURL, *relayURL)
 	defer func() {
-		telemetry.Send(context.Background(), *relayURL, device.Identity{}, telemetry.CommandFinished("login", started, err))
+		telemetry.Send(context.Background(), baseURL, device.Identity{}, telemetry.CommandFinished("login", started, err))
 	}()
 	id, err := device.LoadOrCreate(*identityFile, *deviceName)
 	if err != nil {
 		return err
 	}
-	client := pair.NewClient(*relayURL)
+	client := pair.NewClient(baseURL)
 	local := isLocalInstall()
 	var state relay.State
 	var userEmail string
@@ -1227,7 +1321,7 @@ func runLogin(args []string) (err error) {
 			return err
 		}
 		state = relay.State{
-			RelayURL:           *relayURL,
+			RelayURL:           baseURL,
 			DaemonDeviceID:     res.DaemonDeviceID,
 			UserEmail:          res.User.Email,
 			RemoteAccess:       res.RemoteAccessEnabled,
@@ -1245,7 +1339,7 @@ func runLogin(args []string) (err error) {
 			return err
 		}
 		state = relay.State{
-			RelayURL:           *relayURL,
+			RelayURL:           baseURL,
 			DaemonDeviceID:     auth.DaemonDeviceID,
 			UserEmail:          auth.User.Email,
 			RemoteAccess:       auth.RemoteAccessEnabled,
@@ -1264,7 +1358,7 @@ func runLogin(args []string) (err error) {
 	fmt.Printf("Logged in as %s.\n", userEmail)
 	fmt.Printf("Daemon device: %s (%s)\n", id.DeviceName, daemonDeviceID)
 	fmt.Printf("Remote Access: %t\n", remoteAccess)
-	fmt.Printf("Saved relay state to %s\n", *relayStateFile)
+	fmt.Printf("Saved Nexus pairing state to %s\n", *relayStateFile)
 	if !local {
 		printMobileJoinGrantBestEffort(client, id)
 	}
@@ -1273,18 +1367,18 @@ func runLogin(args []string) (err error) {
 
 // runLocalSetupHandshake performs the loopback handshake for local installs:
 //
-//  1. Pre-register the daemon with the relay via /api/daemon/setup-grants —
+//  1. Pre-register the daemon with Nexus via /api/daemon/setup-grants —
 //     this gives us a grant_id the web can claim.
 //  2. Start a single-shot 127.0.0.1 HTTP server with a fresh nonce, allowing
-//     POSTs only from the relay origin.
-//  3. Open https://<relay>/local-setup#grant=&nonce=&cb= in the user's
+//     POSTs only from the Nexus origin.
+//  3. Open https://<nexus>/local-setup#grant=&nonce=&cb= in the user's
 //     browser. The web mints device tokens via /api/daemon/local-claim and
 //     POSTs them back to our loopback callback.
-//  4. Return the claim. Caller writes it to relay state.
+//  4. Return the claim. Caller writes it to pairing state.
 //
 // We never poll /api/daemon/setup-grants/{id}/result in this path — the web
 // hands us tokens directly via the loopback. The grant entry stays in the
-// relay DB as an audit record.
+// Nexus stores the grant as an audit record.
 func runLocalSetupHandshake(client *pair.Client, id device.Identity, relayURL string, deadline, fallbackPollInterval time.Duration, shouldOpenBrowser bool) (localsetup.Claim, error) {
 	grant, err := client.CreateSetupGrant(id, version.String())
 	if err != nil {
@@ -1376,7 +1470,7 @@ func runLocalSetupHandshake(client *pair.Client, id device.Identity, relayURL st
 func buildLocalSetupURL(relayBaseURL, grantID, nonce, callback string) (string, error) {
 	u, err := url.Parse(relayBaseURL)
 	if err != nil {
-		return "", fmt.Errorf("parse relay url: %w", err)
+		return "", fmt.Errorf("parse Nexus URL: %w", err)
 	}
 	u.Path = "/local-setup"
 	u.RawQuery = ""
@@ -1385,12 +1479,12 @@ func buildLocalSetupURL(relayBaseURL, grantID, nonce, callback string) (string, 
 	return u.String() + "#" + frag, nil
 }
 
-// relayOriginForLocalSetup returns the scheme+host part of the relay URL,
+// relayOriginForLocalSetup returns the scheme+host part of the Nexus URL,
 // for use as the CORS Origin check on the loopback server.
 func relayOriginForLocalSetup(relayURL string) string {
 	u, err := url.Parse(relayURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "https://pocklyapp.com"
+		return defaultNexusURL()
 	}
 	return u.Scheme + "://" + u.Host
 }
@@ -1406,7 +1500,7 @@ func printDeviceAuthorization(auth pair.DeviceAuthorizationResponse) {
 }
 
 // authorizeDaemonDevice runs the QR / device-authorization handshake with the
-// relay. When autoConfirm is true, the daemon answers any awaiting_daemon_confirm
+// Nexus. When autoConfirm is true, the daemon answers any awaiting_daemon_confirm
 // poll with allow=true without ever showing the y/N prompt. autoConfirm is the
 // right choice for local installs (the user is at the keyboard, so the prompt
 // has no shoulder-surf-defense value) and the wrong choice for remote installs
@@ -1479,7 +1573,7 @@ func waitForDeviceAuthorization(ctx context.Context, client *pair.Client, auth p
 			if autoConfirm || autoConfirmPairFromEnv() {
 				// Local install: the user just typed `pockly-daemon setup`
 				// on this exact machine. Skip the y/N prompt and confirm
-				// silently. The relay still records this as a confirmation
+				// silently. Nexus still records this as a confirmation
 				// event for audit. The env-var path is for headless
 				// containers / CI runners where there's no TTY for y/N
 				// but the operator has fully controlled the environment.
@@ -1510,7 +1604,7 @@ func waitForDeviceAuthorization(ctx context.Context, client *pair.Client, auth p
 		case "pending", "":
 			// Keep waiting.
 		default:
-			fmt.Printf("Authorization is waiting in relay state %q. Update pockly-daemon if this does not progress.\n", res.Status)
+			fmt.Printf("Authorization is waiting in Nexus pairing state %q. Update pockly-daemon if this does not progress.\n", res.Status)
 		}
 		if !sleepWithContext(ctx, pollEvery) {
 			return pair.DeviceAuthorizationTokenResponse{}, ctx.Err()
@@ -1699,18 +1793,19 @@ func openURL(rawURL string) error {
 func runRemote(args []string) error {
 	fs := flag.NewFlagSet("remote", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	relayURL := fs.String("relay-url", "", "override relay base URL")
+	nexusURL := fs.String("nexus-url", "", "override Nexus base URL")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
 	enabled := fs.Bool("enabled", true, "enable Remote Access")
 	identityPath, err := device.DefaultPath()
 	if err != nil {
 		return err
 	}
-	identityFile := fs.String("identity-file", identityPath, "device identity file path")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "device identity file path")
 	relayStatePath, err := relay.DefaultStatePath()
 	if err != nil {
 		return err
 	}
-	relayStateFile := fs.String("relay-state-file", relayStatePath, "relay state file path")
+	relayStateFile := nexusStateFileFlag(fs, relayStatePath, "Nexus state file path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1722,12 +1817,12 @@ func runRemote(args []string) error {
 	if err != nil {
 		return err
 	}
-	baseURL := strings.TrimSpace(*relayURL)
+	baseURL := optionalNexusURL(*nexusURL, *relayURL)
 	if baseURL == "" {
 		baseURL = state.RelayURL
 	}
 	if baseURL == "" {
-		return fmt.Errorf("relay URL missing; run login first or pass --relay-url")
+		return fmt.Errorf("Nexus URL missing; run login first or pass --nexus-url")
 	}
 	res, err := pair.NewClient(baseURL).SetRemoteAccess(id, *enabled)
 	if err != nil {
@@ -1748,18 +1843,19 @@ func runPair(args []string) error {
 	fs := flag.NewFlagSet("pair", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 
-	relayURL := fs.String("relay-url", "https://pocklyapp.com", "relay base URL")
-	deviceName := fs.String("device-name", "", "daemon device display name")
+	nexusURL := fs.String("nexus-url", "", "Nexus base URL")
+	relayURL := fs.String("relay-url", "", "legacy alias for --nexus-url")
+	deviceName := fs.String("device-name", "", "connected computer display name")
 	identityPath, err := device.DefaultPath()
 	if err != nil {
 		return err
 	}
-	identityFile := fs.String("identity-file", identityPath, "device identity file path")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "daemon identity file path")
 	relayStatePath, err := relay.DefaultStatePath()
 	if err != nil {
 		return err
 	}
-	relayStateFile := fs.String("relay-state-file", relayStatePath, "relay pairing state file path")
+	relayStateFile := nexusStateFileFlag(fs, relayStatePath, "Nexus pairing state file path")
 	pollInterval := fs.Duration("poll-interval", 2*time.Second, "poll interval for pending confirmation requests")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -1770,7 +1866,8 @@ func runPair(args []string) error {
 		return err
 	}
 
-	client := pair.NewClient(*relayURL)
+	baseURL := selectedNexusURL(*nexusURL, *relayURL)
+	client := pair.NewClient(baseURL)
 	grant, err := client.CreatePairingGrant(id)
 	if err != nil {
 		return err
@@ -1782,7 +1879,7 @@ func runPair(args []string) error {
 	fmt.Printf("Short code: %s\n", grant.ShortCode)
 	fmt.Printf("Expires at: %s\n", grant.ExpiresAt.Format(time.RFC3339))
 	fmt.Printf("QR payload:\n%s\n\n", qrPayload)
-	fmt.Printf("Open pocklyapp.com, log in, and paste or scan the payload above.\n")
+	fmt.Printf("Open your Pockly web app, log in, and paste or scan the payload above.\n")
 
 	for {
 		pending, err := client.PendingRequests(id)
@@ -1800,9 +1897,9 @@ func runPair(args []string) error {
 			}
 			fmt.Printf("Pairing %s: %s\n", req.PairingGrant, res.Status)
 			if allow {
-				fmt.Printf("Bound browser device %s to daemon %s\n", res.BrowserDeviceID, res.DaemonDeviceID)
+				fmt.Printf("Bound browser access %s to daemon %s\n", res.BrowserDeviceID, res.DaemonDeviceID)
 				if err := relay.SaveState(*relayStateFile, relay.State{
-					RelayURL:           *relayURL,
+					RelayURL:           baseURL,
 					DaemonDeviceID:     res.DaemonDeviceID,
 					DeviceAccessToken:  res.DeviceAccessToken,
 					DeviceRefreshToken: res.DeviceRefreshToken,
@@ -1811,7 +1908,7 @@ func runPair(args []string) error {
 				}); err != nil {
 					return err
 				}
-				fmt.Printf("Saved relay state to %s\n", *relayStateFile)
+				fmt.Printf("Saved Nexus pairing state to %s\n", *relayStateFile)
 			}
 			return nil
 		}
@@ -1819,21 +1916,21 @@ func runPair(args []string) error {
 	}
 }
 
-func installUserService(relayURL, identityFile, relayStateFile string, start bool) error {
+func installUserService(nexusURL, identityFile, relayStateFile string, start bool) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable path: %w", err)
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		return installLaunchAgent(exe, relayURL, identityFile, relayStateFile, start)
+		return installLaunchAgent(exe, nexusURL, identityFile, relayStateFile, start)
 	case "linux":
-		return installSystemdUserService(exe, relayURL, identityFile, relayStateFile, start)
+		return installSystemdUserService(exe, nexusURL, identityFile, relayStateFile, start)
 	case "windows":
-		return installWindowsScheduledTask(exe, relayURL, identityFile, relayStateFile, start)
+		return installWindowsScheduledTask(exe, nexusURL, identityFile, relayStateFile, start)
 	default:
 		fmt.Printf("Background service install is not supported on %s.\n", runtime.GOOS)
-		fmt.Printf("Start daemon manually with: %s serve --connect-relay --relay-url %s\n", exe, relayURL)
+		fmt.Printf("Start daemon manually with: %s serve --connect-nexus --nexus-url %s\n", exe, nexusURL)
 		return nil
 	}
 }
@@ -1842,7 +1939,7 @@ func agentServicePath() string {
 	return agentexec.SearchPath(os.Getenv("PATH"), os.Getenv)
 }
 
-func installLaunchAgent(exe, relayURL, identityFile, relayStateFile string, start bool) error {
+func installLaunchAgent(exe, nexusURL, identityFile, relayStateFile string, start bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -1856,8 +1953,8 @@ func installLaunchAgent(exe, relayURL, identityFile, relayStateFile string, star
 		return err
 	}
 	args := []string{
-		exe, "serve", "--connect-relay", "--relay-url", relayURL,
-		"--identity-file", identityFile, "--relay-state-file", relayStateFile,
+		exe, "serve", "--connect-nexus", "--nexus-url", nexusURL,
+		"--identity-file", identityFile, "--nexus-state-file", relayStateFile,
 	}
 	var argXML strings.Builder
 	for _, arg := range args {
@@ -1905,7 +2002,7 @@ func installLaunchAgent(exe, relayURL, identityFile, relayStateFile string, star
 	return nil
 }
 
-func installSystemdUserService(exe, relayURL, identityFile, relayStateFile string, start bool) error {
+func installSystemdUserService(exe, nexusURL, identityFile, relayStateFile string, start bool) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return err
@@ -1924,7 +2021,7 @@ Description=Pockly daemon
 After=network-online.target
 
 [Service]
-ExecStart=%s serve --connect-relay --relay-url %s --identity-file %s --relay-state-file %s
+ExecStart=%s serve --connect-nexus --nexus-url %s --identity-file %s --nexus-state-file %s
 Environment=PATH=%s
 Restart=always
 RestartSec=5
@@ -1933,7 +2030,7 @@ StandardError=append:%s
 
 [Install]
 WantedBy=default.target
-`, systemdQuote(exe), systemdQuote(relayURL), systemdQuote(identityFile), systemdQuote(relayStateFile), systemdQuote(agentServicePath()), filepath.Join(stateDir, "daemon.log"), filepath.Join(stateDir, "daemon.err.log"))
+`, systemdQuote(exe), systemdQuote(nexusURL), systemdQuote(identityFile), systemdQuote(relayStateFile), systemdQuote(agentServicePath()), filepath.Join(stateDir, "daemon.log"), filepath.Join(stateDir, "daemon.err.log"))
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
 		return err
 	}
@@ -1952,7 +2049,7 @@ WantedBy=default.target
 
 const windowsTaskName = "PocklyDaemon"
 
-func installWindowsScheduledTask(exe, relayURL, identityFile, relayStateFile string, start bool) error {
+func installWindowsScheduledTask(exe, nexusURL, identityFile, relayStateFile string, start bool) error {
 	// Register the task from a well-formed XML rather than `/SC ONLOGON /TR`.
 	// The /TR string has to carry the quoted exe plus four quoted flags, and
 	// schtasks' /TR parser mangles those nested quotes — it was failing on
@@ -1962,7 +2059,7 @@ func installWindowsScheduledTask(exe, relayURL, identityFile, relayStateFile str
 	// separate <Command>/<Arguments> elements, sidestepping the quoting, and
 	// lets us set daemon-appropriate settings the /TR form can't: no execution
 	// time limit (default tasks are killed after 72h) and no battery/idle stop.
-	xmlBody := windowsTaskXML(exe, relayURL, identityFile, relayStateFile)
+	xmlBody := windowsTaskXML(exe, nexusURL, identityFile, relayStateFile)
 	f, err := os.CreateTemp("", "pockly-daemon-task-*.xml")
 	if err != nil {
 		return fmt.Errorf("create task xml temp file: %w", err)
@@ -1995,16 +2092,16 @@ func installWindowsScheduledTask(exe, relayURL, identityFile, relayStateFile str
 
 // windowsTaskXML builds a Task Scheduler v1.2 definition that runs the daemon
 // at user logon. The exe goes in <Command> and the flags in <Arguments> (both
-// XML-escaped), so the quoted relay URL / file paths survive without the /TR
+// XML-escaped), so the quoted Nexus URL / file paths survive without the /TR
 // nested-quote mangling. Settings are tuned for a long-lived daemon: it must
 // not be killed after the default 72h limit, must not be blocked or stopped on
 // battery, and must auto-restart if it crashes.
-func windowsTaskXML(exe, relayURL, identityFile, relayStateFile string) string {
-	args := fmt.Sprintf(`serve --connect-relay --relay-url "%s" --identity-file "%s" --relay-state-file "%s"`, relayURL, identityFile, relayStateFile)
+func windowsTaskXML(exe, nexusURL, identityFile, relayStateFile string) string {
+	args := fmt.Sprintf(`serve --connect-nexus --nexus-url "%s" --identity-file "%s" --nexus-state-file "%s"`, nexusURL, identityFile, relayStateFile)
 	return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Pockly daemon - keeps your local Claude sessions reachable from pocklyapp.com.</Description>
+    <Description>Pockly daemon - keeps your local agent sessions reachable through Pockly Nexus.</Description>
     <URI>\` + windowsTaskName + `</URI>
   </RegistrationInfo>
   <Triggers>
@@ -2127,59 +2224,55 @@ func terminalQRMode() string {
 	}
 }
 
-func startRelaySyncLoop(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, syncInterval time.Duration, profile runner.Profile) {
+func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, syncInterval time.Duration, profile runner.Profile) {
 	var lastSyncSuccessTelemetry time.Time
 	var lastLoggedAt time.Time
 	lastLoggedSessions := -1 // sentinel: first sync always logs
 	lastPlaintextSync := map[string]string{}
 	runSync := func() {
 		if err := idx.Refresh(); err != nil {
-			log.Printf("relay sync refresh index: %v", err)
+			log.Printf("Nexus sync refresh index: %v", err)
 			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "index_refresh_failed"})
 			return
 		}
-		// E2E removed: the catalog carries plaintext session metadata +
-		// first-message snippets. No per-browser recipient fetch needed.
+		// Catalog sync carries session metadata and first-message snippets.
 		req, err := relay.BuildCatalogSyncRequest(idx, id.DeviceID, profile)
 		if err != nil {
-			log.Printf("relay sync snapshot: %v", err)
+			log.Printf("Nexus sync snapshot: %v", err)
 			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "snapshot_failed"})
 			return
 		}
 		// Every catalog sync is the complete, authoritative list of sessions
 		// this daemon knows about. By the time this loop runs, idx has
 		// completed at least one Refresh() (StartBackgroundRefresh blocks on
-		// it). Setting FullReconcile=true lets the relay GC sessions the user
-		// has deleted on disk — without this, the relay's session list grows
+		// it). Setting FullReconcile=true lets Nexus GC sessions the user
+		// has deleted on disk — without this, the Nexus session list grows
 		// monotonically and a deleted .jsonl shows as a ghost forever.
 		//
-		// Per-session syncs (syncChangedPlaintextRelaySessions below) MUST
+		// Per-session syncs (syncChangedPlaintextNexusSessions below) MUST
 		// NOT set this flag — they intentionally carry one session + its
 		// turns, not the catalog.
 		req.FullReconcile = true
 		res, err := client.SyncHistory(id, req)
 		if err != nil {
-			log.Printf("relay sync push: %v", err)
+			log.Printf("Nexus sync push: %v", err)
 			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "push_failed"})
 			return
 		}
-		// v0.2.1: dedup the success line. The 2s heartbeat ticker
-		// fires constantly; logging every tick produces ~30 lines/min
-		// of "sessions=N turns=0" noise (~3-4MB/day) that buries real
-		// signal. Only log when something actually changed (new turns
-		// pushed OR session count differs from the previous push) OR
-		// once every 5 min as a "still alive" heartbeat.
+		// Dedup the success line. The heartbeat ticker fires constantly;
+		// logging every tick buries real signal. Only log when something
+		// changed (new turns pushed or session count differs from the
+		// previous push), or once every 5 minutes as a still-alive line.
 		if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || time.Since(lastLoggedAt) > 5*time.Minute {
-			log.Printf("relay sync ok: sessions=%d turns=%d device=%s", res.SessionCount, res.TurnCount, res.DaemonDevice)
+			log.Printf("Nexus sync ok: sessions=%d turns=%d device=%s", res.SessionCount, res.TurnCount, res.DaemonDevice)
 			lastLoggedSessions = res.SessionCount
 			lastLoggedAt = time.Now()
 		}
 		// Push full plaintext history for changed sessions. The catalog
 		// above only carries metadata + snippets; this fills in the turns
-		// the web reader needs. (E2E removal made this the default path —
-		// it was previously gated behind a dev-only flag.)
-		if syncedSessions, syncedTurns := syncChangedPlaintextRelaySessions(ctx, client, id, idx, req.Sessions, lastPlaintextSync, profile); syncedSessions > 0 || syncedTurns > 0 {
-			log.Printf("relay history sync ok: sessions=%d turns=%d device=%s", syncedSessions, syncedTurns, id.DeviceID)
+		// the web reader needs.
+		if syncedSessions, syncedTurns := syncChangedPlaintextNexusSessions(ctx, client, id, idx, req.Sessions, lastPlaintextSync, profile); syncedSessions > 0 || syncedTurns > 0 {
+			log.Printf("Nexus history sync ok: sessions=%d turns=%d device=%s", syncedSessions, syncedTurns, id.DeviceID)
 		}
 		if time.Since(lastSyncSuccessTelemetry) > 10*time.Minute {
 			lastSyncSuccessTelemetry = time.Now()
@@ -2206,10 +2299,10 @@ func startRelaySyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 	}
 }
 
-const maxRelayHistorySessionsPerTick = 8
+const maxNexusHistorySessionsPerTick = 8
 
-func syncChangedPlaintextRelaySessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastPlaintextSync map[string]string, profile runner.Profile) (int, int) {
-	candidates := recentRelaySessions(sessions, maxRelayHistorySessionsPerTick)
+func syncChangedPlaintextNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastPlaintextSync map[string]string, profile runner.Profile) (int, int) {
+	candidates := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick)
 	if len(candidates) == 0 {
 		return 0, 0
 	}
@@ -2222,7 +2315,7 @@ func syncChangedPlaintextRelaySessions(ctx context.Context, client *pair.Client,
 		}
 		req, err := relay.BuildSingleSessionSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, nil)
 		if err != nil {
-			log.Printf("relay plaintext dev sync snapshot session=%s: %v", session.SessionID, err)
+			log.Printf("Nexus history sync snapshot session=%s: %v", session.SessionID, err)
 			continue
 		}
 		if len(req.Turns) == 0 {
@@ -2235,7 +2328,7 @@ func syncChangedPlaintextRelaySessions(ctx context.Context, client *pair.Client,
 		}
 		res, err := client.SyncHistoryContext(ctx, id, req)
 		if err != nil {
-			log.Printf("relay plaintext dev sync push session=%s: %v", session.SessionID, err)
+			log.Printf("Nexus history sync push session=%s: %v", session.SessionID, err)
 			continue
 		}
 		lastPlaintextSync[session.SessionID] = signature
@@ -2245,7 +2338,7 @@ func syncChangedPlaintextRelaySessions(ctx context.Context, client *pair.Client,
 	return syncedSessions, syncedTurns
 }
 
-func recentRelaySessions(sessions []pair.SyncSession, max int) []pair.SyncSession {
+func recentNexusSessions(sessions []pair.SyncSession, max int) []pair.SyncSession {
 	candidates := make([]pair.SyncSession, 0, len(sessions))
 	for _, session := range sessions {
 		if session.SessionID == "" {
@@ -2265,9 +2358,8 @@ func recentRelaySessions(sessions []pair.SyncSession, max int) []pair.SyncSessio
 	return candidates
 }
 
-// defaultAgent supplies the conventional Phase 1 agent string for events
-// where the wrapper didn't bother labelling — every external terminal we
-// surface today is claude-code.
+// defaultAgent supplies the conventional agent string for external terminal
+// events that did not carry an explicit agent label.
 func defaultAgent(v string) string {
 	if strings.TrimSpace(v) == "" {
 		return "claude-code"
@@ -2275,7 +2367,7 @@ func defaultAgent(v string) string {
 	return v
 }
 
-func relaySessionSyncSignature(session pair.SyncSession) string {
+func nexusSessionSyncSignature(session pair.SyncSession) string {
 	if session.LastTimestamp == "" {
 		return ""
 	}
@@ -2368,8 +2460,8 @@ func intPtr(v int) *int {
 
 // permissionDeciderAdapter implements control.PermissionDecider on
 // top of the internal/permission.Store, translating the string
-// "allow"/"deny" the relay sends into the package's typed Decision
-// + remapping ErrNotFound into a sentinel error string the relay can
+// "allow"/"deny" Nexus sends into the package's typed Decision
+// + remapping ErrNotFound into a sentinel error string Nexus can
 // surface to the browser (so a double-click after timeout shows the
 // right "already decided" toast instead of a generic error).
 type permissionDeciderAdapter struct {
@@ -2412,7 +2504,7 @@ func (r sdkSettingsReader) EffortForSDKSession(sid string) string {
 
 // sdkSessionResolver implements sdkdriver.SessionResolver by looking up
 // sid → cwd in the daemon's local session index. Backstop for inject
-// requests that arrive with Cwd="" (older relay versions, or any other
+// requests that arrive with Cwd="" (older Nexus versions, or any other
 // path where the cwd metadata didn't make it across the wire).
 type sdkSessionResolver struct {
 	index *index.Index
@@ -2431,7 +2523,7 @@ func (r sdkSessionResolver) CwdForSession(sid string) string {
 
 // sdkTerminalEventForwarder pipes SDK driver terminal events into the
 // daemon's existing externalTerminalEvents channel (the same one the
-// PTY wrapper feeds via the HTTP TerminalEventSink). The relay's
+// PTY wrapper feeds via the HTTP TerminalEventSink). Nexus
 // publishTerminal uses Driver="sdk" to bucket these rows correctly in
 // terminal_sessions, so deriveSessionConnectionMode can report
 // sdk_running for live SDK turns instead of pty_backed_duplex.
@@ -2523,7 +2615,7 @@ func (a sdkDriverAdapter) EnsureNewDriver(ctx context.Context, sid, cwd string, 
 	return a.manager.EnsureNewDriver(ctx, sid, cwd, a2)
 }
 
-// agentSettingsAdapter bridges relay-side AGENT_SETTINGS_GET / SET
+// agentSettingsAdapter bridges Nexus-side AGENT_SETTINGS_GET / SET
 // control WS messages into the in-memory agentsettings.Store and the
 // live terminal manager. It is the daemon-side analogue of
 // permissionDeciderAdapter: the control package can't import either
@@ -2662,10 +2754,10 @@ const maxGitDiffBytes = 256 << 10
 // diff, a `git commit` naturally clears it — exactly the "reset on commit"
 // behavior we want, mirroring Codex's /diff.
 func (a agentSettingsAdapter) Diff(req control.GitDiffGet) control.GitDiffResult {
-	// The relay's session cwd is the project *basename* ("demo"), not a usable
+	// Nexus session cwd is the project *basename* ("demo"), not a usable
 	// filesystem path — it's only used for grouping. Resolve the real absolute
 	// working-tree cwd from the live terminal session / index instead. Fall
-	// back to req.Cwd only if the relay happened to send an absolute path.
+	// back to req.Cwd only if Nexus happened to send an absolute path.
 	cwd := strings.TrimSpace(a.resolve(req.TerminalSessionID, req.SessionID).cwd)
 	if cwd == "" {
 		if c := strings.TrimSpace(req.Cwd); filepath.IsAbs(c) {
@@ -2745,7 +2837,7 @@ func (a agentSettingsAdapter) Get(req control.AgentSettingsGet) control.AgentSet
 		PermissionMode: snap.Current.PermissionMode,
 		Effort:         snap.Current.Effort,
 		// The running model must appear in its own menu — otherwise the
-		// pill shows "deepseek-v4-flash" while the dropdown only lists
+		// pill shows "anthropic-compatible-fast" while the dropdown only lists
 		// the config aliases, and the active option has nothing to
 		// highlight. The Set path accepts this same augmented set.
 		AvailableModels:          ensureModelsPresent(snap.AvailableModels, displayModel, resolvedModel),

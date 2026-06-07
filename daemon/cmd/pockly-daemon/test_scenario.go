@@ -19,10 +19,9 @@ import (
 	"time"
 )
 
-// runTestScenario is the v0.1.43 end-to-end test orchestrator. Each
-// scenario sets up the bare minimum stack (fake-claude under wrapper,
-// optionally Chrome MCP via the user's browser), drives the scenario,
-// queries telemetry for the expected pattern, and reports PASS/FAIL.
+// runTestScenario is the local end-to-end test orchestrator. Each scenario
+// sets up the minimum stack it needs, drives the scenario, optionally checks
+// self-hosted diagnostics, and reports PASS/FAIL.
 //
 // Scenarios share the same shape:
 //  1. Pre-conditions (active terminal_session, recent telemetry baseline)
@@ -30,8 +29,8 @@ import (
 //  3. Wait + collect (telemetry query, jsonl growth check)
 //  4. Assert + report
 //
-// Designed for AI-driven autonomy: zero external dependencies, all
-// output structured so a wrapping agent can grep PASS/FAIL.
+// Designed for automated local validation: output is structured so callers can
+// grep PASS/FAIL without parsing verbose logs.
 func runTestScenario(args []string) error {
 	if len(args) == 0 {
 		return testScenarioUsageErr("test-scenario requires a name")
@@ -45,7 +44,7 @@ func runTestScenario(args []string) error {
 		return runScenarioPermissionInteractive(args[1:])
 	case "list-scenarios", "list":
 		fmt.Println("Available scenarios:")
-		fmt.Println("  permission-card          Spawn fake-claude under wrapper, verify MCP permission event flows to telemetry.")
+		fmt.Println("  permission-card          Spawn fake-claude under wrapper and verify permission-event plumbing.")
 		fmt.Println("  web-permission-card      Inject synthetic permission_request, print marker for Chrome-MCP web assertion.")
 		fmt.Println("  permission-interactive   Drive mcp-permission --interactive through allow / deny / timeout paths.")
 		return nil
@@ -61,12 +60,12 @@ func testScenarioUsage() string {
 	return `Usage: pockly-daemon test-scenario <name> [flags]
 
 Scenarios:
-  permission-card          Verify the v0.1.42 MCP permission hook lights up.
+  permission-card          Verify MCP permission plumbing with fake-claude.
   web-permission-card      Inject a synthetic permission_request into the live
                            terminal session and print the marker text so a
                            Chrome-MCP-driven agent can assert it rendered in
                            the workspace ("?test=1" hooks needed).
-  permission-interactive   v0.2.0 regression: drive mcp-permission --interactive
+  permission-interactive   Drive mcp-permission --interactive
                            through allow / deny / timeout paths against the
                            live daemon. Needs the daemon to expose the
                            /api/dev/permission-requests endpoints.
@@ -130,18 +129,18 @@ func (r *scenarioReport) finish() error {
 }
 
 // runScenarioPermissionCard spawns a fake-claude under the wrapper and
-// verifies the v0.1.42 MCP permission server is wired up correctly.
+// verifies the MCP permission server is wired up correctly.
 //
-// What it does NOT test (yet): that the web UI renders the card. That
-// requires Chrome MCP / Playwright orchestration — TODO for v0.1.44.
+// What it does NOT test: that the web UI renders the card. That requires
+// browser automation and belongs in the web e2e suite.
 // What it DOES test:
 //   - Wrapper passes --mcp-config + --permission-prompt-tool to the
 //     child (verified by inspecting child argv via /proc).
 //   - When fake-claude is told to "use the permission tool", it spawns
 //     the MCP server (via stdio config), which POSTs a permission_
 //     request event to the daemon's terminal-session events endpoint.
-//   - That event shows up in the relay's telemetry store
-//     (pockly-daemon diagnose telemetry --session-id X must find it).
+//   - Optional self-hosted diagnostics can confirm the event if a provider is
+//     configured.
 func runScenarioPermissionCard(args []string) error {
 	fs := flag.NewFlagSet("test-scenario permission-card", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -187,12 +186,9 @@ func runScenarioPermissionCard(args []string) error {
 	// pollute the user's real terminal_sessions list, AND we run with
 	// --pass to bypass the PTY (fake-claude doesn't need a real TTY).
 	//
-	// Trade-off: --pass mode skips the MCP wiring (mcp-config is only
-	// injected in the PTY branch). So this MVP only verifies the
-	// binary-presence + wrapper-can-run; full MCP hook verification
-	// needs the PTY branch which is harder to drive headless. For
-	// v0.1.43 we ship the scaffolding; v0.1.44 adds a pseudo-TTY
-	// (creack/pty) wrapper test.
+	// Trade-off: --pass mode skips the MCP wiring because mcp-config is
+	// injected in the PTY branch. This check verifies binary presence and
+	// basic wrapper execution; lower-level tests cover MCP wiring directly.
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, wrapperBin,
@@ -226,19 +222,19 @@ func runScenarioPermissionCard(args []string) error {
 		report.check("daemon reachable at "+statusURL, false, err.Error())
 	}
 
-	// v0.1.44 S1: exercise the MCP server in isolation. We can't get
-	// fake-claude to use MCP (it's a dummy that writes jsonl, not a
+	// Exercise the MCP server in isolation. We can't get fake-claude to
+	// use MCP (it's a dummy that writes jsonl, not a
 	// real LLM that calls tools), but we CAN drive the MCP server
 	// directly via stdio + verify it does the right thing:
 	//   - speaks JSON-RPC correctly (initialize → tools/list → tools/call)
 	//   - returns the {behavior:"allow"} shape claude expects
 	//   - POSTs a permission_request event into the daemon's events
 	//     endpoint as a side effect
-	// Then we poll telemetry to confirm that POST landed.
+	// Then we optionally poll diagnostics to confirm that POST landed.
 	checkMCPServerIsolation(ctx, report, exe, *daemonURL)
 
-	// v0.1.44 S3: wiring inspection lives in the wrapper's own unit
-	// test (cmd/pockly-claude-wrapper/main_test.go::TestSetupPermissionMCPWiring)
+	// Wiring inspection lives in the wrapper's own unit test
+	// (cmd/pockly-claude-wrapper/main_test.go::TestSetupPermissionMCPWiring)
 	// because setupPermissionMCP is package-private and the JSON +
 	// flag shape is best asserted with direct unmarshal. The scenario
 	// runner only verifies that the test exists + has run recently,
@@ -253,9 +249,8 @@ func runScenarioPermissionCard(args []string) error {
 // runScenarioWebPermissionCard injects a synthetic permission_request
 // event into the live terminal session and prints a unique marker so a
 // Chrome-MCP-driven outer agent can assert that the workspace UI
-// rendered the 🛡️ card. This is the v0.1.44 S2 half of the closed
-// loop: S1 verified the MCP-side of the protocol, S2 verifies the
-// web-side of the rendering.
+// rendered the permission card. This scenario verifies the web side of
+// the rendering path for a synthetic permission request.
 //
 // Flow:
 //
@@ -264,7 +259,7 @@ func runScenarioPermissionCard(args []string) error {
 //     it as the synthetic tool_name so the marker ends up baked into
 //     the rendered card's text.
 //  3. POST permission_request to /api/dev/terminal-sessions/<ts>/events
-//     — daemon forwards to relay → SSE → web bridge → setTurns → DOM.
+//     — daemon forwards to Nexus → SSE → web bridge → setTurns → DOM.
 //  4. Print the marker. Caller (AI agent) then evals
 //     `window.__pocklyTestHooks.findPermissionCard("<marker>")` in the
 //     workspace tab to assert {found: true}.
@@ -339,7 +334,7 @@ func runScenarioWebPermissionCard(args []string) error {
 
 	// Print the marker on its own line + a Chrome-MCP-ready eval
 	// snippet. The outer AI agent should:
-	//   (a) navigate to https://pocklyapp.com/workspace/sessions?test=1
+	//   (a) navigate to your Pockly web app's /workspace/sessions?test=1
 	//   (b) wait ~1s for SSE to deliver the synthetic event
 	//   (c) eval `window.__pocklyTestHooks.findPermissionCard("<marker>")`
 	//   (d) assert {found: true}
@@ -368,7 +363,7 @@ func safePrefix(s string, n int) string {
 }
 
 // checkMCPServerIsolation runs `pockly-daemon mcp-permission` as a
-// subprocess and walks it through a full MCP handshake. v0.1.44 S1.
+// subprocess and walks it through a full MCP handshake.
 // Catches regressions in:
 //   - JSON-RPC framing (one msg per line, no stdout pollution)
 //   - initialize response shape (protocolVersion, capabilities)
@@ -377,7 +372,7 @@ func safePrefix(s string, n int) string {
 //   - tools/call returns the {behavior:"allow", updatedInput} payload
 //     wrapped in MCP's content envelope
 //   - the side-effect POST to the daemon's events endpoint reaches it
-//     (verified by telemetry poll)
+//     (verified by optional diagnostics when configured)
 func checkMCPServerIsolation(ctx context.Context, report *scenarioReport, daemonBin, daemonURL string) {
 	// Pick an active terminal_session_id to POST events against. If
 	// none registered, skip the side-effect part of the test — the
@@ -472,7 +467,7 @@ func checkMCPServerIsolation(ctx context.Context, report *scenarioReport, daemon
 
 	// Poll telemetry for the side-effect POST. The MCP server fires
 	// it asynchronously (goroutine) so we give it 3s to land + the
-	// telemetry forward latency (daemon → relay → store ≈ 100-500ms).
+	// telemetry forward latency (daemon → Nexus → store ≈ 100-500ms).
 	report.check("MCP isolation: permission_request POSTed (via local daemon)",
 		waitForPermissionEvent(ctx, daemonURL, tsID, 3*time.Second),
 		"checked /api/dev/terminal-sessions/<ts>/events ingest")
@@ -513,14 +508,10 @@ func waitForPermissionEvent(ctx context.Context, daemonURL, tsID string, timeout
 	// Rough proxy: just check that the daemon's terminal_session is
 	// still live + responding. We don't have a direct "list events
 	// since T" endpoint locally; full forward-confirmation lives in
-	// the relay-side telemetry that v0.1.43's diagnose query reads.
-	// For S1 scope we accept the fact that the MCP server returned
-	// successfully = the POST goroutine fired; daemon-side ingest is
-	// best-effort and the protocol-level success is the more
-	// important assertion.
-	//
-	// TODO v0.1.45: add a /api/dev/recent-events?since=X endpoint to
-	// the daemon's local API so we can poll-confirm here.
+	// an optional diagnostics provider when configured.
+	// We accept the fact that the MCP server returned successfully as
+	// proof the POST goroutine fired; daemon-side ingest is best-effort
+	// and the protocol-level success is the more important assertion.
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		select {
@@ -566,7 +557,7 @@ func truncateForReport(s string, max int) string {
 	return s
 }
 
-// runScenarioPermissionInteractive is the v0.2.0 regression scenario.
+// runScenarioPermissionInteractive drives the interactive permission bridge.
 // It drives `pockly-daemon mcp-permission --interactive` through the
 // full register → emit → /await → decide → MCP-response loop against
 // the user's live daemon, covering all three terminal states.
@@ -615,22 +606,22 @@ func runScenarioPermissionInteractive(args []string) error {
 		exe = real
 	}
 
-	// Sanity-check the live daemon exposes the new v0.2.0 endpoints.
+	// Sanity-check the live daemon exposes the permission request endpoints.
 	// We probe /api/dev/permission-requests (GET) — anything except 404
 	// proves the route is registered.
 	probeURL := strings.TrimRight(*daemonURL, "/") + "/api/dev/permission-requests"
 	probeResp, err := (&http.Client{Timeout: 2 * time.Second}).Get(probeURL)
 	if err != nil {
-		report.check("daemon exposes v0.2.0 endpoints", false,
+		report.check("daemon exposes permission endpoints", false,
 			fmt.Sprintf("GET %s: %v", probeURL, err))
 		return report.finish()
 	}
 	probeResp.Body.Close()
 	probeOK := probeResp.StatusCode == http.StatusOK
-	report.check("daemon exposes v0.2.0 endpoints", probeOK,
+	report.check("daemon exposes permission endpoints", probeOK,
 		fmt.Sprintf("GET %s → %d (want 200)", probeURL, probeResp.StatusCode))
 	if !probeOK {
-		fmt.Fprintln(os.Stderr, "\nHint: this scenario needs daemon v0.2.0+ running. `pockly-daemon update` then retry.")
+		fmt.Fprintln(os.Stderr, "\nHint: update the daemon, then retry.")
 		return report.finish()
 	}
 

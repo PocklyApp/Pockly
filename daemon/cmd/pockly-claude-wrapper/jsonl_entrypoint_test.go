@@ -10,11 +10,11 @@ import (
 	"time"
 )
 
-// TestJSONLOwnsCLI guards the v0.1.28 fix for the Claude-Desktop-aliased
-// session bug. Concretely: a project directory hosts BOTH a CLI-owned and
-// a Desktop-owned jsonl; newestJSONLAfter must prefer the CLI one even
-// when Desktop's mtime is newer, because only the CLI session is
-// reachable via the wrapper's PTY.
+// TestJSONLOwnsCLI guards against binding a wrapper to a desktop-owned
+// Claude JSONL file. A project directory can host both CLI-owned and
+// desktop-owned logs; newestJSONLAfter must prefer the CLI one even when
+// the desktop file has the newer mtime, because only the CLI session is
+// reachable through the wrapper's PTY.
 func TestJSONLOwnsCLI(t *testing.T) {
 	dir := t.TempDir()
 	mk := func(name, firstLine string, mtime time.Time) string {

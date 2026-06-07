@@ -47,12 +47,12 @@ export function getSiteContent(t: TFunction) {
   // rendered directly by DocsPage. The old single-paragraph docsSections were
   // removed here.
 
-  // Pockly is pre-1.0 and ships continuously, so the changelog is a single
-  // entry describing the current release rather than a phase-by-phase trail.
+  // Pockly is pre-1.0 and ships continuously, so the changelog is a
+  // single entry describing the current public release.
   const changelogEntries: ChangelogEntry[] = [
     {
-      version: "v0.6",
-      date: "2026-06-03",
+      version: "Current",
+      date: "",
       title: t("site.changelog.current.title"),
       summary: t("site.changelog.current.summary"),
       tags: [t("site.tags.daemon"), t("site.tags.web"), t("site.tags.security")],

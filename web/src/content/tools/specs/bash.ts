@@ -3,18 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2/R3 — Bash tool spec.
+// Bash tool spec.
 //
 // Matches Claude Code's built-in Bash plus a couple of common
 // equivalents from other agents (Codex's `exec_command`, generic
 // "shell"). All three share the {command, description?} input shape,
 // so a single spec works.
 //
-// R3: body upgraded to "command" — ToolCallCard mounts a dedicated
-// terminal-styled block (dark mono background, command prominent +
-// one-click copy). The cwd / description fields stay in `rows` so
-// the header summary stays one-liner-shaped but the body shows the
-// command full-width without truncation.
+// body="command" makes ToolCallCard mount a dedicated terminal-styled block.
+// The cwd / description fields stay in `rows` so the header summary stays
+// one-liner-shaped while the body shows the command without truncation.
 
 import { stringField, truncateMiddle } from "../../../App";
 import type { ToolSpec, ToolRow } from "../types";

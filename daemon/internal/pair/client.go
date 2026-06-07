@@ -24,17 +24,15 @@ import (
 )
 
 // Device access tokens from /api/device-challenge/verify are short-lived
-// (relay TTL ~15m), but every authenticated daemon→relay call
-// (SyncHistory, …) used to re-run the full
-// challenge→verify handshake. The relay rate-limits /api/device-challenge
-// per-device + per-IP, so the 2s relay-sync loop — two authenticated
-// calls per tick — blew past the limit within a minute and every sync
-// failed with "too many challenge requests", surfaced to web as
-// recipients_failed ("请重新打开会话或刷新后重试").
+// (Nexus TTL ~15m), but every authenticated daemon→Nexus call
+// (SyncHistory, …) used to re-run the full challenge→verify handshake. The
+// Nexus rate-limits /api/device-challenge per-device + per-IP, so the 2s
+// Nexus sync loop could blow past the limit within a minute and every sync
+// failed with "too many challenge requests".
 //
 // Cache the verified token per (device, audience) and reuse it until
 // shortly before expiry. invalidateDeviceToken is called on an auth
-// failure so a relay restart — which rotates the relay's token signing
+// failure so a Nexus restart — which rotates Nexus token signing
 // key and invalidates every outstanding token — self-heals on the next
 // call instead of failing for the whole TTL.
 const deviceAccessTokenTTL = 10 * time.Minute
@@ -172,7 +170,7 @@ type SyncRequest struct {
 	Sessions []SyncSession `json:"sessions"`
 	Turns    []SyncTurn    `json:"turns,omitempty"`
 	// FullReconcile signals that Sessions is an authoritative full snapshot of
-	// the daemon's catalog for this device. The relay deletes any sessions it
+	// the daemon's catalog for this device. Nexus deletes any sessions it
 	// has for this device that are NOT in this snapshot (and cascades to their
 	// turns). Set ONLY on catalog syncs — never on single-session pushes that
 	// carry Turns, since those are intentionally partial.
@@ -273,23 +271,21 @@ type SetupResultResponse struct {
 	ExpiresAt           time.Time `json:"expires_at"`
 }
 
-// relayClientTimeout caps one HTTP attempt. Bumped from 10s to 30s
-// because production pocklyapp.com /api/daemon/sync and
-// /api/device-challenge/verify can spike past 10s under load (catalog
-// reconcile fans out to per-session recipients encryption). The retry
-// wrapper below covers transient failures within this ceiling so a
-// single slow attempt doesn't drop the sync.
-const relayClientTimeout = 30 * time.Second
+// nexusClientTimeout caps one HTTP attempt. Bumped from 10s to 30s because
+// production Nexus /api/daemon/sync and /api/device-challenge/verify can spike
+// past 10s under load. The retry wrapper below covers transient failures
+// within this ceiling so a single slow attempt doesn't drop the sync.
+const nexusClientTimeout = 30 * time.Second
 
-// relayMaxAttempts is the total attempts (including the initial one).
+// nexusMaxAttempts is the total attempts (including the initial one).
 // Backoff schedule between attempts: 500ms, 1s, 2s — plus ±25% jitter
 // so multiple daemons coming off the same outage don't thunder.
-const relayMaxAttempts = 3
+const nexusMaxAttempts = 3
 
 func NewClient(baseURL string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		HTTP:    &http.Client{Timeout: relayClientTimeout},
+		HTTP:    &http.Client{Timeout: nexusClientTimeout},
 	}
 }
 
@@ -342,7 +338,7 @@ func (c *Client) DeviceAuthorizationToken(deviceCode, pollSecret string) (Device
 }
 
 // ConfirmDeviceAuthorization is called by the daemon after the local user
-// approves or denies a pending pair claim displayed in the CLI. The relay
+// approves or denies a pending pair claim displayed in the CLI. Nexus
 // only completes registration and issues tokens after allow=true.
 func (c *Client) ConfirmDeviceAuthorization(deviceCode, pollSecret string, allow bool) (DeviceAuthorizationConfirmResponse, error) {
 	var out DeviceAuthorizationConfirmResponse
@@ -511,7 +507,7 @@ func (c *Client) AuthenticateIdentityContext(ctx context.Context, id device.Iden
 		return "", err
 	}
 	if !verified.Verified || verified.DeviceAccessToken == "" {
-		return "", fmt.Errorf("relay challenge verification did not return a device access token")
+		return "", fmt.Errorf("Nexus challenge verification did not return a device access token")
 	}
 	storeDeviceToken(id.DeviceID, audience, verified.DeviceAccessToken)
 	return verified.DeviceAccessToken, nil
@@ -548,7 +544,7 @@ func (c *Client) doJSONContext(ctx context.Context, method, route string, body a
 		}
 	}
 	var lastErr error
-	for attempt := 1; attempt <= relayMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= nexusMaxAttempts; attempt++ {
 		if attempt > 1 {
 			// 500ms, 1s, 2s with ±25% jitter. Cap at ctx deadline.
 			base := time.Duration(1<<uint(attempt-2)) * 500 * time.Millisecond
@@ -568,11 +564,11 @@ func (c *Client) doJSONContext(ctx context.Context, method, route string, body a
 		// Mutations like /api/device-challenge/verify are one-shot
 		// (challenge_id is consumed) so retrying past a real failure
 		// just trades one error for another.
-		if !isRetryableRelayErr(err) {
+		if !isRetryableNexusErr(err) {
 			return err
 		}
 	}
-	return fmt.Errorf("relay %s %s: %d attempts exhausted: %w", method, route, relayMaxAttempts, lastErr)
+	return fmt.Errorf("Nexus %s %s: %d attempts exhausted: %w", method, route, nexusMaxAttempts, lastErr)
 }
 
 func (c *Client) doJSONAttempt(ctx context.Context, method, route string, rawBody []byte, hasBody bool, out any, opts ...requestOption) error {
@@ -602,14 +598,14 @@ func (c *Client) doJSONAttempt(ctx context.Context, method, route string, rawBod
 		var payload map[string]any
 		if err := json.Unmarshal(raw, &payload); err == nil {
 			if message, ok := payload["error"].(string); ok && message != "" {
-				return fmt.Errorf("relay %s %s: status=%d error=%s", method, route, resp.StatusCode, message)
+				return fmt.Errorf("Nexus %s %s: status=%d error=%s", method, route, resp.StatusCode, message)
 			}
 		}
 		body := strings.TrimSpace(string(raw))
 		if body == "" {
 			body = resp.Status
 		}
-		return fmt.Errorf("relay %s %s: status=%d body=%q", method, route, resp.StatusCode, body)
+		return fmt.Errorf("Nexus %s %s: status=%d body=%q", method, route, resp.StatusCode, body)
 	}
 	if out == nil {
 		return nil
@@ -617,13 +613,13 @@ func (c *Client) doJSONAttempt(ctx context.Context, method, route string, rawBod
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-// isRetryableRelayErr returns true when err looks transient — DNS hiccup,
+// isRetryableNexusErr returns true when err looks transient — DNS hiccup,
 // connection reset, server-side 5xx, HTTP/2 mid-stream EOF, request body
-// timed out before relay returned headers. These all matched real
-// pocklyapp.com failures in the wild (see daemon serve.log from May
-// 25-26 2026: lots of "context deadline exceeded while awaiting headers"
-// and "unexpected EOF" against /api/daemon/sync + /api/device-challenge).
-func isRetryableRelayErr(err error) bool {
+// timed out before Nexus returned headers. These all matched real production
+// Nexus failures in the wild: lots of "context deadline exceeded while
+// awaiting headers" and "unexpected EOF" against /api/daemon/sync +
+// /api/device-challenge.
+func isRetryableNexusErr(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -639,7 +635,7 @@ func isRetryableRelayErr(err error) bool {
 			return true
 		}
 	}
-	// HTTP 5xx surfaced through the relay-error path in doJSONAttempt.
+	// HTTP 5xx surfaced through the Nexus-error path in doJSONAttempt.
 	msg := err.Error()
 	if strings.Contains(msg, "status=502") ||
 		strings.Contains(msg, "status=503") ||

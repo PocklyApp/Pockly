@@ -108,21 +108,21 @@ func TestEnvOverlaysClaudeSettingsEnv(t *testing.T) {
 		t.Fatalf("mkdir settings: %v", err)
 	}
 	settingsPath := filepath.Join(settingsDir, "settings.json")
-	if err := os.WriteFile(settingsPath, []byte(`{"env":{"ANTHROPIC_MODEL":"deepseek-v4-flash","ANTHROPIC_AUTH_TOKEN":"sk-secret"}}`), 0o600); err != nil {
+	if err := os.WriteFile(settingsPath, []byte(`{"env":{"ANTHROPIC_MODEL":"anthropic-compatible-fast","ANTHROPIC_AUTH_TOKEN":"TEST_ONLY_ANTHROPIC_TOKEN"}}`), 0o600); err != nil {
 		t.Fatalf("write settings: %v", err)
 	}
 
 	snap := Env([]string{"ANTHROPIC_MODEL=old", "TERM=xterm"})
-	if got := valueForEnv(snap.Env, "ANTHROPIC_MODEL"); got != "deepseek-v4-flash" {
+	if got := valueForEnv(snap.Env, "ANTHROPIC_MODEL"); got != "anthropic-compatible-fast" {
 		t.Fatalf("ANTHROPIC_MODEL = %q", got)
 	}
-	if got := valueForEnv(snap.Env, "ANTHROPIC_AUTH_TOKEN"); got != "sk-secret" {
+	if got := valueForEnv(snap.Env, "ANTHROPIC_AUTH_TOKEN"); got != "TEST_ONLY_ANTHROPIC_TOKEN" {
 		t.Fatalf("ANTHROPIC_AUTH_TOKEN missing/changed: %q", got)
 	}
 	if !reflect.DeepEqual(snap.SettingsEnvKeys, []string{"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"}) {
 		t.Fatalf("SettingsEnvKeys = %#v", snap.SettingsEnvKeys)
 	}
-	if strings.Contains(strings.Join(snap.SettingsEnvKeys, ","), "sk-secret") || strings.Contains(snap.SettingsEnvError, "sk-secret") {
+	if strings.Contains(strings.Join(snap.SettingsEnvKeys, ","), "TEST_ONLY_ANTHROPIC_TOKEN") || strings.Contains(snap.SettingsEnvError, "TEST_ONLY_ANTHROPIC_TOKEN") {
 		t.Fatalf("snapshot leaked secret: %#v", snap)
 	}
 }

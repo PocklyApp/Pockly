@@ -50,10 +50,10 @@ func TestIsAuthFailure(t *testing.T) {
 		errStr string
 		want   bool
 	}{
-		{"relay GET /api/daemon/recipients: status=401 error=unauthorized", true},
-		{"relay GET /api/daemon/recipients: status=403 error=forbidden", true},
-		{"relay POST /api/device-challenge: status=429 error=too many challenge requests", false},
-		{"relay GET /api/daemon/recipients: status=500 body=\"oops\"", false},
+		{"Nexus POST /api/daemon/sync: status=401 error=unauthorized", true},
+		{"Nexus POST /api/daemon/sync: status=403 error=forbidden", true},
+		{"Nexus POST /api/device-challenge: status=429 error=too many challenge requests", false},
+		{"Nexus POST /api/daemon/sync: status=500 body=\"oops\"", false},
 		{"dial tcp: connection refused", false},
 		{"", false},
 	}

@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible problem in Pockly.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include secrets, access tokens, API keys, private prompts, or full session logs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reproducible sequence.
+      placeholder: |
+        1. Start Nexus with ...
+        2. Start daemon with ...
+        3. Open web at ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: commit SHA, tag, or package version
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - web
+        - daemon
+        - nexus
+        - installer
+        - docs
+        - unsure
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact secrets and private prompts.
+      render: shell
