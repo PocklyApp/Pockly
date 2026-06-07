@@ -69,7 +69,7 @@ describe("Nexus public contract boundary", () => {
     const root = repoRoot();
     for (const relativePath of publicDocumentationFiles()) {
       const text = await fs.promises.readFile(path.join(root, relativePath), "utf8");
-      for (const finding of operatorDeploymentFindings(text)) {
+      for (const finding of deploymentBoundaryFindings(text)) {
         assert.fail(`${relativePath} leaked operator-specific deployment detail: ${finding}`);
       }
     }
@@ -84,7 +84,7 @@ describe("Nexus public contract boundary", () => {
     for (const file of files) {
       const relativePath = path.relative(root, file);
       const text = await fs.promises.readFile(file, "utf8");
-      for (const finding of operatorDeploymentFindings(text)) {
+      for (const finding of deploymentBoundaryFindings(text)) {
         assert.fail(`${relativePath} leaked operator platform implementation: ${finding}`);
       }
     }
@@ -123,7 +123,7 @@ describe("Nexus public contract boundary", () => {
     ];
     for (const relativePath of files) {
       const text = await fs.promises.readFile(path.join(root, relativePath), "utf8");
-      for (const finding of operatorDeploymentFindings(text)) {
+      for (const finding of deploymentBoundaryFindings(text)) {
         assert.fail(`${relativePath} leaked operator-specific deployment detail: ${finding}`);
       }
     }
@@ -152,7 +152,7 @@ describe("Nexus public contract boundary", () => {
     }
   });
 
-  it("keeps public source and fixtures provider-neutral and free of private local identifiers", async () => {
+  it("keeps public source and fixtures provider-neutral and free of non-public local identifiers", async () => {
     const root = repoRoot();
     const files = [
       ...publicDocumentationFiles().map((file) => path.join(root, file)),
@@ -169,6 +169,23 @@ describe("Nexus public contract boundary", () => {
         assert.fail(`${relativePath} leaked non-public source detail: ${finding}`);
       }
     }
+  });
+
+  it("detects synthetic deployment boundary fixtures without naming real providers", () => {
+    const sample = [
+      "PRIVATE_PROVIDER_A",
+      "PRIVATE_REGION_A",
+      "PRIVATE_DOMAIN_A",
+      "INTERNAL_CLUSTER_A",
+      "OFFICIAL_HOSTED_DOMAIN_A",
+    ].join("\n");
+    assert.deepEqual(deploymentBoundaryFindings(sample), [
+      "synthetic provider fixture",
+      "synthetic region fixture",
+      "synthetic domain fixture",
+      "synthetic cluster fixture",
+      "synthetic hosted-domain fixture",
+    ]);
   });
 
   it("returns only neutral self-hosted runtime keys", async () => {
@@ -194,7 +211,7 @@ describe("Nexus public contract boundary", () => {
       release_update: true,
       contract_version: "1",
     });
-    for (const finding of operatorDeploymentFindings(JSON.stringify(body))) {
+    for (const finding of deploymentBoundaryFindings(JSON.stringify(body))) {
       assert.fail(`runtime contract leaked operator-specific deployment detail: ${finding}`);
     }
   });
@@ -233,7 +250,7 @@ describe("Nexus public contract boundary", () => {
       const body = await res.json();
       assert.deepEqual(Object.keys(body).sort(), [...runtimeKeys].sort());
       assert.equal(body.runtime, "self_hosted");
-      for (const finding of operatorDeploymentFindings(JSON.stringify(body))) {
+      for (const finding of deploymentBoundaryFindings(JSON.stringify(body))) {
         assert.fail(`runtime contract leaked operator-specific deployment detail: ${finding}`);
       }
     } finally {
@@ -290,10 +307,17 @@ async function collectFiles(dir, extensions) {
   return out;
 }
 
-function operatorDeploymentFindings(text) {
+function deploymentBoundaryFindings(text) {
   const findings = [];
-  if (/\b(?:https?:\/\/)?(?:[a-z0-9-]+\.)?pockly[a-z0-9-]*\.(?:com|cn)\b/i.test(text)) {
-    findings.push("operator-specific domain");
+  const syntheticDeploymentTerms = [
+    ["PRIVATE_PROVIDER_A", "synthetic provider fixture"],
+    ["PRIVATE_REGION_A", "synthetic region fixture"],
+    ["PRIVATE_DOMAIN_A", "synthetic domain fixture"],
+    ["INTERNAL_CLUSTER_A", "synthetic cluster fixture"],
+    ["OFFICIAL_HOSTED_DOMAIN_A", "synthetic hosted-domain fixture"],
+  ];
+  for (const [term, finding] of syntheticDeploymentTerms) {
+    if (text.includes(term)) findings.push(finding);
   }
   return findings;
 }
