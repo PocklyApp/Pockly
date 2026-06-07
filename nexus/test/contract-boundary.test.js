@@ -65,17 +65,17 @@ const productDeviceSemantics = [
 ];
 
 describe("Nexus public contract boundary", () => {
-  it("keeps public docs provider-neutral and free of managed deployment details", async () => {
+  it("keeps public docs provider-neutral and free of operator-specific deployment details", async () => {
     const root = repoRoot();
     for (const relativePath of publicDocumentationFiles()) {
       const text = await fs.promises.readFile(path.join(root, relativePath), "utf8");
-      for (const finding of managedDeploymentFindings(text)) {
-        assert.fail(`${relativePath} leaked managed deployment detail: ${finding}`);
+      for (const finding of operatorDeploymentFindings(text)) {
+        assert.fail(`${relativePath} leaked operator-specific deployment detail: ${finding}`);
       }
     }
   });
 
-  it("keeps public Nexus package free of managed platform implementation", async () => {
+  it("keeps public Nexus package free of operator platform implementation", async () => {
     const root = repoRoot();
     const files = [
       ...await collectFiles(path.join(root, "nexus", "src"), new Set([".js"])),
@@ -84,13 +84,13 @@ describe("Nexus public contract boundary", () => {
     for (const file of files) {
       const relativePath = path.relative(root, file);
       const text = await fs.promises.readFile(file, "utf8");
-      for (const finding of managedDeploymentFindings(text)) {
-        assert.fail(`${relativePath} leaked managed platform implementation: ${finding}`);
+      for (const finding of operatorDeploymentFindings(text)) {
+        assert.fail(`${relativePath} leaked operator platform implementation: ${finding}`);
       }
     }
   });
 
-  it("keeps public repository copy and install surfaces free of private SaaS details", async () => {
+  it("keeps public repository copy and install surfaces free of operator-specific deployment details", async () => {
     const root = repoRoot();
     const files = [
       ...publicDocumentationFiles(),
@@ -123,8 +123,8 @@ describe("Nexus public contract boundary", () => {
     ];
     for (const relativePath of files) {
       const text = await fs.promises.readFile(path.join(root, relativePath), "utf8");
-      for (const finding of managedDeploymentFindings(text)) {
-        assert.fail(`${relativePath} leaked private SaaS detail: ${finding}`);
+      for (const finding of operatorDeploymentFindings(text)) {
+        assert.fail(`${relativePath} leaked operator-specific deployment detail: ${finding}`);
       }
     }
   });
@@ -147,7 +147,7 @@ describe("Nexus public contract boundary", () => {
         assert.doesNotMatch(text, pattern, `${relativePath} leaked removed encryption product semantics: ${pattern}`);
       }
       for (const pattern of productDeviceSemantics) {
-        assert.doesNotMatch(text, pattern, `${relativePath} leaked obsolete device or SaaS storage semantics: ${pattern}`);
+        assert.doesNotMatch(text, pattern, `${relativePath} leaked obsolete device or storage semantics: ${pattern}`);
       }
     }
   });
@@ -194,8 +194,8 @@ describe("Nexus public contract boundary", () => {
       release_update: true,
       contract_version: "1",
     });
-    for (const finding of managedDeploymentFindings(JSON.stringify(body))) {
-      assert.fail(`runtime contract leaked managed deployment detail: ${finding}`);
+    for (const finding of operatorDeploymentFindings(JSON.stringify(body))) {
+      assert.fail(`runtime contract leaked operator-specific deployment detail: ${finding}`);
     }
   });
 
@@ -233,8 +233,8 @@ describe("Nexus public contract boundary", () => {
       const body = await res.json();
       assert.deepEqual(Object.keys(body).sort(), [...runtimeKeys].sort());
       assert.equal(body.runtime, "self_hosted");
-      for (const finding of managedDeploymentFindings(JSON.stringify(body))) {
-        assert.fail(`runtime contract leaked managed deployment detail: ${finding}`);
+      for (const finding of operatorDeploymentFindings(JSON.stringify(body))) {
+        assert.fail(`runtime contract leaked operator-specific deployment detail: ${finding}`);
       }
     } finally {
       await new Promise((resolve) => server.close(resolve));
@@ -290,10 +290,10 @@ async function collectFiles(dir, extensions) {
   return out;
 }
 
-function managedDeploymentFindings(text) {
+function operatorDeploymentFindings(text) {
   const findings = [];
   if (/\b(?:https?:\/\/)?(?:[a-z0-9-]+\.)?pockly[a-z0-9-]*\.(?:com|cn)\b/i.test(text)) {
-    findings.push("managed service domain");
+    findings.push("operator-specific domain");
   }
   return findings;
 }

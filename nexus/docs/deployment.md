@@ -1,9 +1,9 @@
 # Nexus Self-Hosting Notes
 
-This document covers the public self-hosted Nexus runtime only. SaaS
-deployment runbooks, regional routing, cloud provider choices, production
-domains, bucket names, account IDs, and purge procedures are private
-infrastructure details and do not belong in this repository.
+This document covers the public self-hosted Nexus runtime only.
+Operator-specific deployment runbooks, routing, provider choices, domains,
+bucket names, account IDs, and purge procedures are configured outside this
+repository.
 
 ## Default Runtime
 

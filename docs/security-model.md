@@ -33,7 +33,7 @@ boundary.
 ## Account Authentication
 
 The public self-hosted Nexus runtime includes local password accounts so a clean
-checkout can run without private infrastructure. It does not include outbound
+checkout can run without external account infrastructure. It does not include outbound
 email delivery or a full public-signup abuse prevention system by default.
 Operators exposing Nexus to untrusted users should add their own account
 verification, rate limiting, and abuse controls.
@@ -69,4 +69,4 @@ Never commit:
 - provider API keys;
 - browser or daemon access tokens;
 - session logs containing private prompts;
-- production domains, account IDs, bucket IDs, or private deployment runbooks.
+- operator-specific domains, account IDs, bucket IDs, or deployment runbooks.

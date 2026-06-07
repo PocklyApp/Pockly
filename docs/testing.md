@@ -45,6 +45,6 @@ missing. Never commit real API keys or local agent logs.
 
 ## Boundary Tests
 
-The public repository includes tests that prevent private deployment details and
+The public repository includes tests that prevent operator-specific deployment details and
 obsolete security claims from leaking into public docs and runtime contracts.
 Keep those tests updated when public terminology changes.

@@ -19,9 +19,9 @@ nexus/     Self-hosted Pockly Nexus Node.js runtime.
 docs/      Architecture, development, self-hosting, testing, and troubleshooting.
 ```
 
-Private SaaS deployment infrastructure, production routing, cloud-provider
-adapters, domain configuration, billing operations, and release automation are
-not part of this public repository.
+This repository contains the open-source product code and self-hosted Nexus runtime.
+Operator-specific hosting, routing, account policy, billing, and release
+distribution setups are configured separately by each deployment.
 
 ## Supported Agents
 

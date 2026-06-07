@@ -99,5 +99,5 @@ Do not commit real keys or bucket names.
 
 ## Public Boundary
 
-Self-hosted docs must not contain private SaaS deployment internals, provider
-names, production domains, account IDs, bucket IDs, or region routing details.
+Self-hosted docs must not contain operator-specific deployment internals,
+provider names, domains, account IDs, bucket IDs, or routing details.
