@@ -62,9 +62,9 @@ It only advertises capabilities that are explicitly enabled via environment
 flags and matching runtime bindings. HTTP catalog sync and session reads are
 available even when realtime is disabled.
 
-SaaS deployment runbooks and production infrastructure details live outside this
-repository. The public Nexus Contract and client UI should only depend on the
-neutral runtime capabilities above.
+Operator-specific hosting runbooks and infrastructure details are configured
+separately by each deployment. The public Nexus Contract and client UI should
+only depend on the neutral runtime capabilities above.
 
 ## Local Validation
 

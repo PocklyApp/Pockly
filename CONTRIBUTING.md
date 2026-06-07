@@ -1,7 +1,7 @@
 # Contributing To Pockly
 
 Thank you for contributing. This repository is intended to be usable from a
-clean public checkout without private deployment context.
+clean public checkout without operator-specific deployment context.
 
 ## Before You Start
 
@@ -52,7 +52,7 @@ credential-required and skipped by default.
 
 - Keep public terminology consistent: use **Pockly Nexus** for the connection
   layer. Use `relay` only for explicit legacy compatibility.
-- Do not add private SaaS domains, cloud-provider implementation details,
+- Do not add operator-specific domains, provider implementation details,
   account IDs, bucket names, or secrets to public files.
 - Do not claim a browser-only secrecy boundary for session history. Nexus
   stores synced history for the account.

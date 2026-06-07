@@ -7,5 +7,6 @@
 - [Testing](./testing.md)
 - [Troubleshooting](./troubleshooting.md)
 
-These documents cover the public open-source repository. Private SaaS
-deployment implementation details are intentionally out of scope.
+These documents cover the public open-source repository. Operator-specific
+hosting, routing, billing, account policy, and release distribution setups are
+intentionally out of scope.
