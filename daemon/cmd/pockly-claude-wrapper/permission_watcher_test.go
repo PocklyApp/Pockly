@@ -21,9 +21,9 @@ import (
 //
 // This runs the exact production path (stripANSI → detectClaudeTUIApproval)
 // on the real byte stream, so reverting either the stripANSI space-restore or
-// the detector breaks it. It needs no real claude or relay, so it's a
+// the detector breaks it. It needs no real claude or Nexus, so it's a
 // fast, deterministic guard (full-stack e2e can't reliably catch this — the
-// relay replays buffered events, which masked the bug during manual testing).
+// Nexus replays buffered events, which masked the bug during manual testing).
 func TestDetectPermissionFromRealClaudeCHARenderedPrompt(t *testing.T) {
 	// Each TUI line below positions words via CSI n G, mirroring the captured
 	// bytes: "\x1b[2GDo\x1b[5Gyou\x1b[9Gwant\x1b[14Gto\x1b[17Gproceed?".

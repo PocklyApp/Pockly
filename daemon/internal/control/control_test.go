@@ -354,14 +354,11 @@ func TestRouteStartTaskRejectsAgentThatExitsBeforeReady(t *testing.T) {
 	}
 	tmp := t.TempDir()
 	fakeClaude := filepath.Join(tmp, "claude")
-	if err := os.WriteFile(fakeClaude, []byte("#!/bin/sh\necho 'auth missing' >&2\nexit 42\n"), 0o755); err != nil {
+	if err := os.WriteFile(fakeClaude, []byte("#!/bin/sh\necho 'auth missing'\nsleep 0.2\nexit 42\n"), 0o755); err != nil {
 		t.Fatalf("write fake claude: %v", err)
 	}
-	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", tmp+string(os.PathListSeparator)+oldPath); err != nil {
-		t.Fatalf("set PATH: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+	useFakeClaudeLauncher(t, fakeClaude)
+	withStartTaskEarlyDeathWindow(t, 15*time.Second)
 
 	manager := liveterminal.NewManager()
 	r := &runner{terminal: manager}
@@ -394,11 +391,7 @@ func TestRouteStartTaskPrefersSDKDriverWhenAvailable(t *testing.T) {
 	if err := os.WriteFile(fakeClaude, []byte("#!/bin/sh\necho 'pty path must not run' >&2\nexit 42\n"), 0o755); err != nil {
 		t.Fatalf("write fake claude: %v", err)
 	}
-	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", tmp+string(os.PathListSeparator)+oldPath); err != nil {
-		t.Fatalf("set PATH: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+	useFakeClaudeLauncher(t, fakeClaude)
 
 	manager := liveterminal.NewManager()
 	_, ext, err := manager.RegisterExternal("")
@@ -421,7 +414,7 @@ func TestRouteStartTaskPrefersSDKDriverWhenAvailable(t *testing.T) {
 		Cwd:            tmp,
 		Agent:          "claude-code",
 		Text:           "hello",
-		Model:          "deepseek-v4-flash",
+		Model:          "anthropic-compatible-fast",
 		PermissionMode: "acceptEdits",
 		Effort:         "high",
 	}, func(evt InjectEvent) {
@@ -432,7 +425,7 @@ func TestRouteStartTaskPrefersSDKDriverWhenAvailable(t *testing.T) {
 	if len(stub.calls) != 1 {
 		t.Fatalf("expected SDK EnsureNewDriver to be called once, got %d", len(stub.calls))
 	}
-	if got := stub.calls[0]; got.Cwd != tmp || got.Agent != "claude-code" || got.Opts.Model != "deepseek-v4-flash" || got.Opts.PermissionMode != "acceptEdits" || got.Opts.Effort != "high" {
+	if got := stub.calls[0]; got.Cwd != tmp || got.Agent != "claude-code" || got.Opts.Model != "anthropic-compatible-fast" || got.Opts.PermissionMode != "acceptEdits" || got.Opts.Effort != "high" {
 		t.Fatalf("unexpected SDK call: %+v", got)
 	}
 	created := false
@@ -502,11 +495,7 @@ func TestRouteStartTaskWaitsPastSyntheticSessionReady(t *testing.T) {
 	if err := os.WriteFile(fakeClaude, []byte("#!/bin/sh\nsleep 2\necho 'real output after synthetic ready'\nsleep 10\n"), 0o755); err != nil {
 		t.Fatalf("write fake claude: %v", err)
 	}
-	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", tmp+string(os.PathListSeparator)+oldPath); err != nil {
-		t.Fatalf("set PATH: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+	useFakeClaudeLauncher(t, fakeClaude)
 
 	manager := liveterminal.NewManager()
 	r := &runner{terminal: manager}
@@ -543,11 +532,7 @@ func TestRouteStartTaskPromotesSilentLiveProcessAfterEarlyDeathWindow(t *testing
 	if err := os.WriteFile(fakeClaude, []byte("#!/bin/sh\nsleep 10\n"), 0o755); err != nil {
 		t.Fatalf("write fake claude: %v", err)
 	}
-	oldPath := os.Getenv("PATH")
-	if err := os.Setenv("PATH", tmp+string(os.PathListSeparator)+oldPath); err != nil {
-		t.Fatalf("set PATH: %v", err)
-	}
-	t.Cleanup(func() { _ = os.Setenv("PATH", oldPath) })
+	useFakeClaudeLauncher(t, fakeClaude)
 
 	manager := liveterminal.NewManager()
 	r := &runner{terminal: manager}
@@ -660,28 +645,43 @@ func TestResolveExecutableFindsUserLocalBinWhenPathIsEmpty(t *testing.T) {
 	}
 }
 
+func useFakeClaudeLauncher(t *testing.T, fakeClaude string) {
+	t.Helper()
+	t.Setenv("POCKLY_REAL_CLAUDE", fakeClaude)
+	t.Setenv("POCKLY_CLAUDE_LAUNCHER_JSON", "")
+}
+
+func withStartTaskEarlyDeathWindow(t *testing.T, window time.Duration) {
+	t.Helper()
+	previous := startTaskEarlyDeathWindow
+	startTaskEarlyDeathWindow = window
+	t.Cleanup(func() {
+		startTaskEarlyDeathWindow = previous
+	})
+}
+
 func TestParseShellExportsExpandsReferencedVars(t *testing.T) {
 	content := io.NopCloser(strings.NewReader(`
-export DEEPSEEK_API_KEY="sk-test"
-export ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY"
-export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
-export OPENAI_API_KEY="sk-openai"
+export ANTHROPIC_COMPAT_API_KEY="TEST_ONLY_ANTHROPIC_COMPAT_TOKEN"
+export ANTHROPIC_AUTH_TOKEN="$ANTHROPIC_COMPAT_API_KEY"
+export ANTHROPIC_BASE_URL="https://llm-gateway.example/anthropic"
+export OPENAI_COMPAT_API_KEY="TEST_ONLY_OPENAI_COMPAT_TOKEN"
 export CODEX_HOME="$HOME/.codex"
 export OTHER_VAR="ignored"
 `))
 	defer content.Close()
 	exports := parseShellExports(content, map[string]string{})
-	if exports["DEEPSEEK_API_KEY"] != "sk-test" {
-		t.Fatalf("unexpected DEEPSEEK_API_KEY: %q", exports["DEEPSEEK_API_KEY"])
+	if exports["ANTHROPIC_COMPAT_API_KEY"] != "TEST_ONLY_ANTHROPIC_COMPAT_TOKEN" {
+		t.Fatalf("unexpected ANTHROPIC_COMPAT_API_KEY: %q", exports["ANTHROPIC_COMPAT_API_KEY"])
 	}
-	if exports["ANTHROPIC_AUTH_TOKEN"] != "sk-test" {
+	if exports["ANTHROPIC_AUTH_TOKEN"] != "TEST_ONLY_ANTHROPIC_COMPAT_TOKEN" {
 		t.Fatalf("unexpected expanded token: %q", exports["ANTHROPIC_AUTH_TOKEN"])
 	}
-	if exports["ANTHROPIC_BASE_URL"] != "https://api.deepseek.com/anthropic" {
+	if exports["ANTHROPIC_BASE_URL"] != "https://llm-gateway.example/anthropic" {
 		t.Fatalf("unexpected base url: %q", exports["ANTHROPIC_BASE_URL"])
 	}
-	if exports["OPENAI_API_KEY"] != "sk-openai" {
-		t.Fatalf("unexpected OPENAI_API_KEY: %q", exports["OPENAI_API_KEY"])
+	if exports["OPENAI_COMPAT_API_KEY"] != "TEST_ONLY_OPENAI_COMPAT_TOKEN" {
+		t.Fatalf("unexpected OPENAI_COMPAT_API_KEY: %q", exports["OPENAI_COMPAT_API_KEY"])
 	}
 	if !strings.HasSuffix(exports["CODEX_HOME"], ".codex") {
 		t.Fatalf("unexpected CODEX_HOME: %q", exports["CODEX_HOME"])
@@ -692,9 +692,9 @@ export OTHER_VAR="ignored"
 }
 
 // The control WS keepalive keeps an idle daemon "online" through the
-// Cloudflare proxy, which doesn't reliably forward WS PING/PONG control
-// frames. It must push DAEMON_STATUS (an ordinary data frame the relay treats
-// as a liveness touch) on a steady cadence.
+// proxy infrastructure, which doesn't reliably forward WS PING/PONG control
+// frames. It must push DAEMON_STATUS (an ordinary data frame Nexus treats as
+// a liveness touch) on a steady cadence.
 func TestControlKeepaliveSendsDaemonStatus(t *testing.T) {
 	sent := make(chan envelope, 8)
 	done := make(chan struct{})

@@ -68,8 +68,7 @@ func TestBuildSyncRequestStableSeq(t *testing.T) {
 	if len(req1.Turns) != 0 {
 		t.Fatalf("len(turns) = %d, want 0 on a catalog sync", len(req1.Turns))
 	}
-	// E2E removed: the sidebar snippet is the real first user message, in
-	// plaintext (no per-recipient ciphertext).
+	// The sidebar snippet is the real first user message.
 	if req1.Sessions[0].Snippet != "hello from claude" {
 		t.Fatalf("snippet = %q, want the plaintext first message", req1.Sessions[0].Snippet)
 	}
@@ -95,11 +94,59 @@ func TestBuildSingleSessionSyncRequestEmitsPlaintextTurns(t *testing.T) {
 			t.Fatalf("turn[%d].session_id = %q", i, turn.SessionID)
 		}
 	}
-	// Plaintext now: the content the relay stores IS the conversation.
+	// Plaintext now: the content Nexus stores IS the conversation.
 	raw, _ := json.Marshal(req.Turns)
 	for _, want := range []string{"hello from claude", "Read"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("plaintext turns missing %q: %s", want, raw)
+		}
+	}
+}
+
+func TestBuildSingleSessionSyncRequestWireShape(t *testing.T) {
+	idx := fixtureIndex(t)
+	req, err := BuildSingleSessionSyncRequest(idx, "dd_test", "11111111-1111-1111-1111-111111111111", claudeProfile, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	allowedEnvelopeFields := map[string]bool{
+		"hello":          true,
+		"sessions":       true,
+		"turns":          true,
+		"full_reconcile": true,
+	}
+	for key := range envelope {
+		if !allowedEnvelopeFields[key] {
+			t.Fatalf("unexpected sync envelope field %q in %s", key, raw)
+		}
+	}
+
+	var turns []map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["turns"], &turns); err != nil {
+		t.Fatal(err)
+	}
+	allowedTurnFields := map[string]bool{
+		"session_id": true,
+		"seq":        true,
+		"agent":      true,
+		"kind":       true,
+		"timestamp":  true,
+		"payload":    true,
+	}
+	for _, turn := range turns {
+		for key := range turn {
+			if !allowedTurnFields[key] {
+				t.Fatalf("unexpected turn field %q in %s", key, raw)
+			}
 		}
 	}
 }
@@ -370,8 +417,7 @@ func TestBuildSingleSessionSyncRequestEmitsRichRendererFields(t *testing.T) {
 	if len(req.Turns) < 4 {
 		t.Fatalf("len(turns) = %d, want at least 4 rich blocks", len(req.Turns))
 	}
-	// Plaintext: the rich renderer fields are present verbatim (no longer
-	// hidden inside ciphertext).
+	// Rich renderer fields are present in the synced turn payloads.
 	raw, _ := json.Marshal(req.Turns)
 	for _, want := range []string{"sub starting", "image/png", "AAAA", "tu_task", "input_tokens"} {
 		if !strings.Contains(string(raw), want) {
@@ -465,12 +511,10 @@ func writeCodexRollout(t *testing.T, codexHome, tsDash, sessionID, cwd, userText
 // TestBuildCatalogSyncRequestBoundsBodyToByteBudget is the regression for the
 // production 413: a daemon with thousands of sessions built a catalog sync POST
 // that blew past nginx's 1 MiB client_max_body_size, so every sync 413'd and
-// the relay catalog never updated. The build must cap the body under
+// the Nexus catalog never updated. The build must cap the body under
 // catalogSyncMaxBytes, keeping the MOST RECENT sessions (oldest dropped first).
 //
-// (Pre-E2E-removal the bulk was per-recipient ciphertext; now it's the
-// plaintext metadata + 140-char snippet per session, so the fixture needs more
-// sessions to cross the budget — but the cap logic under test is identical.)
+// The fixture creates enough metadata + snippet rows to cross the budget.
 func TestBuildCatalogSyncRequestBoundsBodyToByteBudget(t *testing.T) {
 	root := t.TempDir()
 	claudeHome := filepath.Join(root, ".claude", "projects")

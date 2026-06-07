@@ -119,7 +119,7 @@ func (f *fakeCodexAppRuntime) TurnStart(ctx context.Context, p codexapp.TurnStar
 		if f.errorOnly {
 			cfg.OnNotification(codexapp.Notification{
 				Method: "error",
-				Params: json.RawMessage(`{"code":"rate_limit_exceeded","error":{"message":"DeepSeek quota exceeded"},"details":"retry later"}`),
+				Params: json.RawMessage(`{"code":"rate_limit_exceeded","error":{"message":"compatible provider quota exceeded"},"details":"retry later"}`),
 			})
 			cfg.OnNotification(codexapp.Notification{
 				Method: "turn/completed",
@@ -566,7 +566,7 @@ func TestManagerCodexErrorNotificationCompletesWithUpstreamError(t *testing.T) {
 		for _, e := range sink.Snapshot() {
 			if e.Kind == string(terminal.EventAgentError) &&
 				strings.Contains(e.Error, "codex_turn_error") &&
-				strings.Contains(e.Error, "DeepSeek quota exceeded") &&
+				strings.Contains(e.Error, "compatible provider quota exceeded") &&
 				!strings.Contains(e.Error, "codex_turn_empty") {
 				return true
 			}
@@ -1070,11 +1070,11 @@ func TestManagerStartFailureDoesNotBrickSession(t *testing.T) {
 }
 
 // TestManagerSeqContinuesAcrossReap guards the multi-turn seq-scramble
-// fix. The relay keys turns on (session, seq); when the idle reaper drops
+// fix. Nexus keys turns on (session, seq); when the idle reaper drops
 // a driver and a later follow-up re-creates the ExternalSession, the new
 // instance must continue the seq above the prior high-water instead of
 // restarting at 0 — otherwise the follow-up's events collide with and
-// OVERWRITE the original turn's relay rows (the bug: original user
+// OVERWRITE the original turn rows (the bug: original user
 // message dropped, assistant replies reordered).
 func TestManagerSeqContinuesAcrossReap(t *testing.T) {
 	rec := &persistentClaudeExec{}
@@ -1171,13 +1171,10 @@ func TestBuildArgsEffort(t *testing.T) {
 	}
 }
 
-// TestBuildArgsRefusesBypassPermissionMode guards the L1 fix. SDK sessions must
-// keep canUseTool wired so tool approvals forward to the web as permission
-// cards; passing --permission-mode bypassPermissions (or dontAsk) makes claude
-// skip the permission-prompt-tool and auto-execute tools with no remote
-// approval. The mode reaches buildArgs straight from routeStartTask's
-// req.PermissionMode unchecked, so buildArgs is the last line of defense.
-func TestBuildArgsRefusesBypassPermissionMode(t *testing.T) {
+// TestBuildArgsPassesNativePermissionModes guards Pockly's permission boundary:
+// Pockly forwards Claude's native permission mode selection and does not replace
+// it with a private approval policy.
+func TestBuildArgsPassesNativePermissionModes(t *testing.T) {
 	mk := func(mode string) []string {
 		d := New(Config{Agent: AgentClaude, SessionID: "sess_x", PermissionMode: mode}, terminal.NewExternalSession())
 		args, _, _, err := d.buildArgs()
@@ -1194,16 +1191,10 @@ func TestBuildArgsRefusesBypassPermissionMode(t *testing.T) {
 		}
 		return false
 	}
-	// A valid mode passes through to claude unchanged.
-	if a := mk("plan"); !has(a, "--permission-mode") || !has(a, "plan") {
-		t.Errorf("permission-mode plan should pass through, got %v", a)
-	}
-	// Bypass modes must be refused (no --permission-mode flag → claude default,
-	// which still routes tool approvals through our MCP permission tool).
-	for _, mode := range []string{"bypassPermissions", "dontAsk"} {
+	for _, mode := range []string{"default", "acceptEdits", "plan", "auto", "bypassPermissions", "dontAsk"} {
 		a := mk(mode)
-		if has(a, "--permission-mode") || has(a, mode) {
-			t.Errorf("%s must be refused for SDK sessions (would bypass web approval), got %v", mode, a)
+		if !has(a, "--permission-mode") || !has(a, mode) {
+			t.Errorf("permission-mode %s should pass through, got %v", mode, a)
 		}
 	}
 }
@@ -1291,7 +1282,7 @@ func (s *stubSessionResolver) CwdForSession(sid string) string {
 }
 
 // TestManagerFallsBackToSessionResolverWhenCwdEmpty covers the
-// mixed-version safety net: a relay that doesn't yet populate
+// mixed-version safety net: a Nexus build that doesn't yet populate
 // InjectRequest.Cwd (pre-M9 build) lands here with cwd="". Without the
 // fallback, `claude --resume` would launch in the daemon's $HOME and
 // silently lose CLAUDE.md / project files. With it, the index resolves
@@ -1369,7 +1360,7 @@ func TestManagerSkipsResolverWhenCwdAlreadyProvided(t *testing.T) {
 
 // stubEventSink captures forwarded events so tests can assert the
 // driver tag and the registration → keepalive → exit flow lights up the
-// relay path correctly. Buffered so the test doesn't deadlock if the
+// Nexus forwarding path correctly. Buffered so the test doesn't deadlock if the
 // driver emits more events than the test plans to drain.
 type stubEventSink struct {
 	mu     sync.Mutex
@@ -1394,7 +1385,7 @@ func (s *stubEventSink) Snapshot() []SDKTerminalEvent {
 // correctness fix: a freshly-registered SDK session must report
 // Driver="sdk" via terminal.Manager.List() so the daemon's reconnect
 // re-announce loop in control.runOnce tags keepalives correctly. If this
-// regresses, the relay's deriveSessionConnectionMode would bucket SDK
+// regresses, Nexus connection-mode derivation would bucket SDK
 // rows as pty_backed_duplex and the UI control state would be wrong.
 func TestManagerTagsExternalSessionAsSDK(t *testing.T) {
 	rec := &recordingExec{}
@@ -1422,8 +1413,8 @@ func TestManagerTagsExternalSessionAsSDK(t *testing.T) {
 
 // TestManagerForwardsEventsWithSDKDriverTag covers the full event
 // pipeline: SDK driver emits → ExternalSession.Subscribe → Manager
-// forwarder goroutine → EventSink.ForwardSDKTerminalEvent. The relay
-// uses these to upsert terminal_sessions rows with Driver="sdk". If the
+// forwarder goroutine → EventSink.ForwardSDKTerminalEvent. Nexus uses these
+// to upsert terminal_sessions rows with Driver="sdk". If the
 // sink doesn't see anything, the row never gets written and
 // deriveSessionConnectionMode never reports sdk_running.
 func TestManagerForwardsEventsWithSDKDriverTag(t *testing.T) {
@@ -1452,7 +1443,7 @@ func TestManagerForwardsEventsWithSDKDriverTag(t *testing.T) {
 			t.Errorf("SDKTerminalEvent.SessionID = %q, want sess_a", e.SessionID)
 		}
 		if e.TerminalSessionID == "" {
-			t.Errorf("SDKTerminalEvent.TerminalSessionID empty; relay needs this to upsert")
+			t.Errorf("SDKTerminalEvent.TerminalSessionID empty; Nexus needs this to upsert")
 		}
 	}
 }

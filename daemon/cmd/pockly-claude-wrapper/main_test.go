@@ -30,10 +30,9 @@ func setTestClaudeHome(t *testing.T, dir string) {
 
 func TestParseClaudeInvocationResume(t *testing.T) {
 	// Verifies parseClaudeInvocation extracts the sessionID the user
-	// supplied via --resume / -r. With v0.1.36 the function ALSO
-	// generates a fresh UUID when no session flag is present (see
-	// TestParseClaudeInvocationGeneratesUUID for that case); these
-	// table entries only cover the "user-supplied sid is honored" path.
+	// supplied via --resume / -r. Bare invocations generate a fresh UUID
+	// in TestParseClaudeInvocationGeneratesUUID; these table entries only
+	// cover the "user-supplied sid is honored" path.
 	tests := []struct {
 		name string
 		args []string
@@ -69,11 +68,11 @@ func TestEncodeClaudeProjectDirNameUnixPath(t *testing.T) {
 	}
 }
 
-// TestParseClaudeInvocationGeneratesUUID covers the v0.1.36 happy path:
-// bare `claude` (no session flag) gets a wrapper-generated UUIDv4 that
-// will be injected via --session-id <uuid> before exec. The UUID is the
-// authoritative binding — it determines the jsonl path, appears in the
-// jsonl content, and identifies the wrapper to the daemon.
+// TestParseClaudeInvocationGeneratesUUID covers the bare `claude` path:
+// no session flag gets a wrapper-generated UUIDv4 injected via
+// --session-id <uuid> before exec. The UUID is the authoritative binding:
+// it determines the JSONL path, appears in the JSONL content, and
+// identifies the wrapper to the daemon.
 func TestParseClaudeInvocationGeneratesUUID(t *testing.T) {
 	cases := [][]string{
 		nil,               // bare `claude`
@@ -287,11 +286,10 @@ func TestNewestJSONLAfter(t *testing.T) {
 // changes — claude would route inject text into a stale jsonl after any
 // in-app /resume.
 //
-// Note: v0.1.36 removed the mtime fallback in resolveActiveSession, so
-// we exercise updateClaudeSessionID directly rather than driving it
-// through the discovery loop (which now requires real lsof / proc-fd
-// access we can't fake in a unit test). The rotation invariant is
-// preserved either way — discovery is just the source of sids.
+// Exercise updateClaudeSessionID directly rather than driving it through
+// the discovery loop, which requires real lsof/proc-fd access we cannot
+// fake in a unit test. The rotation invariant is preserved either way;
+// discovery is just the source of sids.
 func TestUpdateClaudeSessionIDDetectsRotation(t *testing.T) {
 	bridge := &daemonBridge{cwd: "/tmp", done: make(chan struct{})}
 
@@ -317,12 +315,9 @@ func TestUpdateClaudeSessionIDDetectsRotation(t *testing.T) {
 	}
 }
 
-// TestEmitReRegistersOnDaemon404 is the regression test for v0.1.25's main
-// fix: when the daemon is restarted (launchctl bootout/bootstrap, crash,
-// upgrade), its in-memory terminal_sessions map is empty. The wrapper's
-// next Emit hits a 404 on its old id. Before this fix, the response was
-// silently discarded and every subsequent event also 404'd — the wrapper
-// looked attached but was sending into a void. Now the bridge auto
+// TestEmitReRegistersOnDaemon404 covers daemon restarts: when the daemon
+// is restarted, its in-memory terminal_sessions map is empty. The wrapper's
+// next Emit hits a 404 on its old id. The bridge must auto
 // re-registers on 404 and replays the event with the new id.
 func TestEmitReRegistersOnDaemon404(t *testing.T) {
 	var (
@@ -474,12 +469,11 @@ func TestEmitNetworkErrorMarksDetached(t *testing.T) {
 	}
 }
 
-// TestSetupPermissionMCPWiring is the v0.1.44 S3 regression test for
-// the wrapper's PTY-mode MCP injection. The wiring (3 layers: temp
-// config file shape + child argv + tool name string) is fragile — a
-// typo anywhere silently disables the 🛡️ permission cards on web
-// without crashing the wrapper. Lock the contract in a unit test so
-// the next refactor breaks the test instead of the user-facing UX.
+// TestSetupPermissionMCPWiring covers the wrapper's PTY-mode MCP injection.
+// The wiring spans temp config shape, child argv, and tool name string; a
+// typo anywhere silently disables web permission cards without crashing the
+// wrapper. Lock the contract in a unit test so refactors break the test
+// instead of the user-facing UX.
 //
 // We can't easily fake `os.Executable()` to control where setupPermission
 // MCP looks for the daemon binary, so the test runs in two modes:
@@ -552,9 +546,9 @@ func TestSetupPermissionMCPWiring(t *testing.T) {
 	if filepath.Base(pockly.Command) != "pockly-daemon" {
 		t.Fatalf("command should be pockly-daemon, got %q", pockly.Command)
 	}
-	// Args must include the subcommand + sid + v0.2.0 --interactive
-	// flag so the spawned MCP server knows which terminal_session to
-	// POST events against AND blocks for the user's allow/deny.
+	// Args must include the subcommand, sid, and --interactive flag so
+	// the spawned MCP server knows which terminal_session to POST events
+	// against and blocks for the user's allow/deny.
 	wantArgs := []string{"mcp-permission", "--session-id", sid, "--interactive"}
 	if fmt.Sprintf("%v", pockly.Args) != fmt.Sprintf("%v", wantArgs) {
 		t.Fatalf("expected args %v, got %v", wantArgs, pockly.Args)
@@ -1071,11 +1065,10 @@ func TestTUIPermissionWatcherScheduledFallbackClearsTimerWhenSuppressed(t *testi
 	}
 }
 
-// TestEmitRetriesOn5xx is the v0.2.2 regression for bug #150 — pre-v0.2.2
-// the wrapper silently dropped events on 5xx responses (single attempt,
-// no retry, no queue). Now it retries up to 4x with exponential backoff,
-// so a transient 503 (relay deploying, daemon GC pause, etc.) doesn't
-// permanently lose the event.
+// TestEmitRetriesOn5xx verifies retry behavior for transient 5xx
+// responses. The wrapper retries with exponential backoff so a transient
+// 503, such as a Nexus deploy or daemon pause, does not permanently lose
+// the event.
 //
 // Scenario: first 2 hits return 503, third returns 202. Emit should
 // succeed without queuing.
@@ -1123,9 +1116,9 @@ func TestEmitRetriesOn5xx(t *testing.T) {
 	}
 }
 
-// TestEmitQueuesAndDrainsPending is the v0.2.2 core guarantee — events
-// that fail all retries DON'T get lost. They go into bridge.pending and
-// drain FIFO on the next Emit call (or 10s keepalive tick).
+// TestEmitQueuesAndDrainsPending verifies that events failing all retries
+// are queued instead of lost. They go into bridge.pending and drain FIFO
+// on the next Emit call or keepalive tick.
 //
 // Scenario: daemon returns 503 forever for the first event → it queues.
 // Then daemon flips to 202 → next Emit drains the queued event + emits

@@ -360,7 +360,7 @@ func fallback(values ...string) string {
 // Without this, the web app's device dropdown displays the raw
 // device_id (e.g. "01ZnxSj01468764") instead of a real machine name,
 // because both Identity.Hostname and StableComputerIdentity
-// .HostnameFirstSeen propagated empty strings through to the relay's
+// .HostnameFirstSeen propagated empty strings through to Nexus'
 // `hostname` column and there's no upstream fallback.
 func resolveHostname() string {
 	h, err := os.Hostname()

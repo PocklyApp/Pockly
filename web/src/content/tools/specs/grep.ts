@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Grep spec.
+// Grep spec.
 //
 // Header shows the pattern in quotes (the most informative arg);
 // path or glob fall to a row. State label uses the existing

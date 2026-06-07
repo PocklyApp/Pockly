@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Glob spec.
+// Glob spec.
 //
 // Similar to Grep but the pattern IS a glob (not a regex). Result is
 // a newline-separated file list; we surface the file count as the

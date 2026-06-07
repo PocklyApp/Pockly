@@ -91,10 +91,9 @@
   --signal-live: #5a9d6f;
   --signal-live-soft: rgba(90, 157, 111, 0.18);
   --signal-warn: #b88a3f;
-  /* Redesign v2 danger signal (offline / unavailable / error states). Pockly's
+  /* Danger signal for offline / unavailable / error states. Pockly's
      --destructive is intentionally monochrome; this muted warm red is the
-     semantic counterpart to --signal-live, used by the .ws-empty is-danger
-     icon bubbles and status copy. */
+     semantic counterpart to --signal-live. */
   --signal-danger: #c4493e;
   --shadow-xs: 0 1px 0 rgba(24, 22, 18, 0.04);
   --shadow-lift: 0 28px 56px -20px rgba(24, 22, 18, 0.18), 0 8px 16px rgba(24, 22, 18, 0.05);
@@ -950,8 +949,7 @@ textarea {
   scroll-padding-bottom: calc(112px + env(safe-area-inset-bottom));
 }
 
-/* Redesign v2 local-setup flow states (.flow-status): a 72px status disc
-   (spinner / check / x) + heading + body, centered. Ported from the design. */
+/* Local-setup flow states: a 72px status disc plus centered heading/body. */
 .flow-status {
   display: grid;
   gap: 12px;
@@ -1012,8 +1010,7 @@ textarea {
   width: 100%;
 }
 
-/* Redesign v2 connect guide (m-ws-connect): install/run/auto steps + a
-   "waiting for this computer to connect" line. Local-setup flow — no codes. */
+/* Connect guide: install/run/auto steps plus a waiting-for-computer line. */
 .connect-setup-card {
   width: min(560px, 100%);
   margin: 0 auto;
@@ -1376,8 +1373,8 @@ button.account-panel.account-button.is-active {
   min-height: 44px;
 }
 
-/* Device picker — top of .drawer-scroll. Replaces the rail search (Workspace
-   Redesign v2): selects which connected computer the session list filters to. */
+/* Device picker at the top of .drawer-scroll: selects which connected
+   computer the session list filters to. */
 .device-picker { position: relative; display: grid; }
 .device-picker-trigger {
   display: grid;
@@ -1713,8 +1710,8 @@ kbd {
   overflow: hidden;
 }
 
-/* Workspace header (Redesign v2) — top bar for the sessions / conversation
-   view: [hamburger (the rail's floating mobile-menu-button fills col 1 on
+/* Workspace header: top bar for the sessions / conversation view:
+   [hamburger (the rail's floating mobile-menu-button fills col 1 on
    mobile; empty on desktop) | status dot + title | actions]. The device
    selector moved to the rail, so the centre is a title, not a device chip. */
 .ws-header {
@@ -4233,11 +4230,11 @@ button.ui-button-secondary.load-earlier-button:hover:not(:disabled) {
   line-height: 1.45;
 }
 
-/* Redesign v2 unified empty/edge-state pattern (.ws-empty): icon bubble (or
+/* Unified empty/edge-state pattern (.ws-empty): icon bubble (or
    spinner) + heading + sub + optional helper/actions, vertically centered.
    Shared by the in-reader idle / preparing / dead-session / error states and
-   the connection (bridge) states. Ported from the design handoff; sub-element
-   selectors are scoped under .ws-empty so they don't collide. */
+   the connection states. Sub-element selectors are scoped under .ws-empty
+   so they don't collide. */
 .ws-empty {
   display: grid;
   align-content: center;
@@ -4345,9 +4342,9 @@ button.ui-button-secondary.load-earlier-button:hover:not(:disabled) {
   filter: brightness(0.96);
 }
 
-/* Redesign v2 modal card pattern (.ws-modal — prefixed to avoid colliding
-   with any existing .modal/.primary/.cancel). Used by the session-drift and
-   daemon-update dialogs. The overlay (.ws-modal-overlay) centers the card. */
+/* Modal card pattern (.ws-modal is prefixed to avoid colliding with existing
+   .modal/.primary/.cancel classes). Used by the session-drift and
+   daemon-update dialogs. The overlay centers the card. */
 .ws-modal-overlay {
   position: absolute;
   inset: 0;
@@ -4822,7 +4819,7 @@ button.ui-button-secondary.load-earlier-button:hover:not(:disabled) {
   color: var(--foreground);
 }
 
-/* R10: LaTeX math (KaTeX). The marked extension emits empty sentinel
+/* LaTeX math (KaTeX). The marked extension emits empty sentinel
    elements with data-tex; renderMath fills them in client-side. When
    KaTeX is loading, hasn't been loaded yet, or fails to load, the
    empty sentinels stay — so we hide them with :empty so the user
@@ -4920,7 +4917,7 @@ pre::-webkit-scrollbar-track {
   padding-top: 42px;
 }
 
-/* R1: language label in the empty top-left corner of fenced code
+/* Language label in the empty top-left corner of fenced code
    blocks. Only renders when the marked renderer wrote a data-lang
    attribute (which our post-replace step always does for ``` blocks
    with a language tag). pointer-events:none so the label doesn't
@@ -4938,7 +4935,7 @@ pre::-webkit-scrollbar-track {
   pointer-events: none;
 }
 
-/* R1: GFM table baseline. marked 14 already emits the structure with
+/* GFM table baseline. marked already emits the structure with
    gfm: true; this just gives borders + zebra readable defaults so
    tables don't render as a wall of unstyled text.
 
@@ -4972,7 +4969,7 @@ pre::-webkit-scrollbar-track {
   color: var(--foreground);
 }
 
-/* R1: GFM task list. Items emitted by marked use `.task-item` (custom
+/* GFM task list. Items emitted by marked use `.task-item` (custom
    renderer in renderMarkdown) so the checkbox is a styled span — no
    <input> tag in the sanitized output, no DOMPurify allowlist
    expansion needed. */
@@ -4996,7 +4993,7 @@ pre::-webkit-scrollbar-track {
   border-color: var(--accent);
   position: relative;
 }
-/* R1: position the check via centered-transform so the rotated rect's
+/* Position the check via centered-transform so the rotated rect's
    geometric center lands at the visual center of the box, instead of
    pinning a corner with `top: 0px left: 3px` (which left the apex
    flush with the top border and looked off on Firefox / high-DPI).
@@ -5120,7 +5117,7 @@ pre::-webkit-scrollbar-track {
   border-top: 1px dashed var(--border);
 }
 
-/* R3 (Claude-style): Bash body lives flat inside the surrounding tool
+/* Bash body lives flat inside the surrounding tool
    body card. The command line is monospace + green prompt sigil; the
    result is plain monospace text. No nested boxes around either —
    the wrapping body card (.tool-card-oneliner-body / .ws-tc-body) is
@@ -5200,7 +5197,7 @@ pre.tool-command-output,
   overflow: auto;
 }
 
-/* R4: ExitPlanMode body="plan" — accent-bordered card that hosts a
+/* ExitPlanMode body="plan": accent-bordered card that hosts a
    full markdown render of the proposed plan, plus a footer noting
    the agent is paused awaiting user approval. The accent stripe on
    the left is the "this is special" cue; the dotted-line footer
@@ -5418,14 +5415,14 @@ pre.tool-command-output,
   border-radius: 8px;
   background: var(--background);
   /* Reset native <button> defaults so the interactive variant
-     (R5) renders identically to the resolved <div> variant. */
+     renders identically to the resolved <div> variant. */
   font: inherit;
   color: inherit;
   text-align: left;
   appearance: none;
 }
 
-/* R5: clickable variant — hover + active feedback so the user
+/* Clickable question option variant: hover + active feedback so the user
    knows the option is interactive. Resolved questions render as
    <div> with no .is-interactive, so this rule never fires for
    them. */
@@ -5475,7 +5472,7 @@ pre.tool-command-output,
   font-style: italic;
 }
 
-/* R5: footer row for multi-select questions — pairs the staged-count
+/* Footer row for multi-select questions: pairs the staged-count
    "Send N" button with the multi-select hint. The button sits at the
    end of the row so it reads as the call-to-action, with the hint
    demoted to the left as supporting copy. */
@@ -5637,7 +5634,7 @@ pre.tool-command-output,
   50%      { opacity: 1; transform: scale(1.1); }
 }
 
-/* R6: Inline image content. Capped to a 300x300 thumbnail tile so a tall
+/* Inline image content. Capped to a 300x300 thumbnail tile so a tall
    screenshot doesn't dominate the timeline; click opens the in-page
    lightbox (see .image-lightbox-* below) at native resolution. The
    button form lets keyboard / screen-reader users activate it like any
@@ -5668,7 +5665,7 @@ pre.tool-command-output,
   object-fit: cover;
 }
 
-/* R6: full-screen image lightbox. Self-implemented overlay — no
+/* Full-screen image lightbox. Self-implemented overlay: no
    third-party lightbox library, so the bundle stays small and CSP
    doesn't need any extra entries. The img is constrained to the
    viewport so the user can pinch-zoom (mobile) or scroll (desktop)
@@ -5737,7 +5734,7 @@ pre.tool-command-output,
 .token-usage-pct {
   font-family: var(--font-mono, ui-monospace, monospace);
 }
-/* R7: tier classes color the % text to match the SVG arc, so the
+/* Tier classes color the % text to match the SVG arc, so the
    indicator reads as one chip instead of arc-vs-grey-number. Stay
    subtle in the "ok" tier — only louden as we approach the window. */
 .token-usage-pie-warn .token-usage-pct {
@@ -6227,7 +6224,7 @@ button.settings-row,
   color: color-mix(in srgb, var(--muted-foreground) 62%, transparent);
 }
 
-/* R9: toggle row variant. Same row grid as the chevron rows but the
+/* Toggle row variant. Same row grid as the chevron rows but the
    chevron column is replaced by a switch; <label> wraps the whole row
    so the entire surface is the click target. Native checkbox is
    visually hidden but stays focusable for keyboard a11y. */
@@ -7982,7 +7979,7 @@ button.settings-signout-button {
     padding-top: var(--mobile-toolbar-height);
   }
 
-  /* Redesign v2 dropped the fixed .toolbar for the chat experience — the
+  /* The chat experience no longer uses the fixed .toolbar; the
      header is now in-flow (.ws-header for the list, AgentConversationHeader
      inside the reader for a conversation). The leftover .workspace
      padding-top reserved a 58px band for a bar that's gone, leaving a dead
@@ -8865,7 +8862,7 @@ button.settings-signout-button {
 }
 
 /* ===========================================================
-   Landing page v2 — component styles (Claude Design)
+   Landing page v2 — component styles
    All classes prefixed with "landing-" to avoid conflicts.
    =========================================================== */
 
@@ -10077,7 +10074,7 @@ button.settings-signout-button {
 .ws-mg-node { display: contents; }
 .ws-mg-body > .ws-narr + .ws-narr { margin-top: -2px; }
 
-/* Thinking — opt-in only (R9 showThinking, off by default). When the
+/* Thinking is opt-in only and off by default. When the
    user does enable it, render as quiet inline italic text rather
    than a message bubble; Codex/Claude both treat thinking as a
    transient in-progress state, not a persistent transcript item. */
@@ -10550,10 +10547,10 @@ details.ws-tc { interpolate-size: allow-keywords; }
   padding: 0;
 }
 
-/* ── Session diffs — "Diffs · N" pill + bottom-sheet drawer ───────────
-   Ported from the Workspace Redesign v2 design. The pill lives in the
-   composer pills row; tapping it opens a bottom sheet listing every file
-   the agent changed, drilling into each file's full diff. */
+/* ── Session diffs: "Diffs · N" pill + bottom-sheet drawer ───────────
+   The pill lives in the composer pills row; tapping it opens a bottom
+   sheet listing every file the agent changed, drilling into each file's
+   full diff. */
 :root {
   --syntax-add: #2ea043;
   --syntax-del: #d4424a;
@@ -10800,7 +10797,7 @@ details.ws-tc { interpolate-size: allow-keywords; }
   gap: 1px;
   /* Size each column to its own content (the model column has the longest
      labels) instead of forcing equal 220px columns — that cap was what made
-     "sonnet -> deepseek-v4-flash" wrap even with width to spare. */
+     "sonnet -> anthropic-compatible-fast" wrap even with width to spare. */
   flex: 1 1 auto;
   min-width: 130px;
   max-width: 360px;
@@ -10819,7 +10816,7 @@ details.ws-tc { interpolate-size: allow-keywords; }
   color: var(--muted-foreground);
   background: var(--popover, var(--card));
 }
-/* Keep option labels (e.g. "sonnet -> deepseek-v4-flash") on one line; the
+/* Keep option labels (e.g. "sonnet -> anthropic-compatible-fast") on one line; the
    column grows to fit them. A pathologically long custom alias truncates with
    an ellipsis rather than wrapping mid-name. */
 .composer-config-col .composer-pill-option {

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Read tool spec.
+// Read tool spec.
 //
 // File-path-as-header pattern. We do NOT show the file contents in
 // the body because Read results are typically large and the user

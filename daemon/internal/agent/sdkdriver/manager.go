@@ -62,9 +62,9 @@ type SettingsReader interface {
 }
 
 // TerminalEventSink receives every event the SDK driver's terminal
-// session emits. Implementations forward them to the relay (typically
-// via control.runner.forwardTerminalEvent). The events are already
-// driver-tagged (Driver="sdk"), so the relay's deriveSessionConnectionMode
+// session emits. Implementations forward them to Nexus (typically via
+// control.runner.forwardTerminalEvent). The events are already
+// driver-tagged (Driver="sdk"), so Nexus connection-mode derivation
 // reports sdk_running / sdk_headless correctly instead of treating the
 // row as PTY.
 type TerminalEventSink interface {
@@ -91,8 +91,8 @@ type SDKTerminalEvent struct {
 }
 
 // SessionResolver fills in metadata the inject path didn't carry. As of
-// 2026-05-25 the relay populates InjectRequest.Cwd from the session
-// catalog, but mixed-version deployments (newer daemon, older relay)
+// 2026-05-25 Nexus populates InjectRequest.Cwd from the session catalog, but
+// mixed-version deployments (newer daemon, older Nexus)
 // will arrive with Cwd empty; falling back to the daemon's local
 // index keeps `claude --resume` rooted in the original project
 // directory rather than defaulting to $HOME (which silently loses
@@ -126,7 +126,7 @@ type Manager struct {
 	mu      sync.Mutex
 	drivers map[string]*entry // sid → entry
 	// lastSeqBySid carries a session's high-water event seq across
-	// ExternalSession re-creation. The relay keys turns on (session, seq);
+	// ExternalSession re-creation. Nexus keys turns on (session, seq);
 	// a fresh ExternalSession restarts seq from 0, so without this a
 	// follow-up turn (after the idle reaper dropped the driver) would emit
 	// seqs that collide with — and overwrite — the original turn's rows.
@@ -173,7 +173,7 @@ type ManagerConfig struct {
 	Sessions SessionResolver
 	// EventSink receives terminal events emitted by every SDK driver
 	// this manager owns. nil means events stay local to the daemon
-	// (subscribers via terminal.Manager still see them, but the relay
+	// (subscribers via terminal.Manager still see them, but Nexus
 	// doesn't, so the catalog never updates to sdk_running). Production
 	// daemons must wire this; main.go does so via a thin adapter that
 	// forwards into control.runner's existing terminalEvents channel.
@@ -304,7 +304,7 @@ func (m *Manager) runIdleReaper() {
 // older than idleTimeout and which is not mid-turn. Split from the
 // ticker loop so tests can drive it with a synthetic `now` instead of
 // sleeping. Reclaim is full: Stop() cancels the subprocess and closes
-// the ExternalSession (so the relay catalog flips the session out of
+// the ExternalSession (so the Nexus catalog flips the session out of
 // "live"), and the entry is dropped — the next inject re-creates a
 // fresh driver via EnsureDriver. A turn arriving concurrently is safe:
 // the SubprocessDone watcher's `e.driver == drv` guard no-ops once the
@@ -418,16 +418,16 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	// SendInput buffer on the input bus while the in-flight turn
 	// completes).
 
-	// Resolve cwd to an ABSOLUTE local path. relay sends only the cwd
+	// Resolve cwd to an ABSOLUTE local path. Nexus sends only the cwd
 	// leaf label (see relay/sync.go:safeCwdLabel — "/home/u/repo" →
-	// "repo") so users' fs layout doesn't leak to the cloud relay.
+	// "repo") so users' filesystem layout doesn't leave the daemon.
 	// That's the right privacy boundary, but it means InjectRequest.Cwd
 	// is unusable as cmd.Dir directly: `exec.Command(...).Dir = "demo"`
 	// would chdir relative to the daemon's own cwd (typically $HOME)
 	// and fail with "no such file or directory".
 	//
 	// The local session index is the authoritative source for the full
-	// path on this machine. We use the relay value only as a hint /
+	// path on this machine. We use the Nexus value only as a hint /
 	// fallback for sessions the index can't resolve yet.
 	//
 	// New-session mode (web's "New conversation") skips the resolver
@@ -489,11 +489,11 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 		}
 		// Tag the session as SDK-owned so terminal.Manager.List() returns
 		// Driver="sdk" — the reconnect re-announce loop in control.runOnce
-		// then sends keepalives with the right driver to relay.
+		// then sends keepalives with the right driver to Nexus.
 		ext.SetDriver("sdk")
 		// Continue the seq above the prior (reaped) instance's high-water
 		// so a follow-up turn's events never collide with — and overwrite —
-		// the original turn's relay rows (keyed on (session, seq)).
+		// the original turn rows (keyed on (session, seq)).
 		if hw := m.lastSeqBySid[sid]; hw > 0 {
 			ext.SeedSeq(hw)
 		}
@@ -528,7 +528,7 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	m.drivers[sid] = &entry{driver: driver, terminalSession: ext, terminalSessionID: tsID}
 	m.mu.Unlock()
 
-	// Forward every event the SDK driver's session emits to the relay
+	// Forward every event the SDK driver's session emits to Nexus
 	// (via the sink). Subscribe is attached to ext (not driver), so on
 	// subsequent turns (isReuse==true) the existing subscriber is still
 	// running and we MUST NOT add a second one — double subscription
@@ -536,7 +536,7 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	//
 	// CRITICAL: first-time subscription must register BEFORE Driver.Start
 	// runs, otherwise the session_started / session_ready events Start
-	// emits synchronously land before any subscriber exists and the relay
+	// emits synchronously land before any subscriber exists and Nexus
 	// never sees the "live" transition.
 	if m.eventSink != nil && !isReuse {
 		sub, unsubscribe := ext.Subscribe(256)
@@ -622,7 +622,7 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	return ext, nil
 }
 
-// resolveCwd turns a possibly-truncated cwd hint from relay into an
+// resolveCwd turns a possibly-truncated cwd hint from Nexus into an
 // absolute path that `exec.Command(...).Dir = ...` can actually chdir
 // into. Precedence:
 //  1. If `hint` is an absolute, locally-existing directory, trust it.
@@ -630,7 +630,7 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 //     escape hatch for non-indexed sessions.)
 //  2. Otherwise consult the local session index. Index entries carry
 //     the absolute path the wrapper actually launched from. This is
-//     the production path for real Pockly users — relay only ever
+//     the production path for real Pockly users — Nexus only ever
 //     sent us the cwd leaf label for privacy.
 //  3. Empty result means SDK driver will refuse to spawn and surface
 //     an error; better than silently chdir-ing to $HOME.

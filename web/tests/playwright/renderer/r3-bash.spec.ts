@@ -5,11 +5,10 @@
 
 import { test, expect } from "@playwright/test";
 
-// R3 — Bash terminal-styled card + command copy.
-// Cases R3-1 (terminal styling), R3-2 (copy clipboard), R3-3 (result block).
+// Bash terminal-styled card + command copy.
 
-test.describe("R3 Bash tool card", () => {
-  test("R3-1 renders .tool-command with $ prompt + command text", async ({ page }) => {
+test.describe("Bash tool card", () => {
+  test("renders .tool-command with $ prompt + command text", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r3-bash");
     // Expand the collapsed <details> so the body is in the layout.
     // Bash is a narrative tool — folded into a ToolNarrativeGroup
@@ -24,7 +23,7 @@ test.describe("R3 Bash tool card", () => {
     await expect(page.locator(".tool-command-output")).toHaveCount(0);
   });
 
-  test("R3-2 copy button writes the command to the clipboard", async ({ page, context }) => {
+  test("copy button writes the command to the clipboard", async ({ page, context }) => {
     // Grant clipboard perms BEFORE navigate so the page can write to it.
     await context.grantPermissions(["clipboard-read", "clipboard-write"]);
     await page.goto("/test/renderer?fixture=r3-bash");
@@ -41,7 +40,7 @@ test.describe("R3 Bash tool card", () => {
     expect(text).toBe("ls -la /tmp");
   });
 
-  test("R3-3 paired result renders below the command in the same terminal block", async ({ page }) => {
+  test("paired result renders below the command in the same terminal block", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r3-bash-with-result");
     // Bash is a narrative tool — folded into a ToolNarrativeGroup
     // pill. Open the narrative first so the inner <details> mounts.

@@ -9,9 +9,9 @@
 //  1. Daemon starts an HTTP server bound to 127.0.0.1 on an OS-chosen port.
 //  2. Daemon generates a one-shot 256-bit nonce and embeds it in the URL it
 //     opens in the user's browser (in the fragment, so it never hits Referer
-//     or relay logs).
+//     or Nexus logs).
 //  3. The web /local-setup page reads the nonce out of the fragment, runs the
-//     existing login flow against the relay, asks the relay to mint a
+//     existing login flow against Nexus, asks Nexus to mint a
 //     "local-claim" (device tokens + daemon device id, scoped to that nonce),
 //     and POSTs the result back to http://127.0.0.1:<port>/callback.
 //  4. Daemon validates Origin, validates nonce, hands the Claim to the caller
@@ -26,8 +26,7 @@
 // Security notes:
 //   - Bound to 127.0.0.1 only, never 0.0.0.0.
 //   - Nonce is single-use; the server stops accepting once consumed.
-//   - Origin must match the configured relay origin (defaults to
-//     https://pockly.example).
+//   - Origin must match the configured Nexus origin.
 //   - Method is POST + Content-Type application/json only.
 //   - Server enforces a hard deadline (default 10 minutes) and shuts itself
 //     down if Wait() is not satisfied.
@@ -51,7 +50,7 @@ import (
 )
 
 // Claim is the payload the web page posts back to the daemon after it has
-// authenticated the user with the relay. Field names match the relay's
+// authenticated the user with Nexus. Field names match Nexus's
 // /api/daemon/local-claim response.
 type Claim struct {
 	DaemonDeviceID      string `json:"daemon_device_id"`
@@ -67,7 +66,7 @@ type Claim struct {
 // Server is a single-shot loopback handshake server.
 type Server struct {
 	// AllowedOrigins lists the URL origins the web page may POST from.
-	// If nil, defaults to {"https://pockly.example"}. Schemes must match
+	// If nil, defaults to {"http://127.0.0.1:8787"}. Schemes must match
 	// (https vs http).
 	AllowedOrigins []string
 
@@ -164,11 +163,11 @@ func (s *Server) CallbackURL() string {
 
 // SetupURL builds the URL the daemon opens in the local browser. It mounts
 // nonce and cb in the fragment so they are not forwarded as a Referer header
-// or recorded in the relay's access log.
+// or recorded in Nexus access logs.
 func (s *Server) SetupURL(relayBaseURL string) (string, error) {
 	u, err := url.Parse(relayBaseURL)
 	if err != nil {
-		return "", fmt.Errorf("localsetup: parse relay url: %w", err)
+		return "", fmt.Errorf("localsetup: parse Nexus URL: %w", err)
 	}
 	u.Path = "/local-setup"
 	u.RawQuery = ""
@@ -228,8 +227,8 @@ func (s *Server) finish(c *Claim, err error) {
 }
 
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
-	// CORS preflight from the relay origin — relay's /local-setup is
-	// loaded under https://pockly.example, so the POST is cross-origin
+	// CORS preflight from the Nexus origin. The web /local-setup page is
+	// loaded under Nexus, so the POST is cross-origin
 	// against http://127.0.0.1:<port>.
 	if r.Method == http.MethodOptions {
 		s.writeCORS(w, r)
@@ -307,7 +306,7 @@ func (s *Server) originAllowed(origin string) bool {
 	}
 	allowed := s.AllowedOrigins
 	if len(allowed) == 0 {
-		allowed = []string{"https://pockly.example"}
+		allowed = []string{"http://127.0.0.1:8787"}
 	}
 	for _, want := range allowed {
 		if strings.EqualFold(origin, want) {

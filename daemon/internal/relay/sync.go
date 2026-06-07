@@ -20,17 +20,15 @@ import (
 	"github.com/PocklyApp/Pockly/daemon/internal/version"
 )
 
-// catalogSyncMaxBytes bounds the full-catalog sync POST body. The relay
-// sits behind nginx, whose default client_max_body_size is 1 MiB; a
-// daemon that has accumulated hundreds of sessions (each contributing
-// metadata + one encrypted snippet PER paired browser recipient) blows
-// past that and every catalog sync 413s — the relay catalog then never
-// updates, so web shows a stale/empty session list.
+// catalogSyncMaxBytes bounds the full-catalog sync POST body. Nexus may sit
+// behind nginx, whose default client_max_body_size is 1 MiB; a daemon that has
+// accumulated thousands of sessions can otherwise blow past that and leave the
+// web catalog stale.
 //
 // We keep the JSON body comfortably under 1 MiB. Sessions are emitted
 // most-recent-first, so when the budget is hit the OLDEST sessions are
 // the ones dropped from this snapshot. Because catalog syncs set
-// FullReconcile=true, the relay drops those overflow sessions from its
+// FullReconcile=true, Nexus drops those overflow sessions from its
 // catalog too — bounded and stable (the same recent set re-syncs each
 // tick; no thrash). Old sessions still live on disk and remain openable
 // via single-session sync if navigated to directly.
@@ -102,8 +100,8 @@ func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile ru
 	emitted := 0
 	for _, entry := range entries {
 		session := entry.session
-		// E2E removed: the first user message rides along as a plaintext
-		// sidebar snippet. The relay stores SyncSession.Snippet directly.
+		// The first user message rides along as a server-stored sidebar
+		// snippet. Nexus stores SyncSession.Snippet directly.
 		ss := pair.SyncSession{
 			SessionID:         session.SessionID,
 			Agent:             entry.agentName,
@@ -119,7 +117,7 @@ func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile ru
 		}
 
 		// Always emit at least one session so a single oversized entry can't
-		// produce an empty catalog (it'd still 413, but the relay would at
+		// produce an empty catalog (it would still 413, but Nexus would at
 		// least see one session rather than reconcile to zero).
 		unitBytes := approxJSONLen(ss)
 		if emitted > 0 && approxBytes+unitBytes > catalogSyncMaxBytes {
@@ -133,8 +131,8 @@ func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile ru
 	if emitted < totalEligible {
 		// No silent truncation: surface that the catalog was capped so the
 		// dropped-oldest behavior is visible in logs (and so a future
-		// delta-sync / relay GC effort has a breadcrumb).
-		log.Printf("relay sync: catalog capped to %d of %d sessions (~%d bytes) to stay under relay body limit; oldest %d dropped from this snapshot",
+		// delta-sync / Nexus GC effort has a breadcrumb).
+		log.Printf("Nexus sync: catalog capped to %d of %d sessions (~%d bytes) to stay under Nexus body limit; oldest %d dropped from this snapshot",
 			emitted, totalEligible, approxBytes, totalEligible-emitted)
 	}
 
@@ -236,7 +234,7 @@ func BuildSingleSessionWindowSyncRequestContext(ctx context.Context, idx *index.
 }
 
 // isSupportedSyncAgent gates agent families that can be exposed beyond the
-// daemon boundary through relay sync. Keep this aligned with extractSessionBlocks.
+// daemon boundary through Nexus sync. Keep this aligned with extractSessionBlocks.
 func isSupportedSyncAgent(agent string) bool {
 	switch agent {
 	case "claude-code", "codex":
@@ -326,7 +324,7 @@ func lastBlockTimestamp(blocks []agent.Block, fallback string) string {
 // payloadForBlock is the wire-shape projection of agent.Block. Any new
 // field added to agent.Block must also be threaded here — otherwise the
 // struct's omitempty will swallow the field on serialization and it'll
-// never reach the relay or the browser. Add a field below AND wire it
+// never reach Nexus or the browser. Add a field below AND wire it
 // into the json.Marshal call.
 func payloadForBlock(block agent.Block) (json.RawMessage, error) {
 	type payload struct {

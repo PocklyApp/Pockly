@@ -270,10 +270,10 @@ func TestValidateModelForCwd(t *testing.T) {
 	}
 	// A model configured in the project's .claude.json is accepted.
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"model":"deepseek-v4-flash"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"model":"anthropic-compatible-fast"}`), 0o644); err != nil {
 		t.Fatalf("write .claude.json: %v", err)
 	}
-	if err := ValidateModelForCwd(dir, "deepseek-v4-flash"); err != nil {
+	if err := ValidateModelForCwd(dir, "anthropic-compatible-fast"); err != nil {
 		t.Fatalf("project-configured model should be valid, got %v", err)
 	}
 	// An unconfigured model is rejected with the typed wire error the
@@ -284,7 +284,7 @@ func TestValidateModelForCwd(t *testing.T) {
 	}
 	// And that same unconfigured model is rejected for a cwd without a
 	// project config too (only the built-in aliases are known there).
-	if err := ValidateModelForCwd("", "deepseek-v4-flash"); err == nil {
+	if err := ValidateModelForCwd("", "anthropic-compatible-fast"); err == nil {
 		t.Fatalf("model not in any config should be rejected for bare cwd")
 	}
 }
@@ -308,11 +308,11 @@ func TestValidateModelForCwdAcceptsExtraAllowed(t *testing.T) {
 }
 
 func TestReadModelOptionsIncludesAnthropicModelEnv(t *testing.T) {
-	t.Setenv("ANTHROPIC_MODEL", "deepseek-v4-flash")
+	t.Setenv("ANTHROPIC_MODEL", "anthropic-compatible-fast")
 	got := ReadModelOptions("")
 	found := false
 	for _, m := range got {
-		if m == "deepseek-v4-flash" {
+		if m == "anthropic-compatible-fast" {
 			found = true
 		}
 	}
@@ -320,16 +320,16 @@ func TestReadModelOptionsIncludesAnthropicModelEnv(t *testing.T) {
 		t.Fatalf("ReadModelOptions should include ANTHROPIC_MODEL env value, got %v", got)
 	}
 	// And it's then accepted by the validator (offer == accept).
-	if err := ValidateModelForCwd("", "deepseek-v4-flash"); err != nil {
+	if err := ValidateModelForCwd("", "anthropic-compatible-fast"); err != nil {
 		t.Fatalf("env model should validate once offered, got %v", err)
 	}
 }
 
 func TestReadModelOptionDetailsResolvesAliasTargets(t *testing.T) {
-	t.Setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "deepseek-v4-pro")
-	t.Setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "deepseek-v4-flash")
-	t.Setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "deepseek-v4-flash")
-	t.Setenv("ANTHROPIC_MODEL", "deepseek-v4-flash")
+	t.Setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "anthropic-compatible-pro")
+	t.Setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "anthropic-compatible-fast")
+	t.Setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "anthropic-compatible-fast")
+	t.Setenv("ANTHROPIC_MODEL", "anthropic-compatible-fast")
 	t.Setenv("HOME", t.TempDir())
 
 	got := ReadModelOptionDetails("")
@@ -343,13 +343,13 @@ func TestReadModelOptionDetailsResolvesAliasTargets(t *testing.T) {
 	if opus.Value == "" {
 		t.Fatalf("expected opus option in %#v", got)
 	}
-	if opus.ResolvedModel != "deepseek-v4-pro" {
-		t.Fatalf("opus resolved_model = %q, want deepseek-v4-pro (options=%#v)", opus.ResolvedModel, got)
+	if opus.ResolvedModel != "anthropic-compatible-pro" {
+		t.Fatalf("opus resolved_model = %q, want anthropic-compatible-pro (options=%#v)", opus.ResolvedModel, got)
 	}
 	if err := ValidateModelForCwd("", "opus"); err != nil {
 		t.Fatalf("alias value should validate: %v", err)
 	}
-	if err := ValidateModelForCwd("", "deepseek-v4-pro"); err != nil {
+	if err := ValidateModelForCwd("", "anthropic-compatible-pro"); err != nil {
 		t.Fatalf("resolved alias target should validate: %v", err)
 	}
 	if err := ValidateModelForCwd("", "gpt-make-believe"); err == nil {
@@ -365,8 +365,8 @@ func TestReadModelOptionDetailsUsesClaudeSettingsEnv(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(configDir, "settings.json"), []byte(`{
 		"env": {
-			"ANTHROPIC_MODEL": "deepseek-v4-flash",
-			"ANTHROPIC_DEFAULT_OPUS_MODEL": "deepseek-v4-pro"
+				"ANTHROPIC_MODEL": "anthropic-compatible-fast",
+				"ANTHROPIC_DEFAULT_OPUS_MODEL": "anthropic-compatible-pro"
 		}
 	}`), 0o600); err != nil {
 		t.Fatalf("write settings: %v", err)
@@ -382,28 +382,28 @@ func TestReadModelOptionDetailsUsesClaudeSettingsEnv(t *testing.T) {
 		switch opt.Value {
 		case "opus":
 			opus = opt
-		case "deepseek-v4-flash":
+			case "anthropic-compatible-fast":
 			settingsDefault = opt
 		}
 	}
-	if opus.ResolvedModel != "deepseek-v4-pro" {
+	if opus.ResolvedModel != "anthropic-compatible-pro" {
 		t.Fatalf("opus resolved_model = %q, want settings env target (options=%#v)", opus.ResolvedModel, got)
 	}
 	if settingsDefault.Source != "claude_settings_env" {
 		t.Fatalf("settings default source = %q, want claude_settings_env (options=%#v)", settingsDefault.Source, got)
 	}
-	if err := ValidateModelForCwd("", "deepseek-v4-pro"); err != nil {
+	if err := ValidateModelForCwd("", "anthropic-compatible-pro"); err != nil {
 		t.Fatalf("settings env resolved target should validate: %v", err)
 	}
-	if got := EffectiveDefaultModel(""); got != "deepseek-v4-flash" {
+	if got := EffectiveDefaultModel(""); got != "anthropic-compatible-fast" {
 		t.Fatalf("EffectiveDefaultModel = %q, want settings env ANTHROPIC_MODEL", got)
 	}
 }
 
 func TestEffectiveDefaultModelFallsBackToAnthropicModelEnv(t *testing.T) {
-	t.Setenv("ANTHROPIC_MODEL", "deepseek-v4-flash")
+	t.Setenv("ANTHROPIC_MODEL", "anthropic-compatible-fast")
 	// Empty cwd + (assume) no config model → env is the effective default.
-	if got := EffectiveDefaultModel(t.TempDir()); got != "deepseek-v4-flash" {
+	if got := EffectiveDefaultModel(t.TempDir()); got != "anthropic-compatible-fast" {
 		// Allow a project/user config to win if the test host has one,
 		// but the bare-temp-dir case should surface the env value.
 		t.Logf("EffectiveDefaultModel = %q (env fallback expected unless host config overrides)", got)
@@ -416,11 +416,11 @@ func TestEffectiveDefaultModelFallsBackToAnthropicModelEnv(t *testing.T) {
 func TestEffectiveDefaultModelReadsProjectConfig(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"model":"deepseek-v4-flash"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, ".claude.json"), []byte(`{"model":"anthropic-compatible-fast"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := EffectiveDefaultModel(dir); got != "deepseek-v4-flash" {
-		t.Fatalf("EffectiveDefaultModel(%q) = %q, want deepseek-v4-flash", dir, got)
+	if got := EffectiveDefaultModel(dir); got != "anthropic-compatible-fast" {
+		t.Fatalf("EffectiveDefaultModel(%q) = %q, want anthropic-compatible-fast", dir, got)
 	}
 }
 
@@ -431,7 +431,7 @@ func TestEffectiveDefaultModelEmptyDirDoesNotLeakProjectModel(t *testing.T) {
 	// config, which is fine — we only guard against the wrong project
 	// value bleeding in.)
 	dir := t.TempDir()
-	if got := EffectiveDefaultModel(dir); got == "deepseek-v4-flash" {
+	if got := EffectiveDefaultModel(dir); got == "anthropic-compatible-fast" {
 		t.Fatalf("empty project dir leaked a project model: %q", got)
 	}
 }

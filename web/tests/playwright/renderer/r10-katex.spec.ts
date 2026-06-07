@@ -5,12 +5,10 @@
 
 import { test, expect } from "@playwright/test";
 
-// R10 — KaTeX math (lazy).
-// Cases R10-1 (block math renders), R10-2 (inline math renders),
-// R10-3 (currency-only fixture does NOT trigger lazy load).
+// KaTeX math lazy loading.
 
-test.describe("R10 KaTeX math rendering", () => {
-  test("R10-1 / R10-2 block + inline math render via KaTeX", async ({ page }) => {
+test.describe("KaTeX math rendering", () => {
+  test("block + inline math render via KaTeX", async ({ page }) => {
     const katexRequests: string[] = [];
     page.on("request", (req) => {
       if (req.url().includes("katex")) katexRequests.push(req.url());
@@ -31,7 +29,7 @@ test.describe("R10 KaTeX math rendering", () => {
     expect(katexRequests.length).toBeGreaterThanOrEqual(1);
   });
 
-  test("R10-3 currency-only content does NOT trigger katex lazy-load", async ({ page }) => {
+  test("currency-only content does not trigger katex lazy-load", async ({ page }) => {
     const katexRequests: string[] = [];
     page.on("request", (req) => {
       if (req.url().includes("katex")) katexRequests.push(req.url());

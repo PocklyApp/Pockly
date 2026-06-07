@@ -48,7 +48,7 @@ Your next response will be slower and use more tokens
 
 This conversation is cached for the current model.
 
-❯ 1. Yes, switch to deepseek-v4-flash
+❯ 1. Yes, switch to anthropic-compatible-fast
   2. No, go back
 `
 	if !detectModelSwitchPrompt(screen) {
@@ -65,7 +65,7 @@ func TestModelSwitchConfirmerWritesEnter(t *testing.T) {
 		writes <- string(p)
 		return len(p), nil
 	})
-	confirmer.Feed([]byte("Switch model?\n1. Yes, switch to deepseek-v4-flash\n2. No, go back\n"))
+	confirmer.Feed([]byte("Switch model?\n1. Yes, switch to anthropic-compatible-fast\n2. No, go back\n"))
 	select {
 	case got := <-writes:
 		if got != "\r" {

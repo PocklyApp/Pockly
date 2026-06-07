@@ -52,10 +52,10 @@ lint:
 version: build
 	./bin/$(BIN) --version
 
-# Live regression sweep against the running daemon. Runs the three
-# v0.1.43+/v0.2.0 scenarios in order and prints a summary line. Needs
-# a wrapped `claude` somewhere on the host so a live terminal_session
-# is registered. Exits non-zero if any scenario fails. Total ~10s.
+# Live regression sweep against the running daemon. Runs the scenario
+# suite and prints a summary line. Needs a wrapped `claude` somewhere
+# on the host so a live terminal_session is registered. Exits non-zero
+# if any scenario fails. Total ~10s.
 regression: build
 	@echo "=== permission-card ==="
 	@./bin/$(BIN) test-scenario permission-card | tail -3

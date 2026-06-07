@@ -5,9 +5,7 @@
 
 import { test, expect } from "@playwright/test";
 
-// R5 — AskUserQuestion interactive picker.
-// Cases R5-1 (options render), R5-2 (single click + dispatch),
-// R5-3 (multi staging), R5-4 (multi send concatenation).
+// AskUserQuestion interactive picker.
 //
 // The picker dispatches a window CustomEvent "pockly:answer-question".
 // In the workspace, App.tsx listens for it and forwards to
@@ -24,8 +22,8 @@ const installAnswerCapture = `
   });
 `;
 
-test.describe("R5 AskUserQuestion picker", () => {
-  test("R5-1 single-select question renders one button per option", async ({ page }) => {
+test.describe("AskUserQuestion picker", () => {
+  test("single-select question renders one button per option", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r5-question-single");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {
       (d as HTMLDetailsElement).open = true;
@@ -35,7 +33,7 @@ test.describe("R5 AskUserQuestion picker", () => {
     await expect(page.locator(".tool-question-send")).toHaveCount(0);
   });
 
-  test("R5-2 single-select click dispatches the event and disables buttons", async ({ page }) => {
+  test("single-select click dispatches the event and disables buttons", async ({ page }) => {
     await page.addInitScript(installAnswerCapture);
     await page.goto("/test/renderer?fixture=r5-question-single");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {
@@ -54,7 +52,7 @@ test.describe("R5 AskUserQuestion picker", () => {
     expect(captured[0].text).toContain("Green");
   });
 
-  test("R5-3 multi-select staging shows .is-picked + enables Send N", async ({ page }) => {
+  test("multi-select staging shows .is-picked + enables Send N", async ({ page }) => {
     await page.goto("/test/renderer?fixture=r5-question-multi");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {
       (d as HTMLDetailsElement).open = true;
@@ -69,7 +67,7 @@ test.describe("R5 AskUserQuestion picker", () => {
     await expect(send).toContainText(/2/); // "Send 2"
   });
 
-  test("R5-4 multi-select Send dispatches a single concatenated answer", async ({ page }) => {
+  test("multi-select Send dispatches a single concatenated answer", async ({ page }) => {
     await page.addInitScript(installAnswerCapture);
     await page.goto("/test/renderer?fixture=r5-question-multi");
     await page.locator("details.tool-card-oneliner").first().evaluate((d) => {

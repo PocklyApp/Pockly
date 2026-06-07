@@ -14,6 +14,8 @@
  * security model) — keep it in sync with the code, not with marketing copy.
  */
 
+import { configuredInstallUnixCommand, configuredInstallWindowsCommand } from "../runtime-config";
+
 export type DocsBlock =
   | { kind: "p"; text: string }
   | { kind: "subhead"; text: string }
@@ -53,12 +55,12 @@ export function getDocsSections(lang: string): DocsSection[] {
             {
               term: tr("Daemon (your computer)", "守护进程（你的电脑）"),
               desc: tr(
-                "A small background program you install once. It watches your local Claude Code / Codex sessions and keeps an outbound connection to the relay. Nothing inbound is exposed.",
-                "你只需安装一次的小型后台程序。它监视本地的 Claude Code / Codex 会话，并与 relay 保持一条出站连接，不暴露任何入站端口。"
+                "A small background program you install once. It watches your local Claude Code / Codex sessions and keeps an outbound connection to Pockly Nexus. Nothing inbound is exposed.",
+                "你只需安装一次的小型后台程序。它监视本地的 Claude Code / Codex 会话，并与 Pockly Nexus 保持一条出站连接，不暴露任何入站端口。"
               ),
             },
             {
-              term: tr("Relay (the cloud, pockly.example)", "Relay（云端，pockly.example）"),
+              term: tr("Pockly Nexus (the connection layer)", "Pockly Nexus（连接层）"),
               desc: tr(
                 "The message hub. It forwards session events between your computer and your phone, and serves the web app. It never sees your model API keys.",
                 "消息中枢。它在你的电脑和手机之间转发会话事件，并提供 Web 应用。它从不接触你的模型 API key。"
@@ -77,8 +79,8 @@ export function getDocsSections(lang: string): DocsSection[] {
         {
           kind: "p",
           text: tr(
-            "When you send a prompt from your phone, it goes web → relay → your computer's daemon → the agent. The agent's output (text, thinking, tool calls, file edits, test results) streams back the same way and renders live on your phone.",
-            "当你从手机发送一条 prompt 时，路径是 Web → relay → 你电脑上的守护进程 → agent。agent 的输出（文本、思考、工具调用、文件改动、测试结果）沿同样的路径流回，并在手机上实时渲染。"
+            "When you send a prompt from your phone, it goes web → Pockly Nexus → your computer's daemon → the agent. The agent's output (text, thinking, tool calls, file edits, test results) streams back the same way and renders live on your phone.",
+            "当你从手机发送一条 prompt 时，路径是 Web → Pockly Nexus → 你电脑上的守护进程 → agent。agent 的输出（文本、思考、工具调用、文件改动、测试结果）沿同样的路径流回，并在手机上实时渲染。"
           ),
         },
         {
@@ -133,9 +135,9 @@ export function getDocsSections(lang: string): DocsSection[] {
           ),
         },
         { kind: "subhead", text: tr("macOS / Linux", "macOS / Linux") },
-        { kind: "command", code: "curl -fsSL https://cdn.pockly.example/install.sh | bash" },
+        { kind: "command", code: configuredInstallUnixCommand() },
         { kind: "subhead", text: tr("Windows (PowerShell)", "Windows（PowerShell）") },
-        { kind: "command", code: "irm https://cdn.pockly.example/install.ps1 | iex" },
+        { kind: "command", code: configuredInstallWindowsCommand() },
         { kind: "subhead", text: tr("What gets installed", "安装了什么") },
         {
           kind: "defs",
@@ -189,8 +191,8 @@ export function getDocsSections(lang: string): DocsSection[] {
           kind: "steps",
           items: [
             tr(
-              "The installer opens pockly.example in your default browser.",
-              "安装程序会在默认浏览器中打开 pockly.example。"
+              "The installer opens your Pockly web app in your default browser.",
+              "安装程序会在默认浏览器中打开你的 Pockly Web 应用。"
             ),
             tr(
               "Sign in to (or create) your Pockly account.",
@@ -201,8 +203,8 @@ export function getDocsSections(lang: string): DocsSection[] {
               "确认“连接这台电脑？”并授权。Pockly 就在电脑本机把守护进程绑定到你的账号。"
             ),
             tr(
-              "The daemon connects to the relay and a success page shows a QR code for joining on your phone.",
-              "守护进程连接到 relay，成功页会显示一个用于在手机上加入的二维码。"
+              "The daemon connects to Pockly Nexus and a success page shows a QR code for joining on your phone.",
+              "守护进程连接到 Pockly Nexus，成功页会显示一个用于在手机上加入的二维码。"
             ),
           ],
         },
@@ -234,8 +236,8 @@ export function getDocsSections(lang: string): DocsSection[] {
           kind: "steps",
           items: [
             tr(
-              "Scan the QR code shown after setup (or open Devices in the workspace and tap \"Add a phone\" to show a fresh one).",
-              "扫描 setup 完成后显示的二维码（或在工作区打开“设备”，点“添加手机”生成一个新的）。"
+              "Scan the QR code shown after setup (or open Connected computers in the workspace and tap \"Add a phone\" to show a fresh one).",
+              "扫描 setup 完成后显示的二维码（或在工作区打开“已连接电脑”，点“添加手机”生成一个新的）。"
             ),
             tr(
               "The link opens the workspace on your phone and joins your account — no password to type. The QR is one-time and short-lived.",
@@ -463,8 +465,8 @@ export function getDocsSections(lang: string): DocsSection[] {
         {
           kind: "note",
           text: tr(
-            "\"Bypass permissions\" is intentionally disabled — Pockly will not let a remote phone turn off all approval prompts.",
-            "“Bypass permissions”被刻意禁用——Pockly 不允许远程手机关闭全部审批提示。"
+            "Available permission modes come from the connected agent and runtime. Pockly forwards the selected native mode; it does not create a separate approval policy.",
+            "可用权限模式来自已连接的 agent 和运行时。Pockly 只转发你选择的原生模式，不创建另一套审批策略。"
           ),
         },
       ],
@@ -478,8 +480,8 @@ export function getDocsSections(lang: string): DocsSection[] {
         {
           kind: "p",
           text: tr(
-            "Connect up to 8 computers to one account — a work laptop, a home box, a dev VM. Each one keeps its own session list; nothing cross-mixes. Switch between them from the device menu in the workspace header, and the conversation list updates to that machine.",
-            "一个账号最多可连接 8 台电脑——工作笔记本、家用主机、开发 VM。每台都保留自己的会话列表，互不混淆。在工作区头部的设备菜单中切换，对话列表会更新为那台机器的内容。"
+            "Connect up to 8 computers to one account — a work laptop, a home box, a dev VM. Each one keeps its own session list; nothing cross-mixes. Switch between them from the computer menu in the workspace header, and the conversation list updates to that computer.",
+            "一个账号最多可连接 8 台电脑——工作笔记本、家用主机、开发 VM。每台都保留自己的会话列表，互不混淆。在工作区头部的电脑菜单中切换，对话列表会更新为那台电脑的内容。"
           ),
         },
       ],
@@ -516,20 +518,20 @@ export function getDocsSections(lang: string): DocsSection[] {
           kind: "list",
           items: [
             tr(
-              "Your agent runtime and API keys never leave your computer. The relay never sees them — it only forwards session events.",
-              "你的 agent 运行环境和 API key 绝不离开你的电脑。relay 从不接触它们——只转发会话事件。"
+              "Your agent runtime and API keys never leave your computer. Pockly Nexus never sees them — it only forwards session events.",
+              "你的 agent 运行环境和 API key 绝不离开你的电脑。Pockly Nexus 从不接触它们——只转发会话事件。"
             ),
             tr(
               "Traffic is protected by TLS in transit (HTTPS / secure WebSockets).",
               "传输全程由 TLS 保护（HTTPS / 安全 WebSocket）。"
             ),
             tr(
-              "Session history is stored on Pockly's servers so you can pick up a conversation on any device. It is not end-to-end encrypted.",
-              "会话历史存储在 Pockly 的服务器上，方便你在任意设备上接续对话。它不是端到端加密的。"
+              "Session history is stored on Nexus so you can pick up a conversation in any signed-in browser.",
+              "会话历史存储在 Nexus 上，方便你在任意已登录浏览器中接续对话。"
             ),
             tr(
-              "Each browser is authorized as its own device. Use \"Sign this browser out\" to remove access from one browser, and revoke a computer from Devices to cut it off entirely.",
-              "每个浏览器都作为独立设备被授权。用“将此浏览器登出”移除单个浏览器的访问；在“设备”中吊销一台电脑以彻底切断它。"
+              "Each browser keeps its own local access key. Use \"Sign this browser out\" to remove access from one browser, and revoke a computer from Connected computers to cut that computer off entirely.",
+              "每个浏览器都会保存自己的本地访问密钥。用“将此浏览器登出”移除单个浏览器的访问；在“已连接电脑”中吊销一台电脑以彻底切断那台电脑。"
             ),
           ],
         },
@@ -554,22 +556,22 @@ export function getDocsSections(lang: string): DocsSection[] {
             {
               term: tr("\"This computer is offline\"", "“这台电脑已离线”"),
               desc: tr(
-                "The daemon isn't reaching the relay. It should auto-run, but you can check it on the computer with the status command below, then refresh the page.",
-                "守护进程未能连上 relay。它本应自动运行，你可以在电脑上用下面的 status 命令检查，然后刷新页面。"
+                "The daemon isn't reaching Pockly Nexus. It should auto-run, but you can check it on the computer with the status command below, then refresh the page.",
+                "守护进程未能连上 Pockly Nexus。它本应自动运行，你可以在电脑上用下面的 status 命令检查，然后刷新页面。"
               ),
             },
             {
               term: tr("\"Still connecting\"", "“仍在连接”"),
               desc: tr(
-                "The daemon is reaching the relay — give it a few seconds. Sessions become writable once it's fully online.",
-                "守护进程正在连接 relay——稍等几秒。完全在线后会话即可写入。"
+                "The daemon is reaching Pockly Nexus — give it a few seconds. Sessions become writable once it's fully online.",
+                "守护进程正在连接 Pockly Nexus——稍等几秒。完全在线后会话即可写入。"
               ),
             },
             {
               term: tr("Can't load a conversation / access not ready", "无法加载对话 / 访问未就绪"),
               desc: tr(
-                "This browser isn't authorized yet. Sign in again on this browser, or open Pockly on the device that's already connected to the computer.",
-                "此浏览器尚未获授权。在此浏览器重新登录，或在已连接到该电脑的设备上打开 Pockly。"
+                "This browser isn't authorized yet. Sign in again on this browser, or open Pockly in a browser that already has access.",
+                "此浏览器尚未获授权。请在此浏览器重新登录，或在已有访问权限的浏览器中打开 Pockly。"
               ),
             },
             {
@@ -604,7 +606,7 @@ export function getDocsSections(lang: string): DocsSection[] {
           kind: "defs",
           items: [
             { term: "pockly-daemon setup", desc: tr("Connect this computer and (re)install the background service.", "连接这台电脑并（重新）安装后台服务。") },
-            { term: "pockly-daemon serve", desc: tr("Run the daemon in the foreground (watch sessions, connect to relay).", "在前台运行守护进程（监视会话、连接 relay）。") },
+            { term: "pockly-daemon serve", desc: tr("Run the daemon in the foreground (watch sessions, connect to Pockly Nexus).", "在前台运行守护进程（监视会话、连接 Pockly Nexus）。") },
             { term: "pockly-daemon login", desc: tr("Log this daemon into a Pockly account.", "把这个守护进程登录到一个 Pockly 账号。") },
             { term: "pockly-daemon status", desc: tr("Print daemon health.", "打印守护进程健康状态。") },
             { term: "pockly-daemon update", desc: tr("Check for and install a newer daemon (alias: upgrade).", "检查并安装更新版守护进程（别名：upgrade）。") },
@@ -645,8 +647,8 @@ export function getDocsSections(lang: string): DocsSection[] {
         {
           kind: "p",
           text: tr(
-            "Then remove the daemon binary, and revoke the computer from Devices in the workspace if you want to cut its access immediately.",
-            "随后删除守护进程二进制文件；如果想立即切断它的访问，在工作区的“设备”中吊销这台电脑。"
+            "Then remove the daemon binary, and revoke the computer from Connected computers in the workspace if you want to cut its access immediately.",
+            "随后删除守护进程二进制文件；如果想立即切断它的访问，在工作区的“已连接电脑”中吊销这台电脑。"
           ),
         },
       ],

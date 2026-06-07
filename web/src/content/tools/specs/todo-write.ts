@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — TodoWrite spec.
+// TodoWrite spec.
 //
 // Selects body="todo" so ToolCallCard mounts ToolTodoView with the
 // extracted entries. State label rolls up "X of N done" for a quick

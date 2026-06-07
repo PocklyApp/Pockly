@@ -8,10 +8,9 @@ import { ed25519 } from "@noble/curves/ed25519";
 const browserStateKey = "pockly.browser_device";
 const nobleEd25519Prefix = "noble-ed25519:";
 
-// E2E session encryption was removed: session content is stored in plaintext on
-// the relay and protected in transit by TLS. The only key the browser keeps is
-// the Ed25519 SIGNING key — it is NOT payload encryption; it authenticates this
-// browser device to the relay via the device-challenge/verify handshake.
+// Browser state now stores only an Ed25519 signing key. It authenticates this
+// login endpoint to Nexus via the device-challenge/verify handshake; it is not
+// used to transform session history.
 export type BrowserDeviceState = {
   deviceId?: string;
   devicePublicKey: string;
@@ -52,9 +51,9 @@ export async function clearBrowserDeviceState() {
 export async function ensureBrowserDeviceState(): Promise<BrowserDeviceState> {
   const existing = loadBrowserDeviceState();
   if (existing?.devicePublicKey && existing?.devicePrivateKeyPkcs8) {
-    // Existing device (incl. ones that still carry a now-unused e2ePublicKey in
-    // localStorage from before E2E removal) — keep the Ed25519 signing key so
-    // the device stays paired; no re-registration needed.
+    // Existing device, including older localStorage blobs that may carry unused
+    // legacy key fields. Keep the Ed25519 signing key so the browser stays
+    // authorized; no re-registration needed.
     return existing;
   }
 
@@ -75,7 +74,7 @@ export function persistBrowserTokens(payload: {
 }) {
   const current = loadBrowserDeviceState();
   if (!current) {
-    throw new Error("browser device state missing");
+    throw new Error("browser access state missing");
   }
   const next: BrowserDeviceState = {
     ...current,

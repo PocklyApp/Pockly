@@ -5,7 +5,7 @@
 // integrations (claude-code, codex, future hermes / opencode / openclaw).
 //
 // Subpackages under internal/agent/<name>/ produce these types from each
-// agent's session storage. The relay forwards them to the web app unchanged
+// agent's session storage. Nexus forwards them to the web app unchanged
 // — they are the daemon ↔ browser canonical form.
 package agent
 
@@ -123,12 +123,11 @@ type Session struct {
 	// FirstMessage is the plaintext of the first user message in the
 	// session (whitespace-collapsed, command/system-reminder tags
 	// stripped, truncated). Populated by the indexer for catalog use.
-	// Never leaves the daemon in plaintext: catalog sync encrypts it
-	// per-recipient before upload.
+	// Sent in catalog sync so Nexus can build useful session labels.
 	FirstMessage string `json:"first_message,omitempty"`
 	// FirstMessageForTitle is a longer (≈800 char) cleaned copy of the
 	// first user message. Same stripping as FirstMessage but a higher cap;
-	// the relay summarizes it into a session title. Stays on the daemon
+	// Nexus summarizes it into a session title. Stays on the daemon
 	// except as a plaintext catalog-sync field.
 	FirstMessageForTitle string `json:"first_message_for_title,omitempty"`
 }

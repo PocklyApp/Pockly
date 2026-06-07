@@ -63,13 +63,13 @@ func TestLatestModel(t *testing.T) {
 		`{"type":"user","message":{"role":"user","content":"hi"}}`,
 		`{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-5","content":[]}}`,
 		`not-json`,
-		`{"type":"assistant","message":{"role":"assistant","model":"deepseek-v4-flash","content":[]}}`,
+		`{"type":"assistant","message":{"role":"assistant","model":"anthropic-compatible-fast","content":[]}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if got := LatestModel(path); got != "deepseek-v4-flash" {
-		t.Fatalf("LatestModel = %q, want deepseek-v4-flash (last assistant turn)", got)
+	if got := LatestModel(path); got != "anthropic-compatible-fast" {
+		t.Fatalf("LatestModel = %q, want anthropic-compatible-fast (last assistant turn)", got)
 	}
 }
 
@@ -78,21 +78,21 @@ func TestLatestCurrentModelUsesLastModelEvent(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sess.jsonl")
 	body := strings.Join([]string{
-		`{"type":"assistant","message":{"role":"assistant","model":"deepseek-v4-flash","content":[]}}`,
-		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mdeepseek-v4-pro\u001b[22m for this session</local-command-stdout>"}}`,
+		`{"type":"assistant","message":{"role":"assistant","model":"anthropic-compatible-fast","content":[]}}`,
+		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1manthropic-compatible-pro\u001b[22m for this session</local-command-stdout>"}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if got := LatestCurrentModel(path); got != "deepseek-v4-pro" {
+	if got := LatestCurrentModel(path); got != "anthropic-compatible-pro" {
 		t.Fatalf("LatestCurrentModel = %q, want latest /model stdout target", got)
 	}
 
-	body += `{"type":"assistant","message":{"role":"assistant","model":"deepseek-v4-flash","content":[]}}` + "\n"
+	body += `{"type":"assistant","message":{"role":"assistant","model":"anthropic-compatible-fast","content":[]}}` + "\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
-	if got := LatestCurrentModel(path); got != "deepseek-v4-flash" {
+	if got := LatestCurrentModel(path); got != "anthropic-compatible-fast" {
 		t.Fatalf("LatestCurrentModel = %q, want latest assistant model", got)
 	}
 }
@@ -119,10 +119,10 @@ func TestLatestModelCommandTarget(t *testing.T) {
 	path := filepath.Join(dir, "sess.jsonl")
 	body := strings.Join([]string{
 		`{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-args>opus</command-args>"}}`,
-		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mdeepseek-v4-pro\u001b[22m for this session</local-command-stdout>"}}`,
-		`{"type":"assistant","message":{"role":"assistant","model":"deepseek-v4-pro","content":[]}}`,
-		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mdeepseek-v4-flash\u001b[22m for this session</local-command-stdout>"}}`,
-		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1mdeepseek-v4-pro\u001b[22m and saved as your default for new sessions</local-command-stdout>"}}`,
+		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1manthropic-compatible-pro\u001b[22m for this session</local-command-stdout>"}}`,
+		`{"type":"assistant","message":{"role":"assistant","model":"anthropic-compatible-pro","content":[]}}`,
+		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1manthropic-compatible-fast\u001b[22m for this session</local-command-stdout>"}}`,
+		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to \u001b[1manthropic-compatible-pro\u001b[22m and saved as your default for new sessions</local-command-stdout>"}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
@@ -131,13 +131,13 @@ func TestLatestModelCommandTarget(t *testing.T) {
 	if got.Count != 3 {
 		t.Fatalf("Count = %d, want 3", got.Count)
 	}
-	if got.LatestTarget != "deepseek-v4-pro" {
-		t.Fatalf("LatestTarget = %q, want deepseek-v4-pro", got.LatestTarget)
+	if got.LatestTarget != "anthropic-compatible-pro" {
+		t.Fatalf("LatestTarget = %q, want anthropic-compatible-pro", got.LatestTarget)
 	}
-	if got := CountModelCommandTarget(path, "deepseek-v4-pro"); got != 2 {
+	if got := CountModelCommandTarget(path, "anthropic-compatible-pro"); got != 2 {
 		t.Fatalf("CountModelCommandTarget(pro) = %d, want 2", got)
 	}
-	if got := CountModelCommandTarget(path, "deepseek-v4-flash"); got != 1 {
+	if got := CountModelCommandTarget(path, "anthropic-compatible-fast"); got != 1 {
 		t.Fatalf("CountModelCommandTarget(flash) = %d, want 1", got)
 	}
 	if got := CountModelCommandTarget(path, "missing-model"); got != 0 {
@@ -162,12 +162,12 @@ func writeFixture(t *testing.T) string {
 func writeLossyDirFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	projectDir := filepath.Join(dir, "-Users-james-Documents-Codex-2026-05-19-https-github-com-pocklyapp-https-github")
+	projectDir := filepath.Join(dir, "-Users-dev-Documents-Codex-2026-05-19-https-github-com-pocklyapp-https-github")
 	if err := os.MkdirAll(projectDir, 0o755); err != nil {
 		t.Fatalf("mkdir lossy fixture: %v", err)
 	}
 	body := strings.TrimSpace(`
-{"type":"user","message":{"role":"user","content":"hello"},"uuid":"u-user","timestamp":"2026-05-17T12:00:00Z","sessionId":"sess-lossy","cwd":"/Users/james/Documents/Codex/2026-05-19/https-github-com-pocklyapp-https-github"}
+{"type":"user","message":{"role":"user","content":"hello"},"uuid":"u-user","timestamp":"2026-05-17T12:00:00Z","sessionId":"sess-lossy","cwd":"/Users/dev/Documents/Codex/2026-05-19/https-github-com-pocklyapp-https-github"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"uuid":"u-asst","timestamp":"2026-05-17T12:00:01Z","sessionId":"sess-lossy"}
 `) + "\n"
 	if err := os.WriteFile(filepath.Join(projectDir, "sess-lossy.jsonl"), []byte(body), 0o644); err != nil {
@@ -241,7 +241,7 @@ func TestListProjects_PrefersRecordedCwdForLossyDirName(t *testing.T) {
 	if len(projects) != 1 {
 		t.Fatalf("expected 1 project, got %d", len(projects))
 	}
-	if got, want := projects[0].Cwd, "/Users/james/Documents/Codex/2026-05-19/https-github-com-pocklyapp-https-github"; got != want {
+	if got, want := projects[0].Cwd, "/Users/dev/Documents/Codex/2026-05-19/https-github-com-pocklyapp-https-github"; got != want {
 		t.Fatalf("Cwd = %q, want %q", got, want)
 	}
 }

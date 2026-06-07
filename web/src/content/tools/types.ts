@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Per-tool config registry types.
+// Per-tool config registry types.
 //
 // A ToolSpec is a pure function bundle that turns a tool_call payload
 // into ToolDisplay metadata. The rendering component (ToolCallCard in
@@ -13,7 +13,7 @@
 // Specs hold NO React — they're pure TS, unit-testable without DOM.
 // React presentation lives in App.tsx where the existing primitives
 // (ToolOnelinerSummary, ToolRows, ToolDiffView, ToolTodoView,
-// ToolQuestionCard) already cover the body kinds we ship in R2.
+// ToolQuestionCard) already cover the body kinds currently shipped.
 //
 // Adding a new tool: drop a file under specs/, register it in
 // registry.ts. The registry matches in array order; the default spec
@@ -27,10 +27,10 @@ export type ToolRow = { key: string; value: string };
 // ToolCallCard's dispatch. "rows-and-raw" is the default — key/value
 // rows on top + collapsible raw input/result blocks.
 //
-// "command" (R3): terminal-styled block highlighting the shell command
+// "command": terminal-styled block highlighting the shell command
 // + one-click copy. Bash and shell aliases use this.
 //
-// "plan" (R4): renders ExitPlanMode's input.plan as a markdown panel
+// "plan": renders ExitPlanMode's input.plan as a markdown panel
 // with an accent-bordered card and an "awaiting approval" footer.
 export type ToolBodyKind = "diff" | "todo" | "question" | "command" | "plan" | "rows-and-raw";
 

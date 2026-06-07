@@ -60,8 +60,8 @@ func TestRefreshBuildsSnapshot(t *testing.T) {
 				t.Fatalf("claude session id = %q", s.SessionID)
 			}
 			// Snippet stays a non-sensitive synthesised title. The
-			// catalog rides the relay in plaintext, so any user prompt
-			// content here would defeat the E2E story.
+			// catalog is server-stored, so raw user prompt content here
+			// would leak into sidebar metadata.
 			if !strings.Contains(s.Snippet, "project") || !strings.Contains(s.Snippet, "Claude Code") {
 				t.Fatalf("claude snippet = %q", s.Snippet)
 			}
@@ -205,4 +205,3 @@ func expectNoChange(t *testing.T, ch <-chan struct{}) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
-

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Write spec.
+// Write spec.
 //
 // Treated as Edit-with-empty-old: the existing extractEditPairs
 // returns a synthetic pair (old="" vs new=content) so ToolDiffView

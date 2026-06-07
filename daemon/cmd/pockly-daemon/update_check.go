@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,11 +14,12 @@ import (
 )
 
 // updateChecker keeps a most-recent snapshot of "is there a newer
-// pockly-daemon on the CDN?" for the /api/status endpoint to surface to
-// the web UI. It is the read-only counterpart to the `pockly-daemon
+// pockly-daemon at the configured release source?" for the /api/status
+// endpoint to surface to the web UI. It is the read-only counterpart to the
+// `pockly-daemon
 // update` subcommand — never installs anything, only reports.
 //
-// Polling cadence: every 24 hours. The CDN's checksums.txt is tiny
+// Polling cadence: every 24 hours. The release checksums.txt is tiny
 // (~600 bytes) and cached aggressively, so this could run hourly
 // without measurable cost, but 24h is what users expect from a daemon
 // upgrade indicator. First check fires immediately on serve start so
@@ -56,7 +58,7 @@ func (u *updateChecker) Snapshot() api.UpdateInfo {
 // goroutine spawned from runServe.
 func (u *updateChecker) Run(ctx context.Context) {
 	// Initial check fires now so /api/status has fresh data within
-	// seconds of daemon start (instead of stale until tomorrow). We
+	// seconds of daemon start instead of waiting for the next interval. We
 	// tolerate failure quietly — the first /api/status response will
 	// just lack a latest version, which the web treats as "no update
 	// info available."
@@ -85,6 +87,9 @@ func (u *updateChecker) runOnce() {
 		u.mu.Unlock()
 	}()
 
+	if strings.TrimSpace(updateBaseURL) == "" {
+		return
+	}
 	manifest, err := fetchChecksumManifest("latest", false)
 	if err != nil {
 		info.Error = err.Error()

@@ -58,12 +58,12 @@ func runClaudeStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	identityFile := fs.String("identity-file", identityPath, "device identity file path")
+	identityFile := pathFlag(fs, "identity-file", identityPath, "device identity file path")
 	relayStatePath, err := relay.DefaultStatePath()
 	if err != nil {
 		return err
 	}
-	relayStateFile := fs.String("relay-state-file", relayStatePath, "relay state file path")
+	relayStateFile := pathFlag(fs, "relay-state-file", relayStatePath, "legacy Nexus state file path")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -281,8 +281,9 @@ func formatClaudeCommandStatus(status claudeStatus) string {
 	if status.Linked {
 		b.WriteString(fmt.Sprintf("Remote access: %s\n", enabledText(status.RemoteAccess)))
 	}
-	b.WriteString("Workspace: https://pockly.example/workspace/sessions\n")
-	b.WriteString("Connect or re-pair: https://pockly.example/workspace/connect\n")
+	baseURL := strings.TrimRight(firstNonEmptyString(status.RelayURL, defaultNexusURL()), "/")
+	b.WriteString(fmt.Sprintf("Workspace: %s/workspace/sessions\n", baseURL))
+	b.WriteString(fmt.Sprintf("Connect or re-pair: %s/workspace/connect\n", baseURL))
 	return b.String()
 }
 
@@ -335,7 +336,7 @@ func removePocklySlashCommandIfOwned(path string) error {
 func isPocklySlashCommand(raw []byte) bool {
 	text := string(raw)
 	return strings.Contains(text, "claude-status --claude-command") &&
-		strings.Contains(text, "pockly.example/workspace")
+		strings.Contains(text, "/workspace")
 }
 
 func installClaudeStatusLine(settingsPath, exe string, force bool) (installed bool, skipped bool, err error) {

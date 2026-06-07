@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Tool spec registry.
+// Tool spec registry.
 //
 // Order matters: the first spec whose `match(name)` returns true wins.
 // Place specific specs above the default; the default's match is
@@ -45,9 +45,8 @@ export const toolSpecs: ToolSpec[] = [
   exitPlanModeSpec,
   // Subagent — Task carries description-as-arg + sidechain nesting.
   taskSpec,
-  // Bash + shell variants — common enough to pull above default but
-  // currently uses the same rows-and-raw body as default (R3 will
-  // give it its own terminal-styled body).
+  // Bash + shell variants — common enough to pull above default and render
+  // through the dedicated terminal-styled command body.
   bashSpec,
   // Catch-all. Keep last.
   defaultSpec,

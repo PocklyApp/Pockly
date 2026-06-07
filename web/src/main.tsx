@@ -17,13 +17,9 @@ if (!rootEl) throw new Error("missing #root");
 
 initObservability();
 
-// v0.1.37: catch-all for uncaught render/runtime errors. Until this hook
-// existed, a JS exception thrown deep inside React's render would white-
-// screen the user AND leave us blind cloud-side — there was no telemetry
-// path from "web crashed at customer X" to our dashboards unless they had
-// Faro enabled in runtime config. Now we POST one event to our own relay
-// so the dashboard sees it regardless of Faro's status. Truncate the
-// message + stack so a chatty stack trace can't blow the 80-char limit.
+// Catch-all for uncaught render/runtime errors. Open-source builds do not send
+// network diagnostics by default; reportWebTelemetry only posts when runtime
+// config explicitly enables a same-origin self-hosted provider.
 window.addEventListener("error", (event) => {
   reportWebTelemetry({
     name: "web_page_error",
@@ -40,10 +36,10 @@ window.addEventListener("unhandledrejection", (event) => {
   });
 });
 
-// Renderer fixture mode (dev-only). Visiting `/test/renderer?fixture=…`
+// Renderer fixture mode (dev-only). Visiting `/test/renderer?fixture=...`
 // on the vite dev server mounts a minimal synthetic session instead of
-// the full App, so Playwright L3 specs can assert against deterministic
-// R1–R10 rendering without going through auth / wrapper / relay.
+// the full App, so Playwright specs can assert rendering without going
+// through auth, wrapper, or Nexus.
 // `import.meta.env.DEV` is statically false in production builds, so
 // the dynamic import + the entire renderer-fixture module + its JSON
 // dependencies all tree-shake out of the prod bundle.

@@ -398,7 +398,7 @@ func TestExtractBlocksStripsModelSwitchANSI(t *testing.T) {
 	path := filepath.Join(dir, "model.jsonl")
 	// Build via json.Marshal so the real ESC byte (\x1b) becomes the exact
 	// \u001b JSON escape the real jsonl stores (a raw ESC in JSON is invalid).
-	content := "<local-command-stdout>Set model to \x1b[1mdeepseek-v4-flash\x1b[22m and saved as your default for new sessions</local-command-stdout>"
+	content := "<local-command-stdout>Set model to \x1b[1manthropic-compatible-fast\x1b[22m and saved as your default for new sessions</local-command-stdout>"
 	rec := map[string]any{
 		"type": "user", "uuid": "u1", "timestamp": "2026-06-01T00:00:00Z", "sessionId": "s",
 		"message": map[string]any{"role": "user", "content": content},
@@ -421,7 +421,7 @@ func TestExtractBlocksStripsModelSwitchANSI(t *testing.T) {
 	if strings.ContainsRune(text, '\x1b') || strings.Contains(text, "[1m") || strings.Contains(text, "[22m") {
 		t.Errorf("extracted text still carries terminal escapes: %q", text)
 	}
-	if !strings.Contains(text, "Set model to deepseek-v4-flash and saved") {
+	if !strings.Contains(text, "Set model to anthropic-compatible-fast and saved") {
 		t.Errorf("extracted text = %q, want the de-escaped confirmation", text)
 	}
 }

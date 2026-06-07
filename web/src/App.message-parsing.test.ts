@@ -53,20 +53,20 @@ test("parseUserMessage classifies a bare prompt as plain", () => {
 test("model pill labels aliases without reverse-selecting resolved targets", () => {
   const options = normalizeModelOptions(
     [
-      { value: "sonnet", label: "sonnet", resolved_model: "deepseek-v4-flash" },
-      { value: "opus", label: "opus", resolved_model: "deepseek-v4-pro" },
-      { value: "haiku", label: "haiku", resolved_model: "deepseek-v4-flash" },
-      { value: "deepseek-v4-flash", label: "deepseek-v4-flash", resolved_model: "deepseek-v4-flash" },
+      { value: "sonnet", label: "sonnet", resolved_model: "anthropic-compatible-fast" },
+      { value: "opus", label: "opus", resolved_model: "anthropic-compatible-pro" },
+      { value: "haiku", label: "haiku", resolved_model: "anthropic-compatible-fast" },
+      { value: "anthropic-compatible-fast", label: "anthropic-compatible-fast", resolved_model: "anthropic-compatible-fast" },
     ],
     [],
   );
 
-  assert.equal(modelOptionLabel(options[0]), "sonnet -> deepseek-v4-flash");
-  assert.equal(modelPillLabel("opus", "deepseek-v4-pro", options), "opus -> deepseek-v4-pro");
-  assert.equal(modelPillLabel("deepseek-v4-flash", "deepseek-v4-flash", options), "deepseek-v4-flash");
+  assert.equal(modelOptionLabel(options[0]), "sonnet -> anthropic-compatible-fast");
+  assert.equal(modelPillLabel("opus", "anthropic-compatible-pro", options), "opus -> anthropic-compatible-pro");
+  assert.equal(modelPillLabel("anthropic-compatible-fast", "anthropic-compatible-fast", options), "anthropic-compatible-fast");
   assert.deepEqual(
-    options.filter((option) => option.value === "deepseek-v4-flash").map((option) => option.value),
-    ["deepseek-v4-flash"],
+    options.filter((option) => option.value === "anthropic-compatible-fast").map((option) => option.value),
+    ["anthropic-compatible-fast"],
   );
 });
 
@@ -236,7 +236,7 @@ test("parseUserMessage hides Claude model switch command records", () => {
     assert.equal(commandResult.text, "");
   }
 
-  const stdout = "<local-command-stdout>Set model to deepseek-v4-flash and saved as your default for new sessions</local-command-stdout>";
+  const stdout = "<local-command-stdout>Set model to anthropic-compatible-fast and saved as your default for new sessions</local-command-stdout>";
   const stdoutResult = parseUserMessage(stdout);
   assert.equal(stdoutResult.kind, "plain");
   if (stdoutResult.kind === "plain") {
@@ -289,7 +289,7 @@ test("attachmentSummary summarizes deferred_tools_delta by addedLines count", ()
 
 test("attachmentSummary surfaces the first allowed tool for command_permissions", () => {
   const text = JSON.stringify({
-    allowedTools: ["Bash('/Users/james/.local/bin/pockly-daemon' claude-status --claude-command)"],
+    allowedTools: ["Bash('/Users/dev/.local/bin/pockly-daemon' claude-status --claude-command)"],
     type: "command_permissions",
   });
   const summary = attachmentSummary("command_permissions", text);
@@ -338,7 +338,7 @@ test("visibleConversationTurns hides empty and model-switch user messages", () =
     turn(1, "user_message", { text: "switching" }),
     turn(2, "user_message", { text: "" }),
     turn(3, "user_message", { text: "<command-name>/model</command-name>" }),
-    turn(4, "user_message", { text: "<local-command-stdout>Set model to deepseek-v4-flash and saved as your default for new sessions</local-command-stdout>" }),
+    turn(4, "user_message", { text: "<local-command-stdout>Set model to anthropic-compatible-fast and saved as your default for new sessions</local-command-stdout>" }),
     turn(5, "assistant_text", { text: "done" }),
   ];
 
@@ -435,11 +435,11 @@ test("reconcileHydratedTurns drops a live assistant turn once hydrated carries t
   // turn. After reconcile the reply must appear exactly once.
   const current = [
     turn(1, "user_message", { text: "pwd" }),
-    turn(1_000_000_002, "assistant_text", { text: "/Users/james/code/steward" }),
+    turn(1_000_000_002, "assistant_text", { text: "/Users/dev/code/steward" }),
   ];
   const hydrated = [
     turn(1, "user_message", { text: "pwd" }),
-    turn(8, "assistant_text", { text: "/Users/james/code/steward" }),
+    turn(8, "assistant_text", { text: "/Users/dev/code/steward" }),
   ];
 
   const reconciled = reconcileHydratedTurns(current, hydrated);
@@ -589,18 +589,18 @@ test("reconcileHydratedTurns collapses duplicate user-message ghosts to one bubb
   // bubbles — fractional-seq ghosts (11.996/11.997) minted by reconcile's
   // displaySeq slotting + optimistic copies (9e8+) that never got dropped.
   const current = [
-    turn(7.999, "user_message", { text: "R1" }),
-    turn(11.996, "user_message", { text: "R2" }),
-    turn(11.997, "user_message", { text: "R2" }),
-    turn(900_000_012, "user_message", { text: "R2" }),
-    turn(900_000_015, "user_message", { text: "R2" }),
-    turn(12, "assistant_text", { text: "R2" }),
+    turn(7.999, "user_message", { text: "U1" }),
+    turn(11.996, "user_message", { text: "U2" }),
+    turn(11.997, "user_message", { text: "U2" }),
+    turn(900_000_012, "user_message", { text: "U2" }),
+    turn(900_000_015, "user_message", { text: "U2" }),
+    turn(12, "assistant_text", { text: "U2" }),
   ];
-  const hydrated = [turn(12, "assistant_text", { text: "R2" })];
+  const hydrated = [turn(12, "assistant_text", { text: "U2" })];
   const reconciled = reconcileHydratedTurns(current, hydrated);
   const userText = (t: SessionTurn) => (t.payload?.text ?? "").trim();
-  assert.equal(reconciled.filter((t) => t.kind === "user_message" && userText(t) === "R2").length, 1);
-  assert.equal(reconciled.filter((t) => t.kind === "user_message" && userText(t) === "R1").length, 1);
+  assert.equal(reconciled.filter((t) => t.kind === "user_message" && userText(t) === "U2").length, 1);
+  assert.equal(reconciled.filter((t) => t.kind === "user_message" && userText(t) === "U1").length, 1);
 });
 
 test("reconcileHydratedTurns preserves genuine repeated user messages (distinct integer seqs)", () => {
@@ -787,8 +787,8 @@ test("latestSessionUsage returns null when no turn carries usage", () => {
   assert.equal(latestSessionUsage(turns), null);
 });
 
-// R7: agent-aware context window denominator. Total swaps based on
-// which agent recorded the turns. Used count is independent.
+// Agent-aware context window denominator. Total swaps based on which
+// agent recorded the turns. Used count is independent.
 test("latestSessionUsage uses Codex context window when agent='codex'", () => {
   const turns = [
     turn(1, "assistant_text", { text: "go", input_tokens: 500 }),
@@ -815,7 +815,7 @@ test("contextWindowForAgent picks the right denominator per agent string", () =>
   assert.equal(contextWindowForAgent("unknown-agent"), 200_000);
 });
 
-// R8: pending permission aggregator. Scans turns for unresolved
+// Pending permission aggregator. Scans turns for unresolved
 // permission_request attachments and surfaces a session-wide count.
 test("summarizePendingPermissions returns empty on a clean session", () => {
   const turns = [
@@ -828,7 +828,7 @@ test("summarizePendingPermissions returns empty on a clean session", () => {
   assert.equal(sum.latestRequestId, "");
 });
 
-test("summarizePendingPermissions counts only pending v0.2.0 requests with request_id", () => {
+test("summarizePendingPermissions counts only pending structured requests with request_id", () => {
   const turns = [
     // Pending: counted.
     turn(1, "tool_result", {
@@ -844,8 +844,8 @@ test("summarizePendingPermissions counts only pending v0.2.0 requests with reque
       permission_tool_name: "Write",
       permission_decision: "allow",
     }),
-    // Legacy v0.1.42 (no request_id): skipped — the card itself
-    // falls through to the generic renderer for these.
+    // Older unstructured events without request_id are skipped; their
+    // card falls through to the generic renderer.
     turn(3, "tool_result", {
       attachment_type: "permission_request",
       permission_tool_name: "Edit",
@@ -908,8 +908,8 @@ test("summarizePendingPermissions treats missing decision as pending", () => {
   assert.equal(sum.latestRequestId, "req-x");
 });
 
-// R9: reader-preferences parser. Tolerates partial blobs and falls
-// back to defaults per key.
+// Reader-preferences parser. Tolerates partial blobs and falls back to
+// defaults per key.
 test("parseReaderPreferences returns defaults for null / non-object input", () => {
   assert.deepEqual(parseReaderPreferences(null), DEFAULT_READER_PREFERENCES);
   assert.deepEqual(parseReaderPreferences(undefined), DEFAULT_READER_PREFERENCES);
@@ -955,8 +955,8 @@ test("parseReaderPreferences ignores non-boolean values per key", () => {
   assert.deepEqual(parseReaderPreferences(noisy), DEFAULT_READER_PREFERENCES);
 });
 
-// R10: math-syntax detector. Drives the lazy-load gate — only when
-// this returns true does the markdown pipeline pull in katex.
+// Math-syntax detector. Drives the lazy-load gate: only when this returns
+// true does the markdown pipeline pull in KaTeX.
 test("hasMathSyntax returns false on plain text", () => {
   assert.equal(hasMathSyntax(""), false);
   assert.equal(hasMathSyntax("just a sentence with no math"), false);
@@ -1006,8 +1006,8 @@ test("tokenUsageTier buckets correctly at the 50% / 80% thresholds", () => {
   assert.equal(tokenUsageTier(79.9), "warn");
   assert.equal(tokenUsageTier(80), "danger");
   assert.equal(tokenUsageTier(100), "danger");
-  // R7: rawPct can exceed 100 before clamping (e.g. if a Codex session
-  // ran with output beyond what 272k header says) — still danger.
+  // rawPct can exceed 100 before clamping, for example if a Codex session
+  // runs beyond the header context window; still danger.
   assert.equal(tokenUsageTier(150), "danger");
 });
 
@@ -1054,13 +1054,13 @@ function sessionForControl(overrides: Partial<SessionListItem> = {}): SessionLis
 test("canControlSession allows any writable session regardless of driver", () => {
   // Dual-driver model: writability is the gate, not a specific
   // connection_mode. PTY mirror and SDK headless are both writable when
-  // daemon is online; relay surfaces that via the `writable` field.
+  // daemon is online; Nexus surfaces that via the `writable` field.
   assert.equal(canControlSession(sessionForControl({ connection_mode: "pty_backed_duplex", writable: true })), true);
   assert.equal(canControlSession(sessionForControl({ connection_mode: "sdk_headless", writable: true })), true);
   assert.equal(canControlSession(sessionForControl({ connection_mode: "sdk_running", writable: true })), true);
   assert.equal(canControlSession(sessionForControl({ connection_mode: "pty_backed_duplex", writable: false })), false);
   assert.equal(canControlSession(sessionForControl({ connection_mode: "read_only", writable: false })), false);
-  // Legacy values from older relays decay through sessionConnectionMode
+  // Legacy values from older Nexus builds decay through sessionConnectionMode
   // but `writable` is still authoritative for control:
   assert.equal(canControlSession(sessionForControl({ connection_mode: "detached", writable: false })), false);
   assert.equal(canControlSession(sessionForControl({ connection_mode: "read_only_sync", writable: false })), false);

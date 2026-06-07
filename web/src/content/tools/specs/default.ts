@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// R2 — Default tool spec (fallback).
+// Default tool spec (fallback).
 //
 // Matches every tool name; placed last in the registry. Implements
 // the same heuristics the pre-registry primaryToolArg /

@@ -151,10 +151,9 @@ func utf8LeadLen(lead byte) int {
 // color codes, and statusLine repaints — interleaved with the actual
 // assistant text, which renders as garbage in the chat view.
 //
-// We do the strip BEFORE Emit so every downstream consumer (today's
-// web, tomorrow's mobile / telemetry) gets clean text without each
-// having to re-implement an ANSI parser. The terminal that the user
-// actually sees still gets the raw bytes — those go to os.Stdout
+// We do the strip BEFORE Emit so downstream consumers get clean text
+// without each having to re-implement an ANSI parser. The terminal that
+// the user actually sees still gets the raw bytes — those go to os.Stdout
 // via writeStdout, untouched.
 //
 // Trade-offs:

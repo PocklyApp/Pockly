@@ -86,7 +86,7 @@ func (s *ExternalSession) InputSubscriberCount() int {
 
 // SeedSeq raises the event sequence so the NEXT emitted event gets a seq
 // strictly greater than n (no-op if n is at or below the current seq).
-// The relay keys turns on (session, seq); when an idle SDK driver is
+// Nexus keys turns on (session, seq); when an idle SDK driver is
 // reaped and later re-created for a follow-up turn, a fresh
 // ExternalSession would otherwise restart seq from 0 and the follow-up's
 // turns would collide with — and overwrite — the original turn's rows.
@@ -410,7 +410,7 @@ func (s *ExternalSession) Driver() string {
 
 // SetDriver records which agent driver owns this session. Called by
 // sdkdriver right after Manager.RegisterExternal returns; the wrapper
-// path leaves it empty (and the relay defaults empty to "pty").
+// path leaves it empty (and Nexus defaults empty to "pty").
 func (s *ExternalSession) SetDriver(driver string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

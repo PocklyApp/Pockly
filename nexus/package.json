@@ -1,0 +1,33 @@
+{
+  "name": "@pockly/nexus",
+  "description": "Self-hosted Pockly Nexus connection runtime.",
+  "private": false,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PocklyApp/Pockly.git",
+    "directory": "nexus"
+  },
+  "type": "module",
+  "keywords": [
+    "pockly",
+    "nexus",
+    "self-hosted",
+    "remote-workspace"
+  ],
+  "bin": {
+    "pockly-nexus": "bin/pockly-nexus.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "validate": "node --test"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1063.0",
+    "better-sqlite3": "^12.10.0",
+    "pg": "^8.21.0",
+    "redis": "^6.0.0",
+    "ws": "^8.21.0"
+  }
+}

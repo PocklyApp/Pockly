@@ -32,7 +32,6 @@ import {
   listOnlineHosts,
   listSessions,
   listTerminalSessions,
-  devLogin,
   loginWithPassword,
   logout,
   openTerminalSession,
@@ -91,6 +90,7 @@ import { getSiteContent } from "./content/site";
 import { getDocsSections, type DocsBlock } from "./content/docs";
 import { resolveToolSpec } from "./content/tools/registry";
 import { trackEvent } from "./observability";
+import { configuredInstallUnixCommand, configuredInstallWindowsCommand } from "./runtime-config";
 import { i18n as appI18n, isSupportedLanguage, setDocumentLanguage, type SupportedLanguage } from "./i18n";
 import { Trans, useTranslation } from "react-i18next";
 import {
@@ -210,13 +210,12 @@ type LiveSessionBridge = {
   abort: AbortController;
   pendingPrompt?: string;
   ignoreEventsBefore?: number;
-  // v0.1.39: auto-reconnect bookkeeping. attempt is the current
-  // backoff index (0 = first try); reconnectTimer is the pending
-  // setTimeout id we can cancel on intentional abort or on a new
-  // attachLiveSessionBridge call replacing this bridge. attemptToken
-  // is an identity check the timer uses to confirm it's still the
-  // "current" attempt for this key — protects against the race where
-  // a fresh attachLiveSessionBridge happens while an old retry was
+  // Auto-reconnect bookkeeping. attempt is the current backoff index
+  // (0 = first try); reconnectTimer is the pending setTimeout id we can
+  // cancel on intentional abort or on a new attachLiveSessionBridge call
+  // replacing this bridge. attemptToken is an identity check the timer
+  // uses to confirm it still owns this key, protecting against the race
+  // where a fresh attachLiveSessionBridge happens while an old retry was
   // sleeping, then both end up trying to reconnect.
   attempt?: number;
   reconnectTimer?: number;
@@ -306,14 +305,14 @@ function trackBootstrapPhase(route: Route, stage: string, status: "ok" | "error"
   });
 }
 
-// MIN_RECOMMENDED_DAEMON_VERSION is a safety fallback for older relays
-// that do not yet attach CDN latest metadata to /api/hosts/online.
-// New relays drive the daemon update prompt from daemon_latest_version
-// / daemon_update_available so users are notified when CDN latest moves.
+// MIN_RECOMMENDED_DAEMON_VERSION is a safety fallback for older Nexus versions
+// that do not yet attach release latest metadata to /api/hosts/online.
+// Current Nexus versions drive the daemon update prompt from daemon_latest_version
+// / daemon_update_available so users are notified when release latest moves.
 const MIN_RECOMMENDED_DAEMON_VERSION = "v0.1.37";
 
 // SSE reconnect backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s, ... (capped at 30s).
-// No attempt cap — relay's session_disconnected event + the user closing the
+// No attempt cap — Nexus session_disconnected events + the user closing the
 // tab are the actual stop signals. Previously capped at 12 (~3.5min) and then
 // gave up with "refresh to reconnect", but that punished users coming back
 // after a 10-min meeting on a still-live session. Each disconnect still
@@ -400,10 +399,10 @@ function daemonUpdateRecommendation(targets: DaemonUpdateTarget[]) {
 }
 
 // DaemonOutdatedBanner renders above the app shell whenever at least one
-// of the user's paired daemons is older than relay-observed CDN latest
+// of the user's paired daemons is older than Nexus-observed release latest
 // or the fallback MIN_RECOMMENDED_DAEMON_VERSION.
 // One-click copy of `pockly-daemon update` lets the user paste and run on
-// their machine; the remote button asks relay to forward UPDATE_REQUEST
+// their machine; the remote button asks Nexus to forward UPDATE_REQUEST
 // over the daemon control WS.
 function DaemonOutdatedBanner({
   devices,
@@ -434,8 +433,7 @@ function DaemonOutdatedBanner({
   // updateState tracks the remote-update click for the FIRST outdated
   // daemon. The button shows "Update remotely" → "Dispatching..." →
   // "Waiting for daemon to come back" → unmount when version refreshes.
-  // We only support a single in-flight update at a time; multi-daemon
-  // batch upgrade is a Phase-2 nicety.
+  // We only support a single in-flight update at a time.
   const [updateState, setUpdateState] = useState<"idle" | "dispatching" | "waiting" | "failed">("idle");
   const [updateError, setUpdateError] = useState("");
   const onCopy = useCallback(() => {
@@ -528,17 +526,16 @@ export function App() {
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [draftConversation, setDraftConversation] = useState<DraftConversation | null>(null);
   const [selected, setSelected] = useState<ReaderSelection | null>(null);
-  // v0.1.41 #3: 'active' = a live terminal_session matches selectedSession;
-  // 'dead' = the wrapper isn't running for this session (chat history loads
-  // but new prompts can't send); 'unknown' = couldn't determine (network
-  // error, daemon offline). Drives the optional banner over the chat view.
+  // 'active' = a live terminal_session matches selectedSession; 'dead' =
+  // the wrapper is not running for this session (chat history loads but new
+  // prompts cannot send); 'unknown' = could not determine (network error,
+  // daemon offline). Drives the optional banner over the chat view.
   const [sessionLivenessHint, setSessionLivenessHint] = useState<"active" | "dead" | "unknown">("unknown");
   const [turns, setTurns] = useState<SessionTurn[]>([]);
   // sessionTitles holds web-derived short titles, keyed by session_id.
-  // These are derived locally from the first user_message turn AFTER
-  // the encrypted turns decrypt, so user-prompt content never leaves
-  // the browser. The daemon still uploads only the non-sensitive
-  // "project · Claude Code · date · shortId" snippet to the relay.
+  // These are derived locally from loaded turns. The daemon also uploads a
+  // short catalog snippet so the sidebar has a useful label before a session
+  // is opened.
   //
   // Persistence is scoped per-user (see sessionTitlesStorageKey) so
   // multi-account browsers don't share each other's prompt-derived
@@ -551,17 +548,14 @@ export function App() {
   const [turnsStatus, setTurnsStatus] = useState("");
   const [syncProgress, setSyncProgress] = useState<SyncSessionEvent | null>(null);
   const [syncingEarlier, setSyncingEarlier] = useState(false);
-  // Search was removed from the rail in Workspace Redesign v2 (the device picker
-  // replaces it); `query` stays as a constant empty string so the existing
-  // filter plumbing (SessionsPage, workspaceHomeEmptyState) is a harmless no-op.
+  // The rail now uses the computer picker as its primary filter. `query` stays
+  // as a constant empty string so the existing filter plumbing remains a
+  // harmless no-op instead of leaving an invisible stale query active.
   const query = "";
-  // User's explicit dropdown pick. Empty = no explicit pick yet, let the
-  // derived `deviceFilter` below fall through to selected-session /
-  // first-daemon. Refactor (2026-05-26): replaces the old
-  // `[deviceFilter, setDeviceFilter] = useState("all")` plus two
-  // competing useEffects that snapped the filter back to
-  // `selected.deviceId` after every user click, defeating dropdown
-  // switches whenever a session was open.
+  // User's explicit computer dropdown pick. Empty = no explicit pick yet;
+  // the derived `deviceFilter` below falls through to selected-session /
+  // first-daemon. Keep this separate from selected.deviceId so opening a
+  // session does not immediately undo a user's dropdown switch.
   const [explicitDeviceFilter, setExplicitDeviceFilter] = useState("");
   const [composerText, setComposerText] = useState("");
   // Prompt attachments (images + any file the agent can read). Sent with the
@@ -601,15 +595,11 @@ export function App() {
   const [pushStatus, setPushStatus] = useState<PushStatus>("checking");
   const [pushDetail, setPushDetail] = useState("");
   const [activeInjectID, setActiveInjectID] = useState("");
-  // driftPrompt holds an in-flight prompt that was bounced by the relay
-  // with session_drifted. We pop a modal (SessionDriftDialog) so the user
-  // can confirm the redirect; on confirm we navigate to actualSid AND
-  // refill the composer with savedText — never auto-resend. The point of
-  // not auto-resending is bug #v0.1.28-A': previously the resend ran
-  // asynchronously and could be lost if the new session's load raced
-  // with the inject, dropping the user's typed prompt with no trace.
-  // Letting the user press Send again is uglier UX but the contract is
-  // simple: if the input box has your text, your text is safe.
+  // driftPrompt holds an in-flight prompt that Nexus bounced with
+  // session_drifted. We show SessionDriftDialog so the user can confirm
+  // the redirect; on confirm we navigate to actualSid and refill the
+  // composer with savedText, but never auto-resend. If the input box has
+  // the user's text, the text is safe.
   const [driftPrompt, setDriftPrompt] = useState<{ savedText: string; actualSid: string; deviceId: string } | null>(null);
   const [claimedSetupGrant, setClaimedSetupGrant] = useState("");
   const [localSetupState, setLocalSetupState] = useState<LocalSetupState>({ phase: "idle" });
@@ -801,7 +791,7 @@ export function App() {
   // the tab we can't tell from inside JS whether the stream is dead or
   // alive, so we conservatively force-recover every live bridge if the
   // page was hidden long enough to matter (>3s — short tab swaps don't
-  // count). Cheap on relay because the catalog rarely has more than
+  // count). Cheap on Nexus because the catalog rarely has more than
   // 1-2 live bridges open at once.
   useEffect(() => {
     let hiddenSince: number | null = null;
@@ -902,7 +892,7 @@ export function App() {
   }, [auth.status, route.view, selectedSession?.device_id, selectedSession?.session_id, selectedSession?.agent]);
 
   // #47 recovery: re-attach the live SSE bridge after a session_disconnected.
-  // handleLiveSessionEvent tears the bridge down when the relay reports the host
+  // handleLiveSessionEvent tears the bridge down when Nexus reports the host
   // unreachable (the deliberate stop-reconnect signal), but the attach effect
   // above keys only on device/session/agent — which don't change across a
   // disconnect→reconnect of the SAME session — so it never re-attaches. When the
@@ -922,15 +912,11 @@ export function App() {
     void attachExistingLiveSessionBridge(selectedSession);
   }, [auth.status, route.view, selectedSession?.device_id, selectedSession?.session_id, selectedSession?.agent, selectedSession?.writable, selectedSession?.connection_mode]);
 
-  // v0.1.43: opt-in test hooks for AI-driven E2E automation.
-  // Activated only when the URL has `?test=1` — production users never
-  // see this surface. Mounted on window so a Chrome MCP / Playwright
-  // driver can precisely simulate state changes (SSE drop, auth
-  // expire, multi-bridge race) without invasive monkey-patching of
-  // fetch or React internals. Each call is one line of intent
-  // ("drop the SSE for session X"); the hook reaches into the same
-  // refs the production code uses, so behavior diverges from real
-  // usage only at the point of the explicit poke.
+  // Opt-in test hooks for local browser automation. Activated only
+  // when the URL has `?test=1`, so production users never see this
+  // surface. Mounted on window so Playwright-style drivers can simulate
+  // state changes (SSE drop, auth expiry, multi-bridge races) without
+  // monkey-patching fetch or React internals.
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!new URLSearchParams(window.location.search).has("test")) return;
@@ -945,9 +931,8 @@ export function App() {
         hasReconnectTimer: b.reconnectTimer != null,
         attemptToken: b.attemptToken,
       })),
-      // Force-abort an SSE — triggers the v0.1.39 reconnect path. Use
-      // this instead of monkey-patching fetch (which has classifier-
-      // unsafe semantics for production targeting).
+      // Force-abort an SSE to exercise reconnect behavior without
+      // monkey-patching fetch.
       dropSSE: (key: string) => {
         const b = liveSessionBridgesRef.current.get(key);
         if (!b) return { ok: false, reason: "no bridge for key" };
@@ -966,13 +951,10 @@ export function App() {
       getBundleVersion: () => Array.from(document.scripts)
         .map((s) => s.src).filter((s) => s.includes("index-"))
         .pop()?.split("/").pop() ?? "unknown",
-      // v0.1.44 S2: expose a compact turn summary so Chrome-MCP-driven
-      // scenarios can assert specific kinds/payloads (eg. permission
-      // request telemetry from the web-permission scenario)
-      // without scraping rendered DOM. Returns the last N turns as
-      // `{kind, attachment_type, text_preview}` triples; full payloads
-      // can be megabytes for jsonl-heavy sessions and would dwarf the
-      // Chrome MCP eval response budget.
+      // Expose a compact turn summary so browser automation can assert
+      // specific kinds/payloads without scraping rendered DOM. Returns
+      // the last N turns as `{kind, attachment_type, text_preview}`
+      // triples; full payloads can be megabytes for jsonl-heavy sessions.
       getTurns: (limit = 20) => {
         const slice = turns.slice(-limit);
         return slice.map((t) => {
@@ -986,11 +968,8 @@ export function App() {
           };
         });
       },
-      // Convenience helper for the v0.1.44 web-permission scenario:
-      // returns true iff a permission_request attachment turn contains
-      // the marker substring (the scenario embeds a unique marker into
-      // the synthetic tool_name so it doesn't false-positive on
-      // unrelated real permission events that may be present).
+      // Convenience helper for permission bridge tests: returns true iff
+      // a permission_request attachment turn contains the marker substring.
       findPermissionRequestTurn: (marker: string) => {
         const needle = String(marker || "").trim();
         if (needle === "") return { found: false, reason: "empty marker" };
@@ -1077,11 +1056,8 @@ export function App() {
     return () => subscription.close();
   }, [auth.status, route.view, selected?.deviceId, selected?.sessionId, turnsStatus]);
 
-  // Derive a session title from the decrypted turns once they land. This
-  // is the privacy-preserving alternative to having the daemon push a
-  // prompt-based snippet through the relay: the actual first-user-prompt
-  // never leaves the browser, but the user still gets a useful label for
-  // any session they've opened.
+  // Derive a session title from the loaded turns once they land. This keeps
+  // opened sessions labeled consistently with catalog snippets.
   useEffect(() => {
     if (auth.status !== "authenticated") return;
     if (!selected || turns.length === 0) return;
@@ -1108,12 +1084,11 @@ export function App() {
     });
   }, [selected?.sessionId, turns, auth.status, auth.status === "authenticated" ? auth.email : ""]);
 
-  // Derive sidebar titles from the plaintext first-user-message snippet the
-  // relay returns on the session-list API. (E2E was removed — the daemon now
-  // sends this snippet in the clear, so there's no per-browser envelope to
-  // decrypt.) Titles feed the same sessionTitles cache that opened-session
-  // derivation populates, so sessionDisplayName picks them up with no
-  // rendering changes. Sessions whose title is already cached are skipped.
+  // Derive sidebar titles from the first-user-message snippet Nexus returns on
+  // the session-list API. Titles feed the same sessionTitles cache that
+  // opened-session derivation populates, so sessionDisplayName picks them up
+  // with no rendering changes. Sessions whose title is already cached are
+  // skipped.
   useEffect(() => {
     if (auth.status !== "authenticated") return;
     if (sessions.length === 0) return;
@@ -1121,7 +1096,7 @@ export function App() {
     const decoded = new Map<string, string>();
     for (const session of sessions) {
       // Skip when already cached, when there's no snippet to derive from, or
-      // when the relay already supplies a generated title (which wins in
+      // when Nexus already supplies a generated title (which wins in
       // sessionDisplayName, so a client-derived fallback would never show).
       if (sessionTitles[session.session_id] || session.title || !session.snippet) continue;
       const derived = deriveSessionTitle(session.snippet);
@@ -1163,13 +1138,10 @@ export function App() {
     }
   }, [auth.status, route]);
 
-  // R5: AskUserQuestion answer bridge. Children deep in the turn
-  // renderer (ToolQuestionCard / QuestionRow) dispatch a
-  // pockly:answer-question CustomEvent on click; this listener routes
-  // the answer through sendPromptForSession against the currently
-  // selected session. Decouples the question card from session state
-  // without prop-drilling sendPromptForSession through 4 component
-  // layers.
+  // AskUserQuestion answer bridge. Children deep in the turn renderer dispatch
+  // a pockly:answer-question CustomEvent on click; this listener routes the
+  // answer through sendPromptForSession against the currently selected session
+  // without prop-drilling through several component layers.
   useEffect(() => {
     const onAnswer = (e: Event) => {
       const detail = (e as CustomEvent<AnswerQuestionDetail>).detail;
@@ -1213,7 +1185,7 @@ export function App() {
     void runMobileJoin(route.grant);
   }, [route.view, route.view === "mobileJoin" ? route.grant : ""]);
 
-  // Per-user session title cache (web-derived from decrypted turns).
+  // Per-user session title cache, derived from loaded turns.
   // Loads the current account's titles whenever auth resolves; clears
   // immediately on signout. Storage stays scoped by email so multiple
   // accounts on one browser don't share or leak prompt-derived labels.
@@ -1234,7 +1206,7 @@ export function App() {
     setDevices([]);
     setHosts([]);
     setSessions([]);
-    // Tear down live bridges on auth expiry (relay redeploy / session expiry).
+    // Tear down live bridges on auth expiry (Nexus redeploy / session expiry).
     // clearReaderState doesn't touch them, so without this each orphaned
     // bridge keeps reconnect-looping through 401s, and a stale "live" bridge
     // blocks a correct reattach after the user logs back in.
@@ -2058,6 +2030,10 @@ export function App() {
     }
     try {
       const result = await registerAccount({ email, name, password });
+      if (result.status === "active") {
+        await finishAuthenticatedFlow();
+        return;
+      }
       setVerificationEmail(result.email);
       setResendAfterSeconds(result.resend_after_seconds);
       setAuthMode("verify");
@@ -2095,7 +2071,7 @@ export function App() {
     try {
       await logout();
     } catch {
-      // Older local relays may not expose logout yet; still clear local UI state.
+      // Older local Nexus builds may not expose logout yet; still clear local UI state.
     }
     subscriptionRef.current?.close();
     subscriptionRef.current = null;
@@ -2141,7 +2117,7 @@ export function App() {
   }
 
   // runLocalSetup completes a daemon-initiated local install:
-  //   1. Mint device tokens via /api/daemon/local-claim (relay binds daemon
+  //   1. Mint device tokens via /api/daemon/local-claim (Nexus binds daemon
   //      to this user and returns access + refresh tokens).
   //   2. POST { nonce, claim } to the daemon's loopback callback so the
   //      daemon process can save the tokens and start serving.
@@ -2152,8 +2128,8 @@ export function App() {
   // worked before moving on.
   async function runLocalSetup(grant: string, nonce: string, cb: string) {
     setLocalSetupState({ phase: "claiming", message: tx("localSetup.claiming") });
-    // Validate cb before consuming the relay setup grant. If the fragment was
-    // tampered with, claiming first would bind the daemon in relay but leave
+    // Validate cb before consuming the Nexus setup grant. If the fragment was
+    // tampered with, claiming first would bind the daemon in Nexus but leave
     // the local process without tokens.
     let cbURL: URL;
     try {
@@ -2225,7 +2201,7 @@ export function App() {
         throw new Error(`${resp.status}: ${body || resp.statusText}`);
       }
     } catch (error) {
-      // The daemon binding still succeeded on the relay side — surface that
+      // The daemon binding still succeeded on the Nexus side — surface that
       // so the user knows what to do next.
       setLocalSetupState({
         phase: "error",
@@ -2323,7 +2299,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         device_name: browserDeviceName(),
         user_agent: navigator.userAgent,
       });
-      // The relay now holds the claim in awaiting_daemon_confirm until the
+      // Nexus now holds the claim in awaiting_daemon_confirm until the
       // daemon process on the user's computer prompts and accepts. Poll for
       // the final state and surface clear feedback.
       setCliStatus("awaiting_daemon_confirm");
@@ -2429,10 +2405,10 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       setDraftConversation(null);
       pendingDraftRef.current = null;
       setSessions([]);
-      setSessionsStatus(tx("errors.encryptedAccessSetupFailed"));
+      setSessionsStatus(tx("errors.deviceSetupFailed"));
       setPushStatus("not_enabled");
       setPushDetail("");
-      clearReaderState(tx("errors.encryptedAccessSetupFailed"));
+      clearReaderState(tx("errors.deviceSetupFailed"));
       pushRoute({ view: "workspaceSessions" });
       return;
     }
@@ -2456,7 +2432,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       setSessionsStatus("");
     } catch (error) {
       setSessions([]);
-      setSessionsStatus(error instanceof Error ? error.message : tx("errors.encryptedAccessSetupFailed"));
+      setSessionsStatus(error instanceof Error ? error.message : tx("errors.deviceSetupFailed"));
     }
 
     const nextDaemonID = preferredDaemonDeviceID(listedDevices, deviceId);
@@ -2619,7 +2595,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
   // attach and the auto-reconnect path. attempt counts the current
   // retry (0 = first attempt). On non-aborted failure we schedule a
   // re-attempt with exponential backoff (1s, 2s, 4s, ..., capped at
-  // 30s) indefinitely — relay buffers history so even multi-minute
+  // 30s) indefinitely — Nexus buffers history so even multi-minute
   // gaps recover without user action.
   //
   // Why explicit retry vs EventSource's built-in: we use fetch + ReadableStream
@@ -2684,8 +2660,8 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     }).catch((error) => {
       if (abort.signal.aborted) return; // intentional cancel
       // Telemetry once per disconnect — captures network errors,
-      // mobile backgrounding, relay WS hiccups. Sampled by the
-      // browser device so we can correlate per-user.
+      // mobile backgrounding, Nexus WS hiccups. Sampled by the
+      // browser access token so we can correlate per-user.
       reportWebTelemetry({
         name: "web_sse_disconnected",
         sessionId: session.session_id,
@@ -2708,11 +2684,10 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         // bumped attemptToken; ditto a user-driven detach).
         const current = liveSessionBridgesRef.current.get(key);
         if (current?.attemptToken !== attemptToken) {
-          // v0.1.41 #1: the retry was abandoned (bridge cleaned up by
-          // session_exited, replaced by a fresh attach, or evicted by
-          // page nav). The "retrying in Xs…" text we set earlier is
-          // now lying about the state. Clear it so the user doesn't
-          // see a forever-stuck status.
+          // The retry was abandoned (bridge cleaned up by session_exited,
+          // replaced by a fresh attach, or evicted by page nav). Clear the
+          // earlier "retrying in Xs…" status so the user does not see a
+          // forever-stuck state.
           setInjectStatus("");
           return;
         }
@@ -2729,7 +2704,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
   // before re-streaming, instead of reusing the terminal_session_id pinned in the
   // bridge. The daemon can re-announce a session under a NEW terminal_session_id
   // (e.g. after a restart), and the auto-reconnect / forceReconnect paths used to
-  // retry the dead pinned id forever — recovering only ~45s later once the relay
+  // retry the dead pinned id forever — recovering only ~45s later once Nexus
   // emitted session_disconnected and the recovery effect re-attached (#33). `expect`
   // is the attemptToken of the bridge that scheduled this reconnect; if it no
   // longer owns the slot (a fresh attach or a detach happened), bail.
@@ -2807,19 +2782,17 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         attachLiveSessionBridge(session, reusable, { ignoreHistory: true });
         setSessionLivenessHint("active");
       } else {
-        // v0.1.41 #3: no matching live terminal_session for the
-        // session_id we're viewing. The chat history loads from
-        // catalog sync, but the user can't send NEW prompts — the
-        // wrapper is gone (claude exited, or daemon hasn't been
-        // online recently). Surface a banner so the user isn't
-        // staring at a working-looking UI that silently can't reply.
+        // No matching live terminal_session for the session_id we're viewing.
+        // The chat history loads from catalog sync, but the user cannot send
+        // new prompts because the wrapper is gone (Claude exited, or daemon
+        // has not been online recently). Surface a banner instead of leaving
+        // a working-looking UI that silently cannot reply.
         setSessionLivenessHint("dead");
       }
     } catch (err) {
-      // v0.1.41 #2: bubble auth failures to top-level state instead
-      // of silently degrading. Pre-fix, a 401 from listTerminalSessions
-      // landed here and got swallowed — no SSE attach, no UI hint, user
-      // sees a frozen workspace forever.
+      // Bubble auth failures to top-level state instead of silently
+      // degrading. A 401 here means there will be no SSE attach and no
+      // useful UI hint unless auth state is reset.
       if (err instanceof AuthExpiredError) {
         setAuth({ status: "anonymous" });
         setInjectStatus("");
@@ -2883,9 +2856,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     // Keep them out of the conversation and let message_added JSONL
     // events below provide the clean assistant turns.
     if (event.kind === "message_added" && event.payload) {
-      // v0.1.35: wrapper jsonl-watch sends one structured record per
-      // Claude turn (role + clean text + uuid) instead of raw PTY
-      // bytes. We only render role="assistant" here because:
+      // The wrapper jsonl watcher sends one structured record per Claude
+      // turn (role + clean text + uuid) instead of raw PTY bytes. We only
+      // render role="assistant" here because:
       //   - role="user" local-typing is already covered by the
       //     user_input handler above (char-by-char stdin capture from
       //     the wrapper, no ANSI noise).
@@ -2896,12 +2869,12 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       // Adding role=user here would double-bubble for BOTH paths.
       //
       // Two payload shapes share this event.kind:
-      //   1. Wrapper jsonl-watch (legacy) — flat `{role, text, uuid, timestamp}`.
-      //   2. SDK driver (v0.4.4+) — raw stream-json record from
+      //   1. Wrapper jsonl-watch — flat `{role, text, uuid, timestamp}`.
+      //   2. SDK driver — raw stream-json record from
       //      `claude --print --output-format=stream-json`, shape
       //      `{type:"assistant", message:{role, content:[{type,text}]},
       //      uuid, session_id}`. The daemon pipes claude's stdout
-      //      verbatim — no flattening — to keep the relay's
+      //      verbatim — no flattening — to keep Nexus
       //      bridgeSDKTerminalEventToTurn able to attribute the same
       //      bytes to session_turns without re-encoding.
       // Normalize both into the legacy flat shape so the existing
@@ -3017,23 +2990,17 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       if (isDisplayedSession) finishLiveAgentRun("Live reply ready.");
     }
     if (event.kind === "permission_request" && event.payload) {
-      // v0.1.42 → v0.2.0: claude is about to invoke a tool and the
-      // MCP permission server routed the "may I?" question through
-      // us instead of the TUI 1/2 prompt — which is what makes the
-      // ask visible (and now actionable) on web.
+      // Claude is about to invoke a tool and the permission bridge routed
+      // the native "may I?" question through Pockly so the ask is visible
+      // and actionable on web.
       //
-      // v0.2.0 introduces the interactive flow:
-      //   - decision === "pending"  → render Approve/Deny buttons +
-      //     stash request_id + daemon_device_id so the buttons can
-      //     POST /api/permission-requests/<id>/decide
-      //   - decision === "allow"/"deny" → render resolved state (a
-      //     follow-up event from the MCP server after /await returns,
-      //     or the v0.1.42 always-allow legacy from old wrappers)
+      // Flow:
+      //   - decision === "pending" renders Approve/Deny buttons and stashes
+      //     request_id + daemon_device_id for the decide API.
+      //   - decision === "allow"/"deny" updates the existing request state.
       //
-      // We use the SAME seqKey across pending → resolved so mergeTurns
-      // replaces the in-place card instead of stacking two — the user
-      // clicked once, they should see one card transition through
-      // states, not a new card.
+      // Use the same seqKey across pending → resolved so mergeTurns replaces
+      // the in-place card instead of stacking two cards for one decision.
       let payload: {
         tool_name?: string;
         input?: unknown;
@@ -3051,9 +3018,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         } catch { return ""; }
       })();
       const decisionStr = payload.decision ?? "pending";
-      // Stable seq per request_id (v0.2.0) or per stable local-confirmation
-      // signature. Legacy resolved events without request_id keep the old
-      // timestamp key so unrelated old wrappers don't overwrite each other.
+      // Stable seq per request_id or per stable local-confirmation signature.
+      // Legacy resolved events without request_id keep the timestamp key so
+      // unrelated old wrappers don't overwrite each other.
       const seqKey = payload.request_id
         ? `perm:req:${payload.request_id}`
         : decisionStr === "local_confirmation"
@@ -3089,9 +3056,8 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         payload: {
           text,
           attachment_type: "permission_request",
-          // v0.2.0 structured fields. Reader at render time uses
-          // these for the interactive card; pre-v0.2.0 readers
-          // ignore unknown keys and fall back to text rendering.
+          // Structured fields used by the interactive permission card.
+          // Older readers ignore unknown keys and fall back to text rendering.
           permission_request_id: payload.request_id ?? "",
           permission_tool_name: toolName,
           permission_input_preview: inputPreview,
@@ -3142,12 +3108,12 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       }
     }
     if (event.kind === "session_exited" || event.kind === "error" || event.kind === "session_disconnected") {
-      // v0.1.39: cancel any pending SSE-reconnect retry — the wrapper is
-      // gone (session_exited), unreachable (session_disconnected), or errored,
-      // so retrying would just hammer relay for nothing. The abort tells any
-      // in-flight stream to bail.
+      // Cancel any pending SSE-reconnect retry: the wrapper is gone
+      // (session_exited), unreachable (session_disconnected), or errored, so
+      // retrying would just hammer Nexus. The abort tells any in-flight stream
+      // to bail.
       //
-      // session_disconnected specifically is the relay's "stop reconnecting"
+      // session_disconnected specifically is Nexus's "stop reconnecting"
       // signal that replaced the old hard reconnect-attempt cap (see the
       // no-attempt-cap note on liveSessionBridgeKey). Until it was handled here
       // that stop signal was a no-op, so a bridge whose host went unreachable
@@ -3298,7 +3264,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         }
         if (promotedInline) {
           // Inline promote already swapped selected/URL to the real session id.
-          // Refresh the catalog, then poll the encrypted turns window for the
+          // Refresh the catalog, then poll the synced turns window for the
           // first assistant/tool output. `/api/tasks` only confirms that the
           // daemon accepted and launched the agent; it is not proof that the
           // first reply has synced.
@@ -3373,11 +3339,10 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           }
         }
         setInjectStatus(error instanceof Error ? error.message : tx("errors.injectFailed"));
-        // v0.1.37 telemetry: inject failed end-to-end. Captures the
-        // "I clicked Send and it didn't work" diagnostic that's
-        // otherwise only visible client-side. session_drifted is
-        // intentionally NOT reported here — it's a known, handled
-        // race (modal owns the UX, user just retries) not a real bug.
+        // Capture browser-to-daemon send failures that would otherwise
+        // be visible only client-side. session_drifted is intentionally
+        // not reported here because it is a handled race: the modal owns
+        // the UX and the user retries against the corrected session.
         reportWebTelemetry({
           name: "web_inject_error",
           sessionId: session.session_id,
@@ -3575,7 +3540,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     switch (event.type) {
       case "inject_started":
         injectPhaseRef.current = { requestId: event.request_id, phase: "started" };
-        setInjectStatus(tx("errors.acceptedByMac"));
+        setInjectStatus(tx("errors.acceptedByComputer"));
         break;
       case "session_created":
         if (target === "draft-session" && event.session_id) {
@@ -3863,7 +3828,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
             pushDetail={pushDetail}
             onEnablePush={() => void onEnablePush()}
             onOpenDevices={() => void navigate({ view: "workspaceDevices" })}
-            onResetEncryptedAccess={onResetCurrentBrowserAccess}
+            onResetBrowserAccess={onResetCurrentBrowserAccess}
             onBack={() => void navigate({ view: "workspaceSessions" })}
             onLogout={() => void onLogout()}
           />
@@ -3963,8 +3928,8 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
             // Navigate to the live sid AND prefill the composer with
             // the saved text. We deliberately do NOT auto-inject — the
             // user pressing Send again is the safety net that
-            // guarantees their text was never silently dropped (the
-            // bug v0.1.27's auto-resend had).
+            // guarantees their text is never silently dropped by automatic
+            // resend after a drift correction.
             const target = driftPrompt;
             setDriftPrompt(null);
             setComposerText(target.savedText);
@@ -4579,9 +4544,9 @@ function MobileJoinQRCodeCard({ className = "" }: { className?: string }) {
   );
 }
 
-// Rail nav pagination (Workspace Redesign v2): each project starts collapsed-
-// open showing RAIL_PROJECT_INITIAL conversations, revealing RAIL_PROJECT_STEP
-// more per "show more"; the loose conversation list paginates the same way.
+// Rail nav pagination: each project starts collapsed-open showing
+// RAIL_PROJECT_INITIAL conversations, revealing RAIL_PROJECT_STEP more per
+// "show more"; the loose conversation list paginates the same way.
 const RAIL_PROJECT_INITIAL = 2;
 const RAIL_PROJECT_STEP = 3;
 const RAIL_LOOSE_INITIAL = 8;
@@ -4734,8 +4699,8 @@ function Rail({
   // (which lives in SessionsPage, a sibling) can open this rail's drawer.
   const setDrawerOpen = onDrawerOpenChange;
   const drawerRef = useRef<HTMLDivElement | null>(null);
-  // The rail filters by the device picker now (Workspace Redesign v2); `sessions`
-  // already arrives scoped to the selected computer.
+  // The rail filters by the computer picker; `sessions` already arrives scoped
+  // to the selected computer.
   const drawerProjects = useMemo(() => buildDrawerProjects(sessions), [sessions]);
   const drawerLooseSessions = useMemo(() => buildDrawerLooseSessions(sessions), [sessions]);
   // Collapsible nav + "show more" state.
@@ -5063,8 +5028,8 @@ function SessionsPage({
   // session don't re-trigger, but switching to a same-id session on
   // another device correctly re-runs the auto-scroll.
   //
-  // Markdown, images, and lazy-loaded math (R10 KaTeX) keep growing
-  // the document several frames after the initial paint — a single
+  // Markdown, images, and lazy-loaded KaTeX math keep growing the document
+  // several frames after the initial paint — a single
   // rAF snap lands halfway up because scrollHeight is still climbing.
   // We re-snap every frame until either scrollHeight has been stable
   // for ~100ms, a 1.5s hard cap is hit, or the user grabs the scroll
@@ -5877,7 +5842,7 @@ function WorkspaceComposerDock({
 //   [ Model: sonnet ▾ ]  [ Effort: none ▾ ]  [ Permission: default ▾ ]
 //
 // The pills are read-write: clicking one opens a tiny popover, picking
-// a value POSTs to /api/sessions/<sid>/agent-settings which the relay
+// a value POSTs to /api/sessions/<sid>/agent-settings which Nexus
 // forwards to the daemon. Model picks inject `/model <name>` into the
 // live PTY; permission picks send Shift+Tab cycles. Effort now applies
 // for real the same way: a pick POSTs agent-settings, the daemon sends
@@ -5911,7 +5876,7 @@ function ClaudeCodePillsRow({
   // draftCwd is the working directory the user picked for the new
   // conversation (empty for "directly chat / no project"). Forwarded
   // to the new /api/agent-defaults endpoint so the model pill picks
-  // up project-config aliases (DeepSeek, etc.) — instead of being
+  // up project-config aliases from compatible providers instead of being
   // stuck on the hardcoded sonnet/opus/haiku alias list.
   draftCwd?: string;
   draftModel?: string;
@@ -5974,8 +5939,8 @@ function ClaudeCodePillsRow({
     // Seed with the bundled aliases so the pill is usable while
     // /api/agent-defaults is in flight (and as a fallback when the
     // daemon is an older build that doesn't expose the endpoint).
-    // The fetch's success path replaces this with the cwd-aware
-    // list including project-config models like DeepSeek.
+    // The fetch's success path replaces this with the cwd-aware list,
+    // including project-config models from compatible providers.
     const fallbackModels = agent === "codex" ? [] : ["sonnet", "opus", "haiku"];
     const fallbackPermissionModes = agent === "codex" ? ["default", "acceptEdits", "auto", "bypassPermissions"] : ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
     const fallbackEfforts = agent === "codex" ? ["none", "minimal", "low", "medium", "high", "xhigh"] : ["none", "low", "medium", "high", "xhigh", "max"];
@@ -7070,8 +7035,15 @@ function DuplexTestPage() {
     let cancelled = false;
     async function boot() {
       try {
-        setStatus("Signing in to local dev relay...");
-        await devLogin("dev@example.local", "James");
+        setStatus("Signing in to local dev Nexus...");
+        const devEmail = "dev@example.local";
+        const devPassword = "correct horse battery staple";
+        try {
+          await registerAccount({ email: devEmail, name: "Dev User", password: devPassword });
+        } catch (error) {
+          if (!(error instanceof Error) || error.message !== "email_already_registered") throw error;
+          await loginWithPassword(devEmail, devPassword);
+        }
         if (cancelled) return;
         const browserState = await ensureBrowserDeviceState();
         const initialHosts = await listOnlineHosts(browserState.deviceId);
@@ -7088,7 +7060,7 @@ function DuplexTestPage() {
           persistBrowserTokens({ browserDeviceId: connected.browser_device_id });
         }
         if (cancelled) return;
-        setStatus("Loading local daemon and Claude sessions...");
+        setStatus("Loading local daemon and agent sessions...");
         const [deviceResult, hostResult, sessionResult] = await Promise.all([
           listDevices(),
           listOnlineHosts(loadBrowserDeviceState()?.deviceId),
@@ -7196,7 +7168,7 @@ function MinimalLiveTerminalTest({
     }).catch((error) => {
       if (!controller.signal.aborted) {
         structuredSessionIdRef.current = "";
-        setStatus(error instanceof Error ? error.message : "Structured Claude stream failed.");
+        setStatus(error instanceof Error ? error.message : "Structured agent stream failed.");
       }
     }).finally(() => {
       if (structuredStreamAbortRef.current === controller) structuredStreamAbortRef.current = null;
@@ -7409,13 +7381,13 @@ function MinimalLiveTerminalTest({
       </header>
       <label className="minimal-duplex-cwd">
         <span>cwd</span>
-        <Input value={cwd} disabled={isLive} onChange={(event) => setCwd(event.target.value)} placeholder="/Users/james/project" />
+        <Input value={cwd} disabled={isLive} onChange={(event) => setCwd(event.target.value)} placeholder="/Users/dev/project" />
       </label>
       <TerminalMirror events={events} active={Boolean(terminalSession)} />
       <div ref={outputRef} className="minimal-duplex-chat">
         {structuredSessionId ? (
           <div className="duplex-transcript-source">
-            <span>Structured Claude session</span>
+            <span>Structured agent session</span>
             <code>{structuredSessionId.slice(0, 8)}</code>
             {hiddenStructuredCount > 0 ? <small>已隐藏 {hiddenStructuredCount} 条工具/思考/附件记录</small> : null}
           </div>
@@ -7666,7 +7638,7 @@ export function renderDuplexChatMessages(events: TerminalEvent[]): DuplexChatMes
       continue;
     }
     if (event.kind === "session_exited") {
-      messages.push({ id: `${index}-session-exited`, role: "system", text: "Claude session stopped.", time });
+      messages.push({ id: `${index}-session-exited`, role: "system", text: "Agent session stopped.", time });
     }
     if (event.kind === "session_disconnected") {
       messages.push({
@@ -7698,7 +7670,7 @@ function fallbackDuplexSessions(devices: Device[]): SessionListItem[] {
     device_id: daemon.device_id,
     session_id: "pockly-duplex-test",
     agent: "claude-code",
-    cwd: "/Users/james/Documents/Codex/2026-05-19/https-github-com-pocklyapp-https-github",
+    cwd: "/Users/dev/projects/pockly-duplex-test",
     snippet: "Pockly duplex test",
     last_timestamp: new Date().toISOString(),
     last_seq: 0,
@@ -7804,8 +7776,8 @@ function PairPage({
   }, [connected, onRefreshHosts]);
   const install =
     tab === "unix"
-      ? { label: "macOS / Linux", prompt: "$", command: "curl -fsSL https://cdn.pockly.example/install.sh | bash" }
-      : { label: "Windows PowerShell", prompt: "PS", command: "irm https://cdn.pockly.example/install.ps1 | iex" };
+      ? { label: "macOS / Linux", prompt: "$", command: configuredInstallUnixCommand() }
+      : { label: "Windows PowerShell", prompt: "PS", command: configuredInstallWindowsCommand() };
   return (
     <div className="route-page connect-setup-page">
       <section className="connect-setup-card" aria-label={tx("connect.pageAria")}>
@@ -8013,7 +7985,7 @@ function SettingsPage({
   pushDetail,
   onEnablePush,
   onOpenDevices,
-  onResetEncryptedAccess,
+  onResetBrowserAccess,
   onBack,
   onLogout,
 }: {
@@ -8025,7 +7997,7 @@ function SettingsPage({
   pushDetail: string;
   onEnablePush: () => void;
   onOpenDevices: () => void;
-  onResetEncryptedAccess: () => Promise<void>;
+  onResetBrowserAccess: () => Promise<void>;
   onBack: () => void;
   onLogout: () => void;
 }) {
@@ -8044,9 +8016,8 @@ function SettingsPage({
   const [resetAccessOpen, setResetAccessOpen] = useState(false);
   const [resetAccessBusy, setResetAccessBusy] = useState(false);
   const [resetAccessStatus, setResetAccessStatus] = useState("");
-  // R9: live snapshot of reader preferences; setReaderPreferences
-  // notifies subscribers so timeline renderers update without a
-  // remount.
+  // Live snapshot of reader preferences; setReaderPreferences notifies
+  // subscribers so timeline renderers update without a remount.
   const readerPrefs = useReaderPreferences();
 
   async function checkMicrophone() {
@@ -8109,10 +8080,8 @@ function SettingsPage({
           <SettingsRow icon={<MessageSquare size={18} aria-hidden="true" />} label={tx("settings.feedback")} onClick={() => setFeedbackOpen(true)} />
         </SettingsSection>
 
-        {/* R9: reader preferences — three toggles persisted to
-            localStorage that affect how the conversation timeline
-            renders. Live: flipping a toggle re-renders open sessions
-            without a remount via the readerPrefsListeners. */}
+        {/* Reader preferences are persisted to localStorage and update open
+            sessions without a remount via readerPrefsListeners. */}
         <SettingsSection title={tx("settings.reader")}>
           <SettingsToggleRow
             icon={<ChevronDown size={18} aria-hidden="true" />}
@@ -8170,7 +8139,7 @@ function SettingsPage({
         selectedSession={selectedSession}
         onOpenChange={setFeedbackOpen}
       />
-      <ResetEncryptedAccessDialog
+      <ResetBrowserAccessDialog
         open={resetAccessOpen}
         busy={resetAccessBusy}
         status={resetAccessStatus}
@@ -8183,10 +8152,10 @@ function SettingsPage({
           setResetAccessBusy(true);
           setResetAccessStatus("");
           try {
-            await onResetEncryptedAccess();
+            await onResetBrowserAccess();
             setResetAccessOpen(false);
           } catch (error) {
-            setResetAccessStatus(error instanceof Error ? error.message : tx("settings.resetEncryptedAccessFailed"));
+            setResetAccessStatus(error instanceof Error ? error.message : tx("settings.resetBrowserAccessFailed"));
           } finally {
             setResetAccessBusy(false);
           }
@@ -8196,7 +8165,7 @@ function SettingsPage({
   );
 }
 
-// SessionDriftDialog shows when relay's drift-aware inject (v0.1.27+)
+// SessionDriftDialog shows when Nexus drift-aware inject handling
 // rejects a Send because the wrapper has rebound to a different sid
 // since the page loaded. Two outcomes:
 //   - Confirm: navigate to actualSid AND refill the composer with
@@ -8340,7 +8309,7 @@ function FeedbackDialog({
   );
 }
 
-function ResetEncryptedAccessDialog({
+function ResetBrowserAccessDialog({
   open,
   busy,
   status,
@@ -8356,13 +8325,13 @@ function ResetEncryptedAccessDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="ws-modal">
-        <DialogTitle asChild><h3>{tx("settings.resetEncryptedAccess")}</h3></DialogTitle>
-        <DialogDescription asChild><p>{tx("settings.resetEncryptedAccessBody")}</p></DialogDescription>
+        <DialogTitle asChild><h3>{tx("settings.resetBrowserAccess")}</h3></DialogTitle>
+        <DialogDescription asChild><p>{tx("settings.resetBrowserAccessBody")}</p></DialogDescription>
         {status ? <p className="ws-modal-error">{status}</p> : null}
         <div className="ws-modal-actions">
           <button type="button" className="ws-modal-btn is-cancel" disabled={busy} onClick={() => onOpenChange(false)}>{tx("common.cancel")}</button>
           <button type="button" className="ws-modal-btn is-danger" disabled={busy} onClick={onConfirm}>
-            {busy ? tx("common.loading") : tx("settings.resetEncryptedAccess")}
+            {busy ? tx("common.loading") : tx("settings.resetBrowserAccess")}
           </button>
         </div>
       </DialogContent>
@@ -8370,9 +8339,9 @@ function ResetEncryptedAccessDialog({
   );
 }
 
-// Notifications sub-page (Redesign v2 m-notif-3): the push toggle, a status
-// card reflecting the current push permission state, and a legend documenting
-// the other permission states. Reached from the Settings → Notifications row.
+// Notifications sub-page with the push toggle, a status card reflecting the
+// current push permission state, and a legend documenting the other permission
+// states. Reached from the Settings -> Notifications row.
 function NotificationsSettingsView({
   pushStatus,
   pushDetail,
@@ -8475,10 +8444,10 @@ function SettingsRow({
   return <div className="settings-row settings-row-static">{content}</div>;
 }
 
-// R9: toggle row for boolean preferences. Renders as a labeled row with
-// a native checkbox aligned right (using the existing settings-row
-// chrome for visual consistency). Click anywhere on the row flips the
-// state; checkbox handles keyboard a11y.
+// Toggle row for boolean preferences. Renders as a labeled row with a native
+// checkbox aligned right using the existing settings-row chrome for visual
+// consistency. Click anywhere on the row flips the state; checkbox handles
+// keyboard accessibility.
 function SettingsToggleRow({
   icon,
   label,
@@ -8707,14 +8676,13 @@ function Toolbar({ eyebrow, title, actions, deviceSelector }: { eyebrow?: string
 }
 
 
-// R9: Reader-side user preferences. Three boolean toggles that affect
-// how the conversation timeline renders. Persisted to localStorage on
-// write; surface lives in the workspace Settings page. Module-level
-// singleton + listener set so the deep-tree renderers (TurnArticle,
-// ToolCallCard) can subscribe via a hook without prop-drilling.
+// Reader-side user preferences. Three boolean toggles affect how the
+// conversation timeline renders. Persisted to localStorage on write; surface
+// lives in the workspace Settings page. Module-level singleton + listener set
+// lets deep-tree renderers subscribe via a hook without prop-drilling.
 //
-// Defaults are conservative — match the pre-R9 behavior, so an
-// existing user sees no change until they opt in to the new toggles.
+// Defaults are conservative, so an existing user sees no change until they opt
+// in to the new toggles.
 //
 //   autoExpandTools     — open every tool <details> by default. Off
 //                         by default because the collapsed-summary
@@ -8733,8 +8701,8 @@ function Toolbar({ eyebrow, title, actions, deviceSelector }: { eyebrow?: string
 //                         agent's reasoning can flip this on.
 //   showRawParameters   — show the JSON dump of payload.input in the
 //                         rows-and-raw fallback body. On by default
-//                         (parity with pre-R9). Off keeps the
-//                         structured rows + result output, drops only
+//                         On by default. Off keeps the structured rows + result
+//                         output, drops only
 //                         the input-dump <pre>.
 export type ReaderPreferences = {
   autoExpandTools: boolean;
@@ -8826,11 +8794,10 @@ function useReaderPreferences(): ReaderPreferences {
   return prefs;
 }
 
-// R7: Documented context windows per agent. Used as the denominator
-// for the token-usage pie when the daemon doesn't surface an explicit
-// max. Numbers are conservative defaults — if the user's actual model
-// has more headroom, the pie will just stay green longer (which is the
-// safer failure mode than under-reporting).
+// Documented context windows per agent. Used as the denominator for the
+// token-usage pie when the daemon doesn't surface an explicit max. Numbers are
+// conservative defaults: if the user's actual model has more headroom, the pie
+// stays green longer, which is safer than under-reporting.
 //
 //   claude-code → 200k  (Sonnet 4.x / Opus 4.x both report 200k)
 //   codex       → 272k  (gpt-5-codex baseline per public docs)
@@ -8855,10 +8822,10 @@ export type SessionUsage = { used: number; total: number };
 // so the latest non-zero record reflects current prompt size. Returns
 // null when no turn carries usage (legacy daemon or pure-user session).
 //
-// R7: agent argument selects the context-window denominator per
+// The agent argument selects the context-window denominator per
 // CONTEXT_WINDOW_TOKENS. Callers from a session header already know the
-// session's agent string and pass it through. Backwards-compat: omitting
-// the argument falls back to the Claude 200k default.
+// session's agent string and pass it through. Omitting the argument falls back
+// to the Claude 200k default.
 export function latestSessionUsage(
   turns: SessionTurn[],
   agent?: string | null,
@@ -8875,8 +8842,8 @@ export function latestSessionUsage(
   return null;
 }
 
-// R7: bucket a 0..100 percentage into the visual escalation tier. Pure
-// function so the test can assert thresholds without touching the DOM.
+// Bucket a 0..100 percentage into the visual escalation tier. Pure function so
+// tests can assert thresholds without touching the DOM.
 export type TokenUsageTier = "ok" | "warn" | "danger";
 export function tokenUsageTier(pct: number): TokenUsageTier {
   if (pct >= 80) return "danger";
@@ -8886,14 +8853,13 @@ export function tokenUsageTier(pct: number): TokenUsageTier {
 
 // Circular progress chart for context-window usage. Renders nothing when
 // usage is unknown (so legacy sessions don't show a stale 0%). Color
-// shifts at 50% / 80% so the pill becomes visually louder as we approach
-// the window limit. R7: localized tooltip + tier class on the wrapper so
-// the percent text gets the matching color too.
+// shifts at 50% / 80% so the pill becomes visually louder as we approach the
+// window limit. The localized tooltip and tier class stay on the wrapper so the
+// percent text gets the matching color too.
 // Exported for the renderer fixture (src/renderer-fixture.tsx) so
-// R7 e2e specs assert against the REAL pie — SVG arc, role/aria,
-// tier class, localized tooltip — not a stripped-down copy. A
-// fixture-side reimplementation would let SVG / a11y / i18n
-// regressions slip past the spec.
+// e2e specs assert against the real pie — SVG arc, role/aria, tier class,
+// localized tooltip — not a stripped-down copy. A fixture-side reimplementation
+// would let SVG / a11y / i18n regressions slip past the spec.
 export function TokenUsagePie({ usage }: { usage: SessionUsage }) {
   const rawPct = (usage.used / usage.total) * 100;
   const pct = Math.min(100, Math.max(0, rawPct));
@@ -8934,13 +8900,13 @@ export function TokenUsagePie({ usage }: { usage: SessionUsage }) {
   );
 }
 
-// R8: session-level pending-permission summary. Scans all known turns
-// for v0.2.0+ permission_request attachments still in "pending" state
-// so the UI can surface a banner above the timeline. Pure function so
-// the test asserts shape without mounting React.
+// Session-level pending-permission summary. Scans all known turns for
+// permission_request attachments still in "pending" state so the UI can surface
+// a banner above the timeline. Pure function so tests assert shape without
+// mounting React.
 //
 // We treat a permission_request as pending if it carries a request_id
-// (structured v0.2.0+ shape) and either has no decision field or the
+// structured shape and either has no decision field or the
 // field is the literal string "pending" — matches the inverse check
 // the card itself does.
 export type PendingPermissionSummary = {
@@ -9246,10 +9212,10 @@ function RunningIndicator({ running }: { running: boolean }) {
 // the workspace does in SessionsPage.
 export function TurnArticle({ turn }: { turn: SessionTurn }) {
   const prefs = useReaderPreferences();
-  // R9: showThinking=false hides the entire thinking article — both
-  // the body AND the kind-mark/time aside — so the transcript reads as
-  // assistant/user only. The pref is at the article level (not the
-  // renderer) so the aside doesn't leave an empty timestamp band.
+  // showThinking=false hides the entire thinking article, both the body and the
+  // kind-mark/time aside, so the transcript reads as assistant/user only. The
+  // pref is at the article level so the aside doesn't leave an empty timestamp
+  // band.
   if (turn.kind === "thinking" && !prefs.showThinking) return null;
   const role = kindLabel(turn.kind);
   return (
@@ -9339,7 +9305,7 @@ function TurnRenderer({ turn }: { turn: SessionTurn }) {
 }
 
 // ============================================================
-// MessageGroup pipeline (ported from Pocklyapp design canvas).
+// MessageGroup pipeline.
 //
 // `groupTurnsForRender` walks visible turns and clusters consecutive
 // same-author turns into one MessageGroup, with role+time shown once
@@ -9349,8 +9315,7 @@ function TurnRenderer({ turn }: { turn: SessionTurn }) {
 // while special tools (AskUserQuestion / ExitPlanMode / permission
 // request attachments) break narrative and render standalone.
 //
-// In P2 these are additive — `SessionsPage` still uses TurnArticle
-// per-turn. P3 swaps the pipeline.
+// SessionsPage uses this grouped pipeline directly for the conversation view.
 // ============================================================
 
 export type RenderAuthor = "user" | "assistant";
@@ -9609,11 +9574,9 @@ function NarrativeChevron() {
 export function ToolNarrativeGroup({ tools }: { tools: NarrativeTool[] }) {
   const prefs = useReaderPreferences();
   const [open, setOpen] = useState(!!prefs.autoExpandTools);
-  // Reader prefs are a live snapshot (see useReaderPreferences /
-  // SettingsPage R9 contract): when the user toggles autoExpandTools
-  // from the settings page, every narrative pill in the open session
-  // should snap to the new value to stay consistent with
-  // <details open={prefs.autoExpandTools}> on individual tool cards.
+  // Settings page contract: when the user toggles autoExpandTools, every
+  // narrative pill in the open session should snap to the new value to stay
+  // consistent with <details open={prefs.autoExpandTools}> on individual cards.
   useEffect(() => {
     setOpen(!!prefs.autoExpandTools);
   }, [prefs.autoExpandTools]);
@@ -9867,7 +9830,7 @@ function AttachmentCard({ payload }: { payload: ToolPayload }) {
   );
 }
 
-// PermissionRequestCard is the v0.2.0 interactive permission UI.
+// PermissionRequestCard renders the interactive native-permission bridge.
 // States:
 //   - "pending": Approve / Deny buttons, click POSTs decision.
 //   - "allow"/"deny" (resolved by user, by timeout, or by another
@@ -9954,18 +9917,17 @@ function PermissionRequestCard({
   const isDeny = decision === "deny";
   const isLocalConfirmation = decision === "local_confirmation";
 
-  // Claude.ai's title is sentence-style: "Allow Claude to run <desc>?"
-  // The description is the agent's own one-liner. If absent, fall
-  // back to the tool name so the card still reads as a sentence.
+  // Native agent approval prompts are sentence-style. If the agent did not
+  // provide a description, fall back to the tool name so the card stays clear.
   const subject = description || toolName;
   const titleText = isLocalConfirmation
     ? tx("errors.waitingLocalConfirmationTitle")
     : isPending
-    ? `Allow Claude to run ${subject}?`
+    ? tx("task.permissionAllowTitle", { subject })
     : isAllow
-    ? `Allowed Claude to run ${subject}`
+    ? tx("task.permissionAllowedTitle", { subject })
     : isDeny
-    ? `Denied Claude to run ${subject}`
+    ? tx("task.permissionDeniedTitle", { subject })
     : subject;
   const dotClass = isPending || isLocalConfirmation
     ? "is-pending"
@@ -10023,10 +9985,9 @@ function ToolCallCard({ payload }: { payload: ToolPayload }) {
   const input = asRecord(payload.input);
   const result = payload.result ?? "";
   const toolName = payload.tool ?? tx("workspace.tool");
-  // R2: per-tool spec lookup. The spec produces pure-data
-  // ToolDisplay (name, icon, headerArg, body kind, rows, stateLabel)
-  // and ToolCallCard maps body kinds → body components below.
-  // Specs live in src/content/tools/specs/; registry.ts orders them.
+  // Per-tool spec lookup produces pure-data ToolDisplay metadata. ToolCallCard
+  // maps body kinds to body components below. Specs live in
+  // src/content/tools/specs/; registry.ts orders them.
   const spec = resolveToolSpec(toolName);
   const display = spec.display(input, payload, result);
   const paired = Boolean(payload._paired_result);
@@ -10056,10 +10017,10 @@ function ToolCallCard({ payload }: { payload: ToolPayload }) {
       : "";
   const sidechainItems = payload._sidechain_items ?? [];
   const hasSidechain = sidechainItems.length > 0;
-  // R9: reader preferences. autoExpandTools opens the <details> by
-  // default; showRawParameters gates the input JSON dump in the
-  // rows-and-raw fallback. Tool *output* (result <pre>) is NOT gated
-  // — that's the actually-useful content of a finished tool call.
+  // Reader preferences. autoExpandTools opens the <details> by default;
+  // showRawParameters gates the input JSON dump in the rows-and-raw fallback.
+  // Tool output is not gated because it is the useful content of a finished
+  // tool call.
   const prefs = useReaderPreferences();
 
   return (
@@ -10111,14 +10072,9 @@ function ToolCallCard({ payload }: { payload: ToolPayload }) {
   );
 }
 
-// R3: terminal-styled body for the Bash spec (body="command"). The
-// command sits in a dark mono block with a `$` prompt prefix; a copy
-// button sticks to the top-right. Result output (when the call has
-// completed) renders below in the same terminal style so the user
-// sees command + stdout as one continuous shell session. Long output
-// stays in the existing tool-raw-block treatment because the
-// auto-collapse-after-18-lines logic in the markdown layer already
-// handles overflow for that.
+// Terminal-styled body for command tools. The command sits in a mono block with
+// a `$` prompt prefix and a copy button. Result output renders below in the same
+// terminal style so the user sees command + stdout as one shell session.
 function ToolCommandBody({ name, command, result }: { name?: string; command: string; result: string }) {
   const [copied, setCopied] = useState(false);
   const onCopy = async () => {
@@ -10154,16 +10110,15 @@ function ToolCommandBody({ name, command, result }: { name?: string; command: st
   );
 }
 
-// R4: plan body for the ExitPlanMode spec. Renders the plan markdown
-// in an accent-bordered panel + footer noting the call is awaiting
-// the user's approval. Plan content goes through the same
-// MarkdownBlock pipeline as assistant_text so tables / task lists /
-// fenced code blocks (R1) render identically to a regular reply.
+// Plan body for the ExitPlanMode spec. Renders the plan markdown in an
+// accent-bordered panel and, while unresolved, a footer noting the call is
+// awaiting the user's approval. Plan content uses the same MarkdownBlock
+// pipeline as assistant_text so tables, task lists, and fenced code blocks
+// render like a regular reply.
 //
-// Approval-button wiring is out of scope here — the user replies in
-// the composer with "approve" / "no, revise". R5's AskUserQuestion
-// upgrade may add a generalized inline-action affordance that plan
-// mode could reuse.
+// Approval-button wiring is out of scope here. The user replies in the composer
+// with "approve" / "no, revise"; native permission prompts use their own
+// approval bridge.
 function ToolPlanBody({ plan, resolved }: { plan: string; resolved?: boolean }) {
   return (
     <div className="tool-plan">
@@ -10220,9 +10175,9 @@ function ToolResultCard({ payload }: { payload: ToolPayload }) {
   const rows = resultRows(result);
   const errorClass = payload.is_error ? "tool-card tool-card-oneliner ws-tc is-error" : "tool-card tool-card-oneliner ws-tc";
   const preview = firstUsefulLine(result);
-  // R9: orphan tool_result also obeys autoExpandTools. showRawParameters
-  // does not apply here — result output is the substance of an orphan
-  // card, not the input parameters.
+  // Orphan tool_result cards also obey autoExpandTools. showRawParameters does
+  // not apply here because result output is the substance of the card, not the
+  // input parameters.
   const prefs = useReaderPreferences();
   return (
     <details className={errorClass} open={prefs.autoExpandTools || undefined}>
@@ -10275,10 +10230,10 @@ function ToolGroupCard({ payload }: { payload: ToolPayload }) {
   const count = items.length;
   const errorCount = items.filter((t) => t.payload?.is_error).length;
   const tone: "ok" | "error" | "idle" = errorCount > 0 ? "error" : "ok";
-  // R2: spec lookup for icon + display name. The group itself doesn't
-  // have meaningful per-item input, so we pass empty input/payload —
-  // the spec's `name` and `icon` come from the tool-name match alone,
-  // which is all the group header needs.
+  // Spec lookup for icon + display name. The group itself doesn't have
+  // meaningful per-item input, so we pass empty input/payload. The spec's name
+  // and icon come from the tool-name match alone, which is all the group header
+  // needs.
   const spec = resolveToolSpec(tool);
   const display = spec.display({}, { tool } as ToolPayload, "");
   return (
@@ -10306,9 +10261,8 @@ function ToolGroupCard({ payload }: { payload: ToolPayload }) {
   );
 }
 
-// R2: primaryToolArg removed. Per-tool specs in src/content/tools/specs/
-// own their own header-arg logic; the default spec keeps a near-
-// identical heuristic for unknown tools.
+// Per-tool specs in src/content/tools/specs/ own their own header-arg logic;
+// the default spec keeps a similar heuristic for unknown tools.
 
 function ToolCardHeader({ icon, name, state, tone = "ok" }: { icon: string; name: string; state: string; tone?: "ok" | "error" | "idle" }) {
   return (
@@ -10364,16 +10318,15 @@ function ToolGlyph({ name }: { name: string }) {
   if (name === "shield") {
     return <svg viewBox="0 0 18 18"><path d="M9 3.5 4 5.5v4c0 3 2.5 4.5 5 5 2.5-.5 5-2 5-5v-4L9 3.5Z" /></svg>;
   }
-  // R2: file glyph for Read spec — a document-with-folded-corner.
+  // File glyph for Read spec: a document with a folded corner.
   if (name === "file") {
     return <svg viewBox="0 0 18 18"><path d="M5 3.5h6l3 3v8h-9V3.5Z" /><path d="M11 3.5v3h3" /></svg>;
   }
-  // R2: list glyph for TodoWrite spec — three rows with bullets.
+  // List glyph for TodoWrite spec: three rows with bullets.
   if (name === "list") {
     return <svg viewBox="0 0 18 18"><circle cx="4" cy="5" r="0.8" fill="currentColor" /><path d="M6.5 5h7" /><circle cx="4" cy="9" r="0.8" fill="currentColor" /><path d="M6.5 9h7" /><circle cx="4" cy="13" r="0.8" fill="currentColor" /><path d="M6.5 13h5" /></svg>;
   }
-  // R4: plan glyph for ExitPlanMode spec — clipboard with a folded
-  // top + a check inside.
+  // Plan glyph for ExitPlanMode spec: clipboard with a folded top and check.
   if (name === "plan") {
     return <svg viewBox="0 0 18 18"><path d="M4 4.5h10v10H4z" /><path d="M6.5 3.5h5v2h-5z" /><path d="m7 9.5 1.5 1.5L12 7.5" /></svg>;
   }
@@ -10385,11 +10338,9 @@ export function asRecord(value: unknown): ToolInput {
   return {};
 }
 
-// R2: toolDisplayName / toolStateLabel / toolRows removed — replaced
-// by ToolSpec.display() output (name / stateLabel / rows fields).
-// Per-tool specs live in src/content/tools/specs/; defaultSpec keeps
-// the same heuristics for unknown tools so the fallback rendering
-// matches what was here before.
+// ToolSpec.display() owns display names, state labels, and rows. Per-tool specs
+// live in src/content/tools/specs/; defaultSpec keeps similar heuristics for
+// unknown tools so fallback rendering stays useful.
 
 function resultRows(result: string) {
   const lines = countNonEmptyLines(result);
@@ -10562,10 +10513,8 @@ export function lineDiff(oldText: string, newText: string): DiffOp[] {
 // data URL) when present so the browser doesn't have to fetch an external
 // asset; falls back to image_url for source.type=="url" emissions.
 //
-// R6: capped to a 300×300 thumbnail; click opens an in-page lightbox
-// (full-screen overlay) at native resolution. Replaces the previous
-// "open in new tab" behaviour so the user stays in context — the tab
-// switch was disruptive on mobile especially.
+// Capped to a 300x300 thumbnail; click opens an in-page lightbox at native
+// resolution so the user stays in context, especially on mobile.
 function ImageTurnCard({ payload }: { payload: ToolPayload }) {
   const mime = payload.image_media_type ?? "image/png";
   const src = payload.image_data
@@ -10588,9 +10537,9 @@ function ImageTurnCard({ payload }: { payload: ToolPayload }) {
   );
 }
 
-// R6: full-screen image overlay. Self-implemented (no third-party
-// lightbox lib) to keep bundle size flat and CSP narrow — only
-// renders the same data: / https: URL the thumbnail already used.
+// Full-screen image overlay. Self-implemented to keep bundle size flat and CSP
+// narrow; it only renders the same data: / https: URL the thumbnail already
+// used.
 //
 // Closes on:
 //   - backdrop click
@@ -10767,12 +10716,10 @@ function ToolTodoView({ todos }: { todos: TodoEntry[] }) {
   );
 }
 
-// R5: window-level event channel for AskUserQuestion answers. The
-// question card lives deep inside the turn renderer tree where the
-// active session id isn't in scope; the conversation view at the App
-// level subscribes to this event and inject-sends the text against
-// whatever session is currently selected. Decouples cleanly without
-// dragging a callback through 4+ component layers.
+// Window-level event channel for AskUserQuestion answers. The question card
+// lives deep inside the turn renderer tree where the active session id isn't in
+// scope; the conversation view subscribes to this event and inject-sends the
+// text against whatever session is selected.
 //
 // Payload contract: { text: string } — the literal user message to
 // inject, already formatted (single-select sends one label, multi-
@@ -11150,7 +11097,7 @@ export function sessionDiffs(turns: SessionTurn[]): SessionFileDiff[] {
 // SessionDiffSheet is the diff drawer: a bottom sheet listing every changed
 // file (name + added/removed + a stacked ratio bar), where tapping a file
 // drills into its full diff (rendered by the shared, syntax-highlighted
-// ToolDiffView). Ported from the Workspace Redesign v2 design.
+// ToolDiffView).
 export function SessionDiffSheet({ diffs, open, onClose }: { diffs: SessionFileDiff[]; open: boolean; onClose: () => void }) {
   const [sel, setSel] = useState<number | null>(null);
   useEffect(() => {
@@ -11287,9 +11234,8 @@ export function titleCaseTool(tool: string) {
     .replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-// R2: toolIcon removed — ToolSpec.display() returns an icon key per
-// tool. The default spec's "tool" icon covers unknowns, and dedicated
-// specs override for distinctive glyphs (terminal/edit/search/etc).
+// Tool specs own their display icon. The default spec covers unknown
+// tools, and dedicated specs override for distinctive glyphs.
 
 function MarkdownBlock({ markdown }: { markdown: string }) {
 	  const ref = useRef<HTMLDivElement | null>(null);
@@ -11305,10 +11251,9 @@ function MarkdownBlock({ markdown }: { markdown: string }) {
 	        highlightElement(node as HTMLElement);
 	        decorateCodeBlock(node);
 	      }
-	      // R10: render math sentinels if the lazy-loaded katex came
-	      // back. renderMath is null when no math was detected or the
-	      // dynamic import failed — both cases leave the empty span /
-	      // div in place (CSS hides them so it's a no-op visually).
+	      // Render math sentinels if the lazy-loaded KaTeX module came back.
+	      // renderMath is null when no math was detected or the dynamic import
+	      // failed; both cases leave the empty span/div hidden by CSS.
 	      if (renderMath) {
 	        const mathNodes = ref.current.querySelectorAll("[data-tex]");
 	        mathNodes.forEach((node) => renderMath(node));
@@ -11507,15 +11452,10 @@ async function renderMarkdown(markdown: string) {
   marked.setOptions({ gfm: true, breaks: false });
   configureMarkedOnce(marked);
   const rawHTML = marked.parse(markdown) as string;
-  // R1: tag fenced code blocks with data-lang="<language>" so CSS can
-  // render the language label in the empty top-left corner (the copy
-  // button already lives top-right; padding-top: 42px on .markdown-block
-  // pre leaves room for both). Capture group repurposed from the
-  // existing code-shell tag rewrite. `data-lang` itself does not need
-  // to be in ALLOWED_ATTR — DOMPurify's `ALLOW_DATA_ATTR` defaults to
-  // true and admits every `data-*` attribute via its built-in regex
-  // independent of the named allowlist, so the value flows through
-  // without further config.
+  // Tag fenced code blocks with data-lang="<language>" so CSS can
+  // render a language label without interfering with the copy button.
+  // DOMPurify allows data-* attributes by default, so the value flows
+  // through without extending ALLOWED_ATTR.
   const html = DOMPurify.sanitize(
     rawHTML.replace(codeBlockRE, '<pre class="code-shell" data-lang="$1"><code class="language-$1">'),
     {
@@ -11524,10 +11464,9 @@ async function renderMarkdown(markdown: string) {
       FORBID_TAGS: ["style", "iframe", "object", "embed", "form", "input", "button"],
     },
   );
-  // R10: only load katex when math is actually present. The check is
-  // against the *sanitized* html (not the raw markdown) so we're sure
-  // DOMPurify didn't strip our sentinel — if it ever does, lazy-load
-  // is skipped and the data-tex spans just render as empty (harmless).
+  // Only load KaTeX when math is actually present. The check is against the
+  // sanitized HTML so we know DOMPurify kept our sentinel; if it ever strips the
+  // sentinel, the data-tex spans render as empty and the lazy import is skipped.
   let renderMath: ((node: Element) => void) | null = null;
   if (html.includes("data-tex=")) {
     try {
@@ -11547,9 +11486,8 @@ async function renderMarkdown(markdown: string) {
           katex.render(tex, node as HTMLElement, {
             throwOnError: false,
             displayMode,
-            // R10: output: 'html' avoids MathML — keeps the DOM
-            // closer to plain HTML and skirts a few Safari quirks
-            // where MathML font-fallback shows tofu glyphs.
+            // output: "html" avoids MathML, keeping the DOM closer to plain
+            // HTML and avoiding Safari MathML font fallback quirks.
             output: "html",
           });
         } catch {
@@ -11564,14 +11502,10 @@ async function renderMarkdown(markdown: string) {
   return { html, highlightElement: hljs.default.highlightElement, renderMath };
 }
 
-// R1: marked.use mutates a singleton and STACKS renderer overrides on
-// every call. Calling it once per renderMarkdown invocation grew the
-// listitem renderer chain unbounded over the lifetime of the page —
-// every non-task list item walked the full chain (each layer returned
-// false → fallback to the next), and each layer's closure was retained
-// in memory. Gate behind a module-level flag so the renderer override
-// is registered exactly once, regardless of how many concurrent or
-// sequential renderMarkdown calls land.
+// marked.use mutates a singleton and stacks renderer overrides on every call.
+// Calling it once per renderMarkdown invocation grew the listitem renderer
+// chain unbounded over the lifetime of the page. Gate behind a module-level flag
+// so the renderer override is registered exactly once.
 let markedConfigured = false;
 function configureMarkedOnce(marked: typeof import("marked").marked) {
   if (markedConfigured) return;
@@ -11591,12 +11525,10 @@ function configureMarkedOnce(marked: typeof import("marked").marked) {
         return `<li class="task-item"><span class="task-check${checked}" aria-hidden="true"></span>${inner}</li>\n`;
       },
     },
-    // R10: LaTeX math extensions. The tokenizer emits sentinel HTML
-    // nodes carrying the raw TeX in data-tex; an opt-in lazy KaTeX
-    // pass in renderMarkdown then replaces those sentinels with the
-    // rendered formula. Splitting "tokenize" from "render" lets us
-    // skip loading the ~280KB katex bundle entirely when no math is
-    // present in the markdown.
+    // LaTeX math extensions. The tokenizer emits sentinel HTML nodes carrying
+    // the raw TeX in data-tex; an opt-in lazy KaTeX pass in renderMarkdown then
+    // replaces those sentinels with the rendered formula. Splitting "tokenize"
+    // from "render" lets us skip loading KaTeX when no math is present.
     //
     // Block math: $$...$$  and  \[...\]
     // Inline math:           \(...\)
@@ -11656,11 +11588,8 @@ function configureMarkedOnce(marked: typeof import("marked").marked) {
   });
 }
 
-// R10: HTML-attribute escape for data-tex. KaTeX takes the raw TeX
-// source (not HTML), so what we need is to make sure the value
-// survives the attribute round-trip without breaking the HTML or
-// triggering XSS. Escape the five chars that matter inside a
-// double-quoted attribute value.
+// HTML-attribute escape for data-tex. KaTeX takes the raw TeX source, so this
+// only needs to keep the value valid inside a double-quoted HTML attribute.
 function escapeHtmlAttr(s: string): string {
   return s
     .replace(/&/g, "&amp;")
@@ -11670,10 +11599,9 @@ function escapeHtmlAttr(s: string): string {
     .replace(/>/g, "&gt;");
 }
 
-// R10: quick detector — returns true if the markdown contains any of
-// our supported math delimiters outside obvious code-fence contexts.
-// Used by renderMarkdown to skip the KaTeX lazy-load when no math is
-// present. Exported for unit tests.
+// Quick detector: returns true if the markdown contains any supported math
+// delimiters outside obvious code-fence contexts. Used by renderMarkdown to
+// skip the KaTeX lazy-load when no math is present.
 export function hasMathSyntax(markdown: string): boolean {
   if (!markdown) return false;
   // Strip fenced code blocks before scanning so `$$x$$` inside ``` ```
@@ -11933,10 +11861,8 @@ export function mergeAdjacentAssistantTurns(turns: SessionTurn[]): SessionTurn[]
   return out;
 }
 
-// Redesign v2 unified empty / preparing / edge-state block: an icon bubble
-// (or a spinner) + heading + optional sub / helper / footer (a .ws-empty-actions
-// button pair, or an inline link). All the in-reader "no turns to show yet"
-// states render through this so they share one visual language.
+// Shared empty / preparing / edge-state block used by the reader so
+// transient "no turns yet" states keep one visual language.
 function WsEmpty({
   icon,
   tone,
@@ -11966,10 +11892,9 @@ function WsEmpty({
 }
 
 // The reader's "a session is selected but there are no turns to show" state,
-// resolved to the right Redesign v2 edge state by the session's liveness +
-// connection: dead session, no connected computer, offline (read_only), a
-// freshly-empty writable session ("ready to hand off"), or a load error.
-// Mirrors the design's pruned model — writable→ready, read_only→offline.
+// resolved by the session's liveness and connection state: dead session, no
+// connected computer, offline (read_only), a freshly-empty writable session
+// ("ready to hand off"), or a load error.
 function ReaderEdgeState({
   session,
   daemonDevices,
@@ -12210,7 +12135,7 @@ export function pickSelection(
     if (routed) return { sessionId: routed.session_id, deviceId: routed.device_id };
     // Catalog may lag the route by a few seconds — e.g. a draft just got
     // promoted to a real session_id via the daemon's session_created event,
-    // but the relay's catalog sync hasn't included it yet. If `current`
+    // but Nexus catalog sync hasn't included it yet. If `current`
     // already points at this routed session_id, keep it instead of falling
     // through to bestContinuationCandidate, which would silently jump to a
     // different session (typically the most-active one on the same device).
@@ -12227,7 +12152,7 @@ export function pickSelection(
     return best ? { sessionId: best.session_id, deviceId: best.device_id } : null;
   }
   if (current) {
-    // Drafts are client-side only — they never appear in the relay's
+    // Drafts are client-side only — they never appear in Nexus
     // session catalog. Without this short-circuit, every catalog
     // refresh that runs through pickSelection while a draft is the
     // current selection would fall through to bestContinuationCandidate
@@ -12266,12 +12191,11 @@ export function normalizeUserMessageKey(text: string | undefined): string {
 }
 
 // `authoritative` marks `hydrated` as the COMPLETE server-truth turn list for
-// the session (a GET /turns response — listEncryptedTurnsForBrowserSession /
-// listPlaintextTurnsForSession both return the whole session, ORDER BY seq, no
-// window). In that mode a `current` genuine turn (seq < 9e8) is redundant: it is
+// the session (a GET /turns response returns the whole session, ORDER BY seq,
+// no window). In that mode a `current` genuine turn (seq < 9e8) is redundant: it is
 // either already in `hydrated` under the same seq (mergeTurns folds it) or it is
 // a STALE copy the live turnHub push (subscribeToSession → reconcile, App.tsx
-// ~931) left behind under a DIFFERENT genuine-seq scheme — the relay stamps live
+// ~931) left behind under a DIFFERENT genuine-seq scheme — Nexus stamps live
 // SDK `user_input`/`message_added` bridge turns with the terminal-event counter
 // (evt.Seq) while the jsonl history sync stamps the same message with a
 // block-index seq (minSeq+idx). Two genuine same-text turns at different seqs
@@ -12365,7 +12289,7 @@ export function reconcileHydratedTurns(current: SessionTurn[], hydrated: Session
   return dedupeUserMessageGhosts(dedupeTurnsByUuid(mergeTurns(preserved, hydrated)));
 }
 
-// turnBlockIdentity is a per-BLOCK key for de-duplication. The relay can
+// turnBlockIdentity is a per-BLOCK key for de-duplication. Nexus can
 // persist ONE logical block under TWO seqs: the live SDK stream bridge
 // (control.go bridgeSDKTerminalEventToTurn) stamps the terminal-event counter,
 // while the daemon's jsonl history sync stamps a block index — both carry the
@@ -12443,7 +12367,7 @@ function dedupeUserMessageGhosts(turns: SessionTurn[]): SessionTurn[] {
   // Does any GENUINE copy of this user text carry a jsonl uuid? A real
   // double-send produces TWO durable jsonl records (two distinct uuids); the
   // live-vs-synced artifact produces ONE uuid'd history record plus a no-uuid
-  // live-bridge copy (the relay's SDK user_input bridge stamps text only, with
+  // live-bridge copy (Nexus SDK user_input bridge stamps text only, with
   // the terminal-event counter as seq — a genuine integer seq, so it can't be
   // told apart from a real second send by seq alone). When a uuid'd copy
   // exists, the no-uuid copies are duplicates of it and must be dropped.
@@ -12694,10 +12618,10 @@ export function sessionConnectionMode(session: SessionListItem | null) {
 
 export function canControlSession(session: SessionListItem | null) {
   // Draft conversations live only on the client until the first message is
-  // sent — they have no relay-side writable flag yet, but the composer must
+  // sent — they have no Nexus-side writable flag yet, but the composer must
   // be usable so sending can promote the draft into a real session.
   if (isDraftConversation(session)) return true;
-  // Writability follows the relay's `writable` field, not a specific mode.
+  // Writability follows Nexus's `writable` field, not a specific mode.
   // PTY mirror and SDK headless are both writable when daemon is online.
   return session?.writable === true;
 }
@@ -12855,8 +12779,6 @@ function syncStageLabel(stage: SyncSessionEvent["stage"]) {
       return tx("syncStage.locating");
     case "extracting":
       return tx("syncStage.extracting");
-    case "encrypting":
-      return tx("syncStage.encrypting");
     case "uploading":
       return tx("syncStage.uploading");
     case "completed":
@@ -12870,7 +12792,6 @@ function syncStageLabel(stage: SyncSessionEvent["stage"]) {
 
 function syncErrorMessage(message: string) {
   if (message === "daemon offline") return tx("errors.daemonOffline");
-  if (message === "no_recipients" || message === "browser_key_missing" || message === "recipient_not_ready") return tx("errors.encryptedAccessSetupFailed");
   // Daemon API returns "session not found" (with spaces); the sync
   // stream uses the snake_case "session_not_found". Map both to the
   // friendly localized copy so the user never sees the raw English.
@@ -12908,7 +12829,7 @@ export function liveMessageStableSeqKey(
 
 function isStaleBrowserDeviceError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error || "");
-  return message.includes("revoked browser device") ||
+  return message.includes("revoked browser access") ||
     message.includes("device_revoked") ||
     message.includes("eligible device not found");
 }
@@ -13018,7 +12939,7 @@ function filterSessions(
 }
 
 // sessionDisplayName picks the best human-readable label for a session.
-// Precedence: (1) the relay-generated `title` (SiliconFlow summary of the
+// Precedence: (1) the Nexus-generated `title` (summary of the
 // first message) when present — it's a strictly better automatic label than
 // the mechanical snippet truncation; (2) the `override` arg, the web-derived
 // title from sessionTitles (shown immediately as a fallback before the async
@@ -13030,7 +12951,7 @@ function sessionDisplayName(session: SessionListItem, override?: string) {
   const trimmedOverride = override?.trim();
   if (trimmedOverride) return trimmedOverride;
   const snippet = (session.snippet || "").trim();
-  if (snippet && snippet !== "Encrypted session") {
+  if (snippet) {
     return snippet;
   }
   const project = lastPathSegment(session.cwd) || session.cwd || tx("workspace.session");
@@ -13042,13 +12963,11 @@ function sessionDisplayName(session: SessionListItem, override?: string) {
 
 // ── Session title cache ──────────────────────────────────────────────
 //
-// The daemon catalog uploads non-sensitive synthesised snippets to the
-// relay; real prompt content stays in the E2E-encrypted turns. Once
-// the browser has decrypted a session's turns it can locally derive a
-// short title from the first user message — that's `deriveSessionTitle`
-// below. The derived title is cached per session_id in localStorage so
-// previously-opened sessions render with a useful label even on a cold
-// list view, without ever shipping prompt content to the relay.
+// The daemon catalog uploads synthesised snippets to Nexus. Once the browser
+// has loaded a session's turns it can locally derive a short title from the
+// first user message — that's `deriveSessionTitle` below. The derived title is
+// cached per session_id in localStorage so previously-opened sessions render
+// with a useful label even on a cold list view.
 
 // Scope by user so two accounts on the same browser don't share derived
 // titles (and so that logout actually erases an account's local prompt
@@ -13489,6 +13408,8 @@ function authErrorMessage(error: unknown) {
       return tx("errors.rateLimited");
     case "verification_email_failed":
       return tx("errors.verificationEmailFailed");
+    case "verification_not_configured":
+      return tx("errors.verificationNotConfigured");
     default:
       return message;
   }
@@ -13510,7 +13431,7 @@ function feedbackErrorMessage(error: unknown) {
 
 function injectControlErrorMessage(message: string) {
   // Daemon-side drift surfaces as "session_drifted current=<sid>" from
-  // control.injectIntoPTY. Same root cause as relay-side session_drifted,
+  // control.injectIntoPTY. Same root cause as Nexus-side session_drifted,
   // just emitted later (after the request reached the daemon). Translate
   // to the same actionable copy so users get a consistent message;
   // sendPromptForSession's catch handles the actual switch.
@@ -13529,7 +13450,7 @@ function injectControlErrorMessage(message: string) {
       return tx("errors.injectMissingText");
     case "session_not_attached":
     case "not_pty_backed":
-      // Legacy daemon/relay codes from before the SDK-headless mode.
+      // Legacy daemon/Nexus codes from before the SDK-headless mode.
       // Both meant "no PTY wrapper bound" — under the new model that
       // case is supposed to be served by an SDK subprocess instead. If a
       // build of either side still emits these, fall back to the

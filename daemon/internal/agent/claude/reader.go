@@ -138,8 +138,8 @@ func listSessionFiles(dir string) ([]SessionFile, error) {
 	return out, nil
 }
 
-// cwdFromDirName converts -Users-liuzheng-Desktop-workspace back into
-// /Users/example/Desktop/workspace. This is best-effort: if the
+// cwdFromDirName converts -Users-alice-Desktop-workspace back into
+// /Users/alice/Desktop/workspace. This is best-effort: if the
 // original path contained dashes, the round-trip is lossy. The cwd is
 // only used for display and for finding the directory to spawn
 // `claude --resume` from, so a wrong reconstruction will surface as a
@@ -254,7 +254,7 @@ func ParseRecords(path string) iter.Seq2[Record, error] {
 
 // LatestModel returns the model id from the most recent assistant
 // record in the session jsonl — the ground-truth model the running
-// claude actually used last (e.g. "deepseek-v4-flash", or a full
+// claude actually used last (e.g. "anthropic-compatible-fast", or a full
 // "claude-sonnet-4-..." id). Returns "" when the file has no
 // assistant turn yet or can't be opened.
 //
@@ -318,7 +318,7 @@ var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
 // records Claude wrote, plus the latest resolved target. Claude records these
 // as user local-command-stdout rows such as:
 //
-//	<local-command-stdout>Set model to \x1b[1mdeepseek-v4-pro\x1b[22m for this session</local-command-stdout>
+//	<local-command-stdout>Set model to \x1b[1manthropic-compatible-pro\x1b[22m for this session</local-command-stdout>
 //
 // The observation is used to distinguish an accepted PTY write from a model
 // switch that was swallowed by a native permission sheet or another TUI state.

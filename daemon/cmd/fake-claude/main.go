@@ -7,10 +7,10 @@
 //
 //   - the wrapper's discoverSessionIDFromProjectsDir (mtime-bump
 //     detection in ~/.claude/projects/<encoded-cwd>/*.jsonl) fires
-//   - daemon's catalog sync surfaces a session to the relay
+//   - daemon's catalog sync surfaces a session to Nexus
 //   - inject from the web reaches the wrapper's PTY, which forwards
 //     to this fake's stdin; we append a user_message + assistant event,
-//     letting the relay turn correlator see the round-trip.
+//     letting the Nexus turn correlator see the round-trip.
 //
 // On startup, writes a single `system` event to seed the jsonl. Then
 // reads stdin line-by-line; each line becomes a `user` event followed
@@ -45,10 +45,9 @@ const fakeVersion = "0.0.0-fake (Pockly e2e fake claude)"
 func main() {
 	// Mimic the few flags pockly-claude-wrapper's shouldPassThrough()
 	// special-cases so the wrapper doesn't try to bypass us into a
-	// nonexistent "real claude" sibling. Also honor --session-id since
-	// v0.1.36's wrapper injects it; without honoring it, the wrapper's
-	// locked watcher would tail <wrapper-uuid>.jsonl while we'd write
-	// to <our-fresh-uuid>.jsonl — paths diverge, e2e goes silent.
+	// nonexistent "real claude" sibling. Honor --session-id so the
+	// wrapper's locked watcher and this fake agent write/read the same
+	// JSONL path.
 	var injectedSID string
 	var requestedModel string
 	var streamJSON bool
@@ -194,7 +193,7 @@ func main() {
 			})
 
 			// Pretend to "think" for a bit so the timing looks plausible
-			// in the relay's turn timeline.
+			// in the Nexus turn timeline.
 			time.Sleep(50 * time.Millisecond)
 
 			// assistant event

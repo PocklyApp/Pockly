@@ -6,7 +6,7 @@
 import { defineConfig, devices } from "@playwright/test";
 
 // Renderer tests run against a developer-managed Vite server. They do not
-// require a relay, daemon, Docker stack, or model provider credentials.
+// require Nexus, a daemon, Docker stack, or model provider credentials.
 export default defineConfig({
   testDir: "./tests/playwright",
   // CI-friendly defaults. The race we're guarding against in

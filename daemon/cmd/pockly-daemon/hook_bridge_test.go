@@ -26,7 +26,7 @@ func TestParseHookPayload(t *testing.T) {
 			name: "PreToolUse Bash",
 			body: `{
 				"session_id": "sess_aaa",
-				"transcript_path": "/Users/james/.claude/projects/x/sess_aaa.jsonl",
+				"transcript_path": "/Users/dev/.claude/projects/x/sess_aaa.jsonl",
 				"hook_event_name": "PreToolUse",
 				"tool_name": "Bash",
 				"tool_input": {"command": "ls -la"}
@@ -103,9 +103,9 @@ func TestParseHookPayload(t *testing.T) {
 	}
 }
 
-// TestWriteEmptyDecision: the H1 default that makes claude fall back
-// to its built-in prompt. Has to be {}\n exactly — anything else
-// gets parsed as a real decision and could surprise claude.
+// TestWriteEmptyDecision verifies the empty hook response that makes Claude
+// fall back to its built-in prompt. Has to be {}\n exactly; anything else gets
+// parsed as a real decision and could surprise Claude.
 func TestWriteEmptyDecision(t *testing.T) {
 	var buf bytes.Buffer
 	if err := writeEmptyDecision(&buf); err != nil {
