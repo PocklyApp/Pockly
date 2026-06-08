@@ -85,8 +85,6 @@ import { AppShell, Workspace } from "./components/layout/app-shell";
 import { ThemeToggle } from "./components/layout/theme-toggle";
 import { useTheme, type ThemeMode } from "./theme";
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogTitle, Input, Notice, Select, Textarea } from "./components/ui";
-import { getSiteContent } from "./content/site";
-import { getDocsSections, type DocsBlock } from "./content/docs";
 import { resolveToolSpec } from "./content/tools/registry";
 import { trackEvent } from "./observability";
 import { configuredInstallUnixCommand, configuredInstallWindowsCommand } from "./runtime-config";
@@ -135,9 +133,6 @@ type AuthState =
   | { status: "authenticated"; email: string; name: string };
 
 export type Route =
-  | { view: "publicEntry" }
-  | { view: "publicDocs" }
-  | { view: "publicChangelog" }
   | { view: "login" }
   | { view: "cliLogin"; deviceCode: string }
   | { view: "duplexTest" }
@@ -272,12 +267,6 @@ function routeTelemetryPath(route: Route) {
       return "/local-setup";
     case "mobileJoin":
       return "/mobile-join";
-    case "publicDocs":
-      return "/docs";
-    case "publicChangelog":
-      return "/changelog";
-    case "publicEntry":
-      return "/";
     case "duplexTest":
       return "/duplex-test";
     case "login":
@@ -3663,16 +3652,6 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     );
   }
 
-  if (isPublicRoute(route)) {
-    return (
-      <PublicSite
-        route={route}
-        auth={auth}
-        onNavigate={(next) => void navigate(next)}
-      />
-    );
-  }
-
   // Don't flash the login page while the initial getSession() is in flight
   // for users who already have a valid cookie. Render a neutral splash for
   // the loading window; LoginPage only renders once we've confirmed there
@@ -3954,187 +3933,6 @@ function SplashScreen() {
     >
       <RefreshCw className="app-splash-spinner" size={22} strokeWidth={1.8} aria-hidden="true" />
     </div>
-  );
-}
-
-function PublicSite({ route, auth, onNavigate }: { route: Route; auth: AuthState; onNavigate: (route: Route) => void }) {
-  return (
-    <main className="public-site">
-      <PublicHeader route={route} auth={auth} onNavigate={onNavigate} />
-      {route.view === "publicEntry" ? (
-        <PublicEntry auth={auth} onNavigate={onNavigate} />
-      ) : route.view === "publicDocs" ? (
-        <DocsPage />
-      ) : (
-        <ChangelogPage />
-      )}
-    </main>
-  );
-}
-
-function PublicHeader({ route, auth, onNavigate }: { route: Route; auth: AuthState; onNavigate: (route: Route) => void }) {
-  return (
-    <header className="public-header">
-      <button type="button" className="public-brand" onClick={() => onNavigate({ view: "publicEntry" })}>
-        <span className="brand-mark" aria-hidden="true"><img src="/pockly-icon.svg" alt="" /></span>
-        <span>
-          <strong>Pockly</strong>
-          <small>{tx("public.brandSubtitle")}</small>
-        </span>
-      </button>
-      <nav aria-label={tx("public.nav.aria")}>
-        <button type="button" className={route.view === "publicEntry" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicEntry" })}>{tx("public.nav.home")}</button>
-        <button type="button" className={route.view === "publicDocs" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicDocs" })}>{tx("public.nav.docs")}</button>
-        <button type="button" className={route.view === "publicChangelog" ? "is-active" : ""} onClick={() => onNavigate({ view: "publicChangelog" })}>{tx("public.nav.changelog")}</button>
-      </nav>
-      <div className="public-actions">
-        <ThemeToggle />
-        {auth.status === "authenticated" ? (
-          <Button onClick={() => onNavigate({ view: "workspaceSessions" })}>{tx("public.actions.openWorkspace")}</Button>
-        ) : (
-          <Button onClick={() => onNavigate({ view: "login" })}>{tx("public.actions.signIn")}</Button>
-        )}
-      </div>
-    </header>
-  );
-}
-
-function PublicEntry({ auth, onNavigate }: { auth: AuthState; onNavigate: (route: Route) => void }) {
-  return (
-    <section className="public-entry">
-      <div className="public-entry-copy">
-        <span className="public-entry-label">{tx("public.entry.label")}</span>
-        <h1>{tx("public.entry.title")}</h1>
-        <p>{tx("public.entry.body")}</p>
-      </div>
-      <div className="public-entry-actions" aria-label={tx("public.entry.actionsAria")}>
-        <button
-          type="button"
-          className="public-entry-card"
-          onClick={() => onNavigate(auth.status === "authenticated" ? { view: "workspaceSessions" } : { view: "login" })}
-        >
-          <strong>{tx("public.entry.openWorkspace")}</strong>
-          <span>{tx("public.entry.openWorkspaceBody")}</span>
-        </button>
-        <button
-          type="button"
-          className="public-entry-card"
-          onClick={() => onNavigate({ view: "workspaceConnect" })}
-        >
-          <strong>{tx("public.entry.connectNexus")}</strong>
-          <span>{tx("public.entry.connectNexusBody")}</span>
-        </button>
-        <button
-          type="button"
-          className="public-entry-card"
-          onClick={() => onNavigate({ view: "publicDocs" })}
-        >
-          <strong>{tx("public.entry.selfHostingDocs")}</strong>
-          <span>{tx("public.entry.selfHostingDocsBody")}</span>
-        </button>
-        <a className="public-entry-card" href="https://github.com/PocklyApp/Pockly">
-          <strong>{tx("public.entry.github")}</strong>
-          <span>{tx("public.entry.githubBody")}</span>
-        </a>
-      </div>
-    </section>
-  );
-}
-
-function DocsBlockView({ block }: { block: DocsBlock }) {
-  switch (block.kind) {
-    case "p":
-      return <p>{block.text}</p>;
-    case "subhead":
-      return <h3 className="docs-subhead">{block.text}</h3>;
-    case "list":
-      return (
-        <ul className="docs-list">
-          {block.items.map((item, i) => <li key={i}>{item}</li>)}
-        </ul>
-      );
-    case "steps":
-      return (
-        <ol className="docs-steps">
-          {block.items.map((item, i) => <li key={i}>{item}</li>)}
-        </ol>
-      );
-    case "command":
-      return (
-        <div className="docs-command">
-          {block.caption ? <span className="docs-command-cap">{block.caption}</span> : null}
-          <pre><code>{block.code}</code></pre>
-        </div>
-      );
-    case "note":
-      return <div className="docs-note">{block.text}</div>;
-    case "defs":
-      return (
-        <dl className="docs-defs">
-          {block.items.map((item, i) => (
-            <div key={i} className="docs-def">
-              <dt>{item.term}</dt>
-              <dd>{item.desc}</dd>
-            </div>
-          ))}
-        </dl>
-      );
-    default:
-      return null;
-  }
-}
-
-function DocsPage() {
-  const { t, i18n } = useTranslation();
-  const sections = getDocsSections(i18n.language);
-  return (
-    <section className="public-doc-layout">
-      <aside className="docs-toc">
-        <span className="label">{t("public.docs.tocLabel")}</span>
-        {sections.map((section) => <a key={section.id} href={`#${section.id}`}>{section.title}</a>)}
-      </aside>
-      <div className="docs-content">
-        <div className="public-page-head">
-          <span className="label">{t("public.docs.pageLabel")}</span>
-          <h1>{t("public.docs.title")}</h1>
-          <p>{t("public.docs.body")}</p>
-        </div>
-        {sections.map((section) => (
-          <article key={section.id} id={section.id} className="docs-section">
-            <h2>{section.title}</h2>
-            {section.blocks.map((block, i) => <DocsBlockView key={i} block={block} />)}
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function ChangelogPage() {
-  const { changelogEntries } = getSiteContent(appI18n.t.bind(appI18n));
-  return (
-    <section className="changelog-page">
-      <div className="public-page-head">
-        <span className="label">{tx("public.changelog.pageLabel")}</span>
-        <h1>{tx("public.changelog.title")}</h1>
-        <p>{tx("public.changelog.body")}</p>
-      </div>
-      <div className="changelog-list">
-        {changelogEntries.map((entry) => (
-          <article key={`${entry.version}-${entry.title}`} className="changelog-card">
-            <time>{entry.date}</time>
-            <div>
-              <span className="label">{entry.version}</span>
-              <h2>{entry.title}</h2>
-              <p>{entry.summary}</p>
-              <div className="tag-row">
-                {entry.tags.map((tag) => <span key={tag}>{tag}</span>)}
-              </div>
-            </div>
-          </article>
-        ))}
-      </div>
-    </section>
   );
 }
 
@@ -12009,14 +11807,12 @@ function ReaderEdgeState({
 }
 
 function parseRoute(): Route {
-  if (window.location.pathname === "/") return { view: "publicEntry" };
-  if (window.location.pathname === "/docs") return { view: "publicDocs" };
-  if (window.location.pathname === "/changelog") return { view: "publicChangelog" };
+  if (window.location.pathname === "/") return { view: "workspaceSessions" };
   if (window.location.pathname === "/login") return { view: "login" };
   if (window.location.pathname === "/duplex-test") {
     const env = window.POCKLY_CONFIG?.environment || "local";
     if (env === "local") return { view: "duplexTest" };
-    return { view: "publicEntry" };
+    return { view: "workspaceSessions" };
   }
   if (window.location.pathname === "/cli/login") {
     const deviceCode = new URLSearchParams(window.location.search).get("device_code")?.trim() ?? "";
@@ -12088,17 +11884,11 @@ function parseRoute(): Route {
       deviceId,
     };
   }
-  return { view: "publicEntry" };
+  return { view: "workspaceSessions" };
 }
 
 function routeToPath(route: Route) {
   switch (route.view) {
-    case "publicEntry":
-      return "/";
-    case "publicDocs":
-      return "/docs";
-    case "publicChangelog":
-      return "/changelog";
     case "login":
       return "/login";
     case "cliLogin":
@@ -12135,7 +11925,7 @@ function isReaderRoute(route: Route) {
 }
 
 function isPublicRoute(route: Route) {
-  return route.view === "publicEntry" || route.view === "publicDocs" || route.view === "publicChangelog" || route.view === "duplexTest" || route.view === "mobileJoin";
+  return route.view === "duplexTest" || route.view === "mobileJoin";
 }
 
 function isAuthenticatedWorkspaceRoute(route: Route) {
