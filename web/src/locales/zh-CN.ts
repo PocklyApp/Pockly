@@ -90,7 +90,7 @@ export const zhCN = {
     name: "姓名",
     password: "密码",
     confirmPassword: "确认密码",
-    passwordHint: "请至少使用 10 个字符。自托管 Nexus 默认会在创建账号后直接登录，除非你的部署额外接入了验证流程。",
+    passwordHint: "请至少使用 10 个字符。",
     sendVerificationCode: "创建账号",
     newToPockly: "第一次使用 Pockly？",
     alreadyHaveAccount: "已有账号？",
