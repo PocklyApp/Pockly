@@ -90,7 +90,7 @@ export const en = {
     name: "Name",
     password: "Password",
     confirmPassword: "Confirm password",
-    passwordHint: "Use at least 10 characters. Self-hosted Nexus signs you in after account creation unless your deployment adds verification.",
+    passwordHint: "Use at least 10 characters.",
     sendVerificationCode: "Create account",
     newToPockly: "New to Pockly?",
     alreadyHaveAccount: "Already have an account?",
