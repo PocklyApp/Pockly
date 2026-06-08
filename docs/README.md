@@ -1,5 +1,6 @@
 # Pockly Documentation
 
+- [User Guide](./user-guide.md) · [中文](./user-guide.zh-CN.md)
 - [Architecture](./architecture.md)
 - [Development](./development.md)
 - [Self-hosting Nexus](./self-hosting.md)
