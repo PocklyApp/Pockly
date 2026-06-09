@@ -11527,10 +11527,16 @@ export function isRenderableConversationTurn(turn: SessionTurn) {
 }
 
 export function visibleConversationTurns(turns: SessionTurn[]) {
-  return groupConsecutiveTools(
-    mergeAdjacentToolPairs(
-      mergeAdjacentAssistantTurns(nestSidechainTurns(turns.filter(isRenderableConversationTurn))),
-    ),
+  // NOTE: consecutive same-tool runs are intentionally NOT pre-collapsed into
+  // `tool_group` carriers here. The narrative renderer (segmentGroupBody →
+  // ToolNarrativeGroup → narrativePhrase) already condenses a run into a single
+  // line ("Edited 4 files") with a drill-in body of the individual cards. Doing
+  // it twice produced two inconsistent renderings in one conversation — a run
+  // of >=4 became a "4 次连续调用" ToolGroupCard while shorter/mixed runs stayed
+  // narrative. Let every tool run flow through the narrative path so the styling
+  // is uniform.
+  return mergeAdjacentToolPairs(
+    mergeAdjacentAssistantTurns(nestSidechainTurns(turns.filter(isRenderableConversationTurn))),
   );
 }
 
