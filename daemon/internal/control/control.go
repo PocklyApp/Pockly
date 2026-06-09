@@ -492,18 +492,70 @@ func Run(ctx context.Context, cfg Client) error {
 		codexTerminals: map[string]*codexProcessTerminal{},
 		agentSettings:  cfg.AgentSettings,
 	}
+	// Reconnect with a self-resetting exponential backoff. A flaky network or a
+	// TUN/HTTP proxy in front of the daemon will sever the long-lived control WS
+	// at irregular intervals (observed: 1006 / "use of closed network
+	// connection" while the request/response HTTP sync sails through). The old
+	// fixed 2s delay left the daemon "offline" — and therefore un-injectable —
+	// for whole seconds on every cut. Instead: reconnect in well under a second
+	// after a healthy connection drops, but back off (capped) when reconnects
+	// keep failing back-to-back (e.g. during a deploy) so we don't hammer.
+	backoff := controlReconnectInitial
 	for {
 		attemptStarted := time.Now()
 		if err := runOnce(ctx, cfg, r); err != nil {
-			telemetry.Send(context.Background(), cfg.RelayURL, cfg.Identity, telemetry.Event{Name: "control_disconnected", Command: "serve", Status: "error", ErrorCode: err.Error(), DurationMS: time.Since(attemptStarted)})
+			connectedFor := time.Since(attemptStarted)
+			telemetry.Send(context.Background(), cfg.RelayURL, cfg.Identity, telemetry.Event{Name: "control_disconnected", Command: "serve", Status: "error", ErrorCode: err.Error(), DurationMS: connectedFor})
+			// A connection that stayed up past the stable threshold then dropped
+			// is treated as healthy: reset to the initial delay so the very next
+			// reconnect is near-instant. Only repeated quick failures grow it.
+			if connectedFor >= controlReconnectStable {
+				backoff = controlReconnectInitial
+			}
+			delay := jitteredBackoff(backoff)
 			select {
 			case <-ctx.Done():
 				return nil
-			case <-time.After(2 * time.Second):
-				log.Printf("Nexus control reconnecting after error: %v", err)
+			case <-time.After(delay):
+				log.Printf("Nexus control reconnecting after error: %v (after %s)", err, delay.Round(time.Millisecond))
 			}
+			backoff = nextControlBackoff(backoff)
 		}
 	}
+}
+
+const (
+	// controlReconnectInitial is the delay before the first reconnect after a
+	// drop. Small so a transient proxy cut on an otherwise-healthy connection is
+	// invisible to the user.
+	controlReconnectInitial = 500 * time.Millisecond
+	// controlReconnectMax caps the backoff so a prolonged outage (e.g. a deploy
+	// rolling the Worker) doesn't stretch reconnects out to minutes.
+	controlReconnectMax = 30 * time.Second
+	// controlReconnectStable is how long a connection must survive to be judged
+	// healthy; a drop after this resets the backoff to the initial delay.
+	controlReconnectStable = 30 * time.Second
+)
+
+// nextControlBackoff doubles the delay up to the cap.
+func nextControlBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > controlReconnectMax {
+		return controlReconnectMax
+	}
+	return next
+}
+
+// jitteredBackoff trims up to ~25% off the delay so many daemons (or repeated
+// attempts) don't resynchronize with server cycles. Uses the wall clock as the
+// entropy source to avoid pulling in math/rand (crypto/rand is already aliased
+// to `rand` in this file).
+func jitteredBackoff(d time.Duration) time.Duration {
+	span := int64(d) / 4
+	if span <= 0 {
+		return d
+	}
+	return d - time.Duration(time.Now().UnixNano()%span)
 }
 
 const (
