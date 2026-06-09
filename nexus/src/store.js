@@ -260,6 +260,10 @@ export class InMemoryNexusStore {
     return next;
   }
 
+  async upsertSessions(sessions) {
+    for (const session of sessions) await this.upsertSession(session);
+  }
+
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
     const keep = new Set(keepSessionIDs);
     for (const [key, session] of [...this.sessions.entries()]) {
@@ -290,6 +294,10 @@ export class InMemoryNexusStore {
     const next = { ...(existing ?? {}), ...turn };
     this.turns.set(key, next);
     return next;
+  }
+
+  async upsertTurns(turns) {
+    for (const turn of turns) await this.upsertTurn(turn);
   }
 
   async listTurns(userID, deviceID, sessionID) {
@@ -765,8 +773,8 @@ export class SQLNexusStore {
     return await this.db.prepare(`SELECT * FROM mobile_join_grants WHERE grant_token = ?`).bind(grantToken).first();
   }
 
-  async upsertSession(session) {
-    await this.db.prepare(`
+  _upsertSessionStatement(session) {
+    return this.db.prepare(`
       INSERT INTO sessions (
         user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
         snippet, first_message, title, last_seq, last_timestamp,
@@ -816,8 +824,24 @@ export class SQLNexusStore {
       session.synced_max_seq ?? 0,
       session.has_older_turns ? 1 : 0,
       session.updated_at,
-    ).run();
+    );
+  }
+
+  async upsertSession(session) {
+    await this._upsertSessionStatement(session).run();
     return session;
+  }
+
+  async upsertSessions(sessions) {
+    if (!sessions.length) return;
+    if (typeof this.db.batch === "function") {
+      const CHUNK = 50;
+      for (let i = 0; i < sessions.length; i += CHUNK) {
+        await this.db.batch(sessions.slice(i, i + CHUNK).map((session) => this._upsertSessionStatement(session)));
+      }
+      return;
+    }
+    for (const session of sessions) await this._upsertSessionStatement(session).run();
   }
 
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
@@ -867,8 +891,8 @@ export class SQLNexusStore {
     return row ? normalizeSessionRow(row) : null;
   }
 
-  async upsertTurn(turn) {
-    await this.db.prepare(`
+  _upsertTurnStatement(turn) {
+    return this.db.prepare(`
       INSERT INTO session_turns (user_id, device_id, session_id, seq, agent, kind, timestamp, payload, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, device_id, session_id, seq) DO UPDATE SET
@@ -887,8 +911,24 @@ export class SQLNexusStore {
       turn.timestamp ?? null,
       turn.payload ?? null,
       turn.updated_at,
-    ).run();
+    );
+  }
+
+  async upsertTurn(turn) {
+    await this._upsertTurnStatement(turn).run();
     return turn;
+  }
+
+  async upsertTurns(turns) {
+    if (!turns.length) return;
+    if (typeof this.db.batch === "function") {
+      const CHUNK = 50;
+      for (let i = 0; i < turns.length; i += CHUNK) {
+        await this.db.batch(turns.slice(i, i + CHUNK).map((turn) => this._upsertTurnStatement(turn)));
+      }
+      return;
+    }
+    for (const turn of turns) await this._upsertTurnStatement(turn).run();
   }
 
   async listTurns(userID, deviceID, sessionID) {

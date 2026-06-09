@@ -1017,12 +1017,8 @@ async function daemonSync(request, store) {
   if (body.full_reconcile) {
     await store.deleteMissingDeviceSessions(user.user_id, device.device_id, sessions.map((session) => String(session.session_id)));
   }
-  for (const session of sessions) {
-    await store.upsertSession(syncSessionRecord(user, device, session, now, uploadedTurnsBySession.get(String(session.session_id)) ?? 0));
-  }
-  for (const turn of turns) {
-    await store.upsertTurn(syncTurnRecord(user, device, turn, now));
-  }
+  await store.upsertSessions(sessions.map((session) => syncSessionRecord(user, device, session, now, uploadedTurnsBySession.get(String(session.session_id)) ?? 0)));
+  await store.upsertTurns(turns.map((turn) => syncTurnRecord(user, device, turn, now)));
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
