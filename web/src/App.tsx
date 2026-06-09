@@ -5720,6 +5720,11 @@ function ClaudeCodePillsRow({
   const [snapshot, setSnapshot] = useState<AgentSettingsSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  // Bumped to re-run the agent-settings fetch after a transient failure (e.g.
+  // the daemon was momentarily offline / reconnecting / just reinstalled) so a
+  // stale "daemon offline" error self-heals once it's back, instead of sticking
+  // under the run-config pills forever.
+  const [retryTick, setRetryTick] = useState(0);
   const [busyField, setBusyField] = useState<"" | "model" | "effort" | "permission_mode">("");
   // The model/effort/permission settings live in one combined "Run config"
   // pill whose popover is a 3-column panel; this tracks its open state.
@@ -5835,6 +5840,7 @@ function ClaudeCodePillsRow({
   useEffect(() => {
     if (!sessionId || !deviceId || draftMode) return;
     const ctrl = new AbortController();
+    let retryTimer = 0;
     setLoading(true);
     setError("");
     setSnapshot(null);
@@ -5858,15 +5864,23 @@ function ClaudeCodePillsRow({
       .catch((err: unknown) => {
         if (ctrl.signal.aborted) return;
         setError(err instanceof Error ? err.message : String(err));
+        // Self-heal a transient failure (daemon momentarily offline /
+        // reconnecting / just reinstalled): retry so the run-config + the
+        // surfaced error clear once it's back, rather than sticking forever.
+        retryTimer = window.setTimeout(() => setRetryTick((t) => t + 1), 4000);
       })
       .finally(() => {
         if (!ctrl.signal.aborted) setLoading(false);
       });
-    return () => ctrl.abort();
+    return () => {
+      ctrl.abort();
+      if (retryTimer) window.clearTimeout(retryTimer);
+    };
   }, [
     sessionId,
     deviceId,
     draftMode,
+    retryTick,
     onModelChange,
     onEffortChange,
     onPermissionModeChange,
