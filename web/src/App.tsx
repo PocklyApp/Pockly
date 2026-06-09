@@ -13355,9 +13355,20 @@ function kindLabel(kind: string) {
   }
 }
 
+// Codex rollout session files are named with an ISO-ish stamp that uses DASHES
+// between the time fields ("2026-06-05T17-06-32"), and the daemon forwards that
+// raw string as the session timestamp. `new Date()` cannot parse it, so any
+// formatter would fall back to printing the raw string. Convert the time-field
+// dashes back to colons so it parses like a normal ISO timestamp. Claude
+// sessions already emit RFC3339 and pass through untouched.
+function normalizeTimestamp(value: string): string {
+  const match = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})(.*)$/.exec(value);
+  return match ? `${match[1]}T${match[2]}:${match[3]}:${match[4]}${match[5]}` : value;
+}
+
 function shortTime(value: string) {
   if (!value) return "--";
-  const date = new Date(value);
+  const date = new Date(normalizeTimestamp(value));
   if (Number.isNaN(date.getTime())) return value;
   const now = Date.now();
   const delta = now - date.getTime();
@@ -13374,18 +13385,15 @@ function shortTime(value: string) {
 // expiries instead.
 function clockTime(value: string) {
   if (!value) return "--";
-  const date = new Date(value);
+  const date = new Date(normalizeTimestamp(value));
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleTimeString(appI18n.language, { hour: "2-digit", minute: "2-digit" });
 }
 
 function shortDateTime(value: string) {
-  const normalized = value.includes("T") && /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}/.test(value)
-    ? value.slice(0, 16).replace("T", " ").replace(/(\d{2})-(\d{2})$/, "$1:$2")
-    : value;
-  const date = new Date(normalized);
+  const date = new Date(normalizeTimestamp(value));
   if (!Number.isNaN(date.getTime())) {
     return date.toLocaleDateString(appI18n.language, { month: "short", day: "numeric" });
   }
-  return normalized.slice(0, 16);
+  return value.slice(0, 16);
 }
