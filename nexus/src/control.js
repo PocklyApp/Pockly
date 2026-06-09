@@ -121,10 +121,14 @@ export class InMemoryControlHub {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  attachDaemonWebSocketConnection({ userID, deviceID, socket }) {
+  // Register (or replace) a daemon connection and announce presence. Split out
+  // from the WebSocket accept path so alternative transports can reuse the
+  // registry/presence bookkeeping while supplying their own socket.
+  registerDaemonConnection({ userID, deviceID, socket }) {
     const conn = {
       deviceID,
       userID,
+      socket,
       sendEnvelope: async (envelope) => {
         socketSend(socket, JSON.stringify(envelope));
       },
@@ -140,6 +144,28 @@ export class InMemoryControlHub {
       presence_reason: "control_connected",
       control_connected: true,
     });
+    return conn;
+  }
+
+  // Tear down a daemon connection: drop it from the registry (if it is still the
+  // active one for this socket), announce offline, and fail in-flight streams.
+  onDaemonConnectionClosed(userID, deviceID, socket) {
+    const conn = this.daemons.get(deviceID);
+    if (conn && conn.socket === socket) {
+      this.daemons.delete(deviceID);
+      this.broadcastHostStatus({
+        userID,
+        deviceID,
+        presence_status: "offline",
+        presence_reason: "control_disconnected",
+        control_connected: false,
+      });
+    }
+    this.failStreamsForDaemon(deviceID, "daemon control connection closed");
+  }
+
+  attachDaemonWebSocketConnection({ userID, deviceID, socket }) {
+    const conn = this.registerDaemonConnection({ userID, deviceID, socket });
     socketAddListener(socket, "message", (event) => {
       try {
         this.receiveDaemonEnvelope(deviceID, JSON.parse(String(socketMessageData(event))));
@@ -148,19 +174,7 @@ export class InMemoryControlHub {
         // surface real protocol failures through telemetry and close events.
       }
     });
-    const cleanup = once(() => {
-      if (this.daemons.get(deviceID) === conn) {
-        this.daemons.delete(deviceID);
-        this.broadcastHostStatus({
-          userID,
-          deviceID,
-          presence_status: "offline",
-          presence_reason: "control_disconnected",
-          control_connected: false,
-        });
-      }
-      this.failStreamsForDaemon(deviceID, "daemon control connection closed");
-    });
+    const cleanup = once(() => this.onDaemonConnectionClosed(userID, deviceID, socket));
     socketAddListener(socket, "close", cleanup);
     socketAddListener(socket, "error", cleanup);
     return conn;
