@@ -1381,30 +1381,50 @@ func waitForExternalStartTaskStarted(ctx context.Context, events <-chan liveterm
 }
 
 func waitForExternalSessionBound(ctx context.Context, ext *liveterminal.ExternalSession, events <-chan liveterminal.Event, provisionalSID string) (string, error) {
-	timer := time.NewTimer(5 * time.Second)
+	// Codex assigns its own thread id asynchronously, only after its app-server
+	// cold starts (process spawn + handshake + thread/start). On a first spawn
+	// that routinely takes well over five seconds. The previous 5s ceiling fired
+	// before the id was assigned, and — because the bound id was only sampled at
+	// the top of each loop iteration — the timer branch read a stale empty value
+	// and returned agent_start_failed. The caller then skipped session_created,
+	// so the web never learned the real session id and bounced its draft back to
+	// the picker, even though codex went on to finish the turn a beat later.
+	//
+	// Poll the bound id on a short ticker (so we detect the bind without waiting
+	// for a driver event) and give the cold start real headroom. Genuine startup
+	// failures still return promptly via the error / exited events below.
+	const bindTimeout = 30 * time.Second
+	timer := time.NewTimer(bindTimeout)
 	defer timer.Stop()
-	boundSID := ""
-	for {
+	ticker := time.NewTicker(150 * time.Millisecond)
+	defer ticker.Stop()
+	boundSID := func() string {
 		if sid := strings.TrimSpace(ext.ClaudeSessionID()); sid != "" && sid != provisionalSID {
-			boundSID = sid
+			return sid
 		}
+		return ""
+	}
+	if sid := boundSID(); sid != "" {
+		return sid, nil
+	}
+	for {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-timer.C:
-			if boundSID != "" {
-				return boundSID, nil
+			if sid := boundSID(); sid != "" {
+				return sid, nil
 			}
 			return "", fmt.Errorf("agent_start_failed: codex thread id not assigned")
+		case <-ticker.C:
+			if sid := boundSID(); sid != "" {
+				return sid, nil
+			}
 		case event, ok := <-events:
 			if !ok {
 				return "", fmt.Errorf("agent_exited_before_ready")
 			}
 			switch event.Kind {
-			case liveterminal.EventUserInput, liveterminal.EventTextDelta, liveterminal.EventMessageAdded, liveterminal.EventPromptReady:
-				if boundSID != "" {
-					return boundSID, nil
-				}
 			case liveterminal.EventError:
 				if strings.TrimSpace(event.Error) != "" {
 					return "", fmt.Errorf("agent_start_failed: %s", event.Error)
@@ -1412,6 +1432,10 @@ func waitForExternalSessionBound(ctx context.Context, ext *liveterminal.External
 				return "", fmt.Errorf("agent_start_failed")
 			case liveterminal.EventSessionExited:
 				return "", fmt.Errorf("agent_exited_before_ready")
+			default:
+				if sid := boundSID(); sid != "" {
+					return sid, nil
+				}
 			}
 		}
 	}
