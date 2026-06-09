@@ -364,6 +364,10 @@ export const en = {
     permissionPlan: "Plan mode",
     permissionAuto: "Auto mode",
     permissionBypass: "Bypass permissions",
+    // Codex approval presets (request-approval / approve-for-me / full-access).
+    permCodexRequest: "Request approval",
+    permCodexAuto: "Approve for me",
+    permCodexFull: "Full access",
     noOptions: "No options available",
   },
   task: {

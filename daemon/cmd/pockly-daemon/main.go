@@ -2991,7 +2991,10 @@ func isCodexAgentName(agent string) bool {
 	return strings.TrimSpace(agent) == "codex"
 }
 
-var codexEffortLevels = []string{"none", "minimal", "low", "medium", "high", "xhigh"}
+// codexEffortLevels are the reasoning levels the codex run-config pill offers
+// (low/medium/high/xhigh — no claude-only none/minimal/max). Source of truth
+// is sdkdriver so the UI list and the per-turn mapping never drift.
+var codexEffortLevels = sdkdriver.CodexEffortLevels()
 
 func isCodexEffortLevel(effort string) bool {
 	effort = strings.TrimSpace(effort)
@@ -3006,10 +3009,10 @@ func isCodexEffortLevel(effort string) bool {
 	return false
 }
 
+// codexPermissionModes are codex's three approval presets (mapped to
+// approvalPolicy + sandbox by sdkdriver.codexApprovalPolicy/codexSandbox).
 func codexPermissionModes() []string {
-	// These are Pockly UI values mapped to Codex's AskForApproval strings
-	// by sdkdriver.codexApprovalPolicy.
-	return []string{"default", "acceptEdits", "auto", "bypassPermissions"}
+	return sdkdriver.CodexPermissionModes()
 }
 
 func isCodexPermissionMode(mode string) bool {
@@ -3023,6 +3026,36 @@ func isCodexPermissionMode(mode string) bool {
 		}
 	}
 	return false
+}
+
+// codexDefaultPermissionMode resolves the preset a fresh codex session should
+// show when the user hasn't picked one yet, mirroring codex's own config.toml
+// (approval_policy + sandbox_mode). Falls back to the cautious request-approval
+// preset when codex has no config.
+func codexDefaultPermissionMode() string {
+	cfg := readCodexConfigModel()
+	ap := strings.TrimSpace(cfg.approvalPolicy)
+	sb := strings.TrimSpace(cfg.sandboxMode)
+	if sb == "danger-full-access" || ap == "never" {
+		return sdkdriver.CodexModeFullAccess
+	}
+	if ap == "on-failure" {
+		return sdkdriver.CodexModeApproveForMe
+	}
+	return sdkdriver.CodexModeRequestApproval
+}
+
+// codexDefaultEffort mirrors codex's model_reasoning_effort config, clamped to
+// the four levels the pill offers. Codex's effective default is medium.
+func codexDefaultEffort() string {
+	switch strings.TrimSpace(readCodexConfigModel().reasoningEffort) {
+	case "low", "medium", "high", "xhigh":
+		return strings.TrimSpace(readCodexConfigModel().reasoningEffort)
+	case "minimal":
+		return "low"
+	default:
+		return "medium"
+	}
 }
 
 func (a agentSettingsAdapter) codexSettingsSnapshot(requestID string, res agentSettingsResolveResult) control.AgentSettingsResult {
@@ -3041,11 +3074,11 @@ func (a agentSettingsAdapter) codexSettingsSnapshot(requestID string, res agentS
 	}
 	mode := strings.TrimSpace(snap.PermissionMode)
 	if mode == "" {
-		mode = "default"
+		mode = codexDefaultPermissionMode()
 	}
 	effort := strings.TrimSpace(snap.Effort)
 	if effort == "" {
-		effort = "none"
+		effort = codexDefaultEffort()
 	}
 	return control.AgentSettingsResult{
 		RequestID:                requestID,
@@ -3106,11 +3139,11 @@ func (a agentSettingsAdapter) setCodexSettings(req control.AgentSettingsSet, res
 	}
 	mode := strings.TrimSpace(snap.PermissionMode)
 	if mode == "" {
-		mode = "default"
+		mode = codexDefaultPermissionMode()
 	}
 	effort := strings.TrimSpace(snap.Effort)
 	if effort == "" {
-		effort = "none"
+		effort = codexDefaultEffort()
 	}
 	return control.AgentSettingsResult{
 		RequestID:                req.RequestID,
@@ -3186,6 +3219,13 @@ func codexModelOptions() (defaultModel string, resolvedDefault string, models []
 type codexConfigModel struct {
 	model         string
 	modelProvider string
+	// approvalPolicy / sandboxMode / reasoningEffort mirror codex's own
+	// config.toml so a fresh codex session in Pockly defaults to whatever
+	// the user already runs codex as (see codexDefaultPermissionMode /
+	// codexDefaultEffort). Empty when the key is absent.
+	approvalPolicy  string
+	sandboxMode     string
+	reasoningEffort string
 }
 
 func readCodexConfigModel() codexConfigModel {
@@ -3229,6 +3269,12 @@ func parseCodexConfigModel(raw string) codexConfigModel {
 			out.model = value
 		case "model_provider":
 			out.modelProvider = value
+		case "approval_policy":
+			out.approvalPolicy = value
+		case "sandbox_mode":
+			out.sandboxMode = value
+		case "model_reasoning_effort":
+			out.reasoningEffort = value
 		}
 	}
 	return out

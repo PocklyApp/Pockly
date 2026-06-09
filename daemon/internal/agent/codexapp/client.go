@@ -489,6 +489,8 @@ func (p ThreadStartParams) toMap() map[string]any {
 		out["approvalPolicy"] = p.ApprovalPolicy
 	}
 	if p.Sandbox != "" {
+		// app-server `sandbox` is a kebab-case string enum
+		// (read-only | workspace-write | danger-full-access), not an object.
 		out["sandbox"] = p.Sandbox
 	}
 	return out
@@ -505,6 +507,7 @@ type ThreadResumeParams struct {
 	Cwd            string
 	Model          string
 	ApprovalPolicy string
+	Sandbox        string
 }
 
 func (p ThreadResumeParams) toMap() map[string]any {
@@ -520,6 +523,9 @@ func (p ThreadResumeParams) toMap() map[string]any {
 	}
 	if p.ApprovalPolicy != "" {
 		out["approvalPolicy"] = p.ApprovalPolicy
+	}
+	if p.Sandbox != "" {
+		out["sandbox"] = p.Sandbox
 	}
 	return out
 }

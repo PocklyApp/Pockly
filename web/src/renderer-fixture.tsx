@@ -204,14 +204,14 @@ function FixturePage({ fixtureName }: { fixtureName: string }) {
 // the stale error self-heals via the 4s retry. No synthetic copy of the
 // component — this is the production component, fetching through the real
 // getAgentSettings/auth path, with Playwright page.route controlling the wire.
-function PillsRetryFixture() {
+function PillsRetryFixture({ agent }: { agent: string }) {
   return (
     <div className="fixture-root" data-fixture="pills-retry">
       <div className="composer-pills-row" style={{ padding: "12px 4px" }}>
         <ClaudeCodePillsRow
           sessionId="fx"
           deviceId="fx"
-          agent="claude-code"
+          agent={agent}
           disabled={false}
           onModelChange={() => {}}
           onEffortChange={() => {}}
@@ -234,7 +234,8 @@ export function mountRendererFixture(rootEl: HTMLElement) {
   document.documentElement.setAttribute("data-renderer-fixture", "1");
   const fixtureName = parseFixtureName();
   if (fixtureName === "pills-retry") {
-    createRoot(rootEl).render(<PillsRetryFixture />);
+    const agent = new URLSearchParams(window.location.search).get("agent") || "claude-code";
+    createRoot(rootEl).render(<PillsRetryFixture agent={agent} />);
     return;
   }
   createRoot(rootEl).render(<FixturePage fixtureName={fixtureName} />);
