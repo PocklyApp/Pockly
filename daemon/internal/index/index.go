@@ -444,7 +444,12 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 			}
 			for _, s := range p.Sessions {
 				session := buildCatalogSession(s.SessionID, s.Path, "")
-				session.Timestamp = firstNonEmpty(s.Timestamp, session.Timestamp)
+				// Codex names rollout files with a dashed wall-clock stamp
+				// ("...T17-06-32") that is not RFC3339-parseable; the web would
+				// render it raw. Prefer the file mtime (like Claude), falling
+				// back to a normalized form of the filename stamp, so the catalog
+				// always carries a parseable timestamp.
+				session.Timestamp = firstNonEmpty(session.Timestamp, normalizeCodexTimestamp(s.Timestamp))
 				session.Snippet = catalogSessionTitle(agentCodex, p.Cwd, s.SessionID, session.Timestamp)
 				project.Sessions = append(project.Sessions, session)
 				sessions[s.SessionID] = SessionRef{
@@ -495,6 +500,20 @@ func buildCatalogSession(sessionID, path, snippet string) agent.Session {
 		session.Timestamp = info.ModTime().UTC().Format(time.RFC3339Nano)
 	}
 	return session
+}
+
+// normalizeCodexTimestamp converts Codex's dashed filename stamp
+// ("2026-06-05T17-06-32") into an RFC3339 timestamp. The stamp is local
+// wall-clock time, so it is parsed in the local zone. Values that are already
+// parseable (or in an unknown shape) are returned unchanged.
+func normalizeCodexTimestamp(ts string) string {
+	if ts == "" {
+		return ""
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15-04-05", ts, time.Local); err == nil {
+		return t.UTC().Format(time.RFC3339)
+	}
+	return ts
 }
 
 func catalogSessionTitle(agentName, cwd, sessionID, timestamp string) string {
