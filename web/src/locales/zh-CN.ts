@@ -357,7 +357,7 @@ export const zhCN = {
     effortLow: "低",
     effortMedium: "中",
     effortHigh: "高",
-    effortXhigh: "极高",
+    effortXhigh: "超高",
     effortMax: "最高",
     permissionLabel: "权限",
     permissionDefault: "询问权限",
@@ -365,6 +365,10 @@ export const zhCN = {
     permissionPlan: "计划模式",
     permissionAuto: "自动模式",
     permissionBypass: "绕过权限",
+    // Codex 审批预设(request-approval / approve-for-me / full-access)。
+    permCodexRequest: "请求批准",
+    permCodexAuto: "替我审批",
+    permCodexFull: "完全访问",
     noOptions: "暂无选项",
   },
   task: {
