@@ -821,20 +821,36 @@ export class SQLNexusStore {
   }
 
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
-    const placeholders = keepSessionIDs.map(() => "?").join(", ");
     if (keepSessionIDs.length === 0) {
       await this.db.prepare(`DELETE FROM session_turns WHERE user_id = ? AND device_id = ?`).bind(userID, deviceID).run();
       await this.db.prepare(`DELETE FROM sessions WHERE user_id = ? AND device_id = ?`).bind(userID, deviceID).run();
       return;
     }
-    await this.db.prepare(`
-      DELETE FROM session_turns
-      WHERE user_id = ? AND device_id = ? AND session_id NOT IN (${placeholders})
-    `).bind(userID, deviceID, ...keepSessionIDs).run();
-    await this.db.prepare(`
-      DELETE FROM sessions
-      WHERE user_id = ? AND device_id = ? AND session_id NOT IN (${placeholders})
-    `).bind(userID, deviceID, ...keepSessionIDs).run();
+    // Compute the stale sessions (present for this device but not in the new
+    // catalog) and delete them in small batches. A single
+    // `NOT IN (...all kept ids...)` binds one parameter per kept session, which
+    // overflows D1's bound-variable limit on large catalogs ("too many SQL
+    // variables"); self-hosted SQLite tolerates ~32k variables, D1 does not.
+    const keep = new Set(keepSessionIDs.map((id) => String(id)));
+    const existing = await this.db.prepare(`
+      SELECT session_id FROM sessions WHERE user_id = ? AND device_id = ?
+    `).bind(userID, deviceID).all();
+    const stale = (existing.results ?? [])
+      .map((row) => String(row.session_id))
+      .filter((id) => !keep.has(id));
+    const CHUNK = 50;
+    for (let i = 0; i < stale.length; i += CHUNK) {
+      const batch = stale.slice(i, i + CHUNK);
+      const placeholders = batch.map(() => "?").join(", ");
+      await this.db.prepare(`
+        DELETE FROM session_turns
+        WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
+      `).bind(userID, deviceID, ...batch).run();
+      await this.db.prepare(`
+        DELETE FROM sessions
+        WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
+      `).bind(userID, deviceID, ...batch).run();
+    }
   }
 
   async listSessionsForUser(userID) {
