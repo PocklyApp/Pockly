@@ -99,6 +99,10 @@ type SDKTerminalEvent struct {
 // CLAUDE.md / cwd-scoped MCP / on-disk files).
 type SessionResolver interface {
 	CwdForSession(sid string) string
+	// PathForSession returns the on-disk rollout/jsonl path for a known session,
+	// or "" if unknown. Codex resumes by this path (it loads the thread directly
+	// from disk), which a freshly-spawned app-server cannot do from threadId alone.
+	PathForSession(sid string) string
 }
 
 type Manager struct {
@@ -505,10 +509,18 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 		permissionMode = m.settings.PermissionModeForSDKSession(sid)
 		effort = m.settings.EffortForSDKSession(sid)
 	}
+	// Resolve the on-disk rollout path for a resumed session so the codex driver
+	// can resume by path (loading the thread from disk) instead of by threadId
+	// alone, which a freshly-spawned app-server rejects with "thread not found".
+	resumePath := ""
+	if !newSession && m.sessions != nil {
+		resumePath = m.sessions.PathForSession(sid)
+	}
 	driver := New(Config{
 		SessionID:         sid,
 		Agent:             agent,
 		Cwd:               cwd,
+		ResumePath:        resumePath,
 		BinaryPath:        binaryPath,
 		CommandPrefixArgs: commandPrefixArgs,
 		LauncherSource:    launcherSource,

@@ -495,7 +495,13 @@ func (p ThreadStartParams) toMap() map[string]any {
 }
 
 type ThreadResumeParams struct {
-	ThreadID       string
+	ThreadID string
+	// Path is the rollout file to resume from. Resuming by ThreadID alone makes a
+	// freshly-spawned app-server look the thread up in its (empty in-process)
+	// registry and reply "thread not found". Per codex's own protocol schema a
+	// non-empty path loads the thread directly from disk and takes precedence
+	// over threadId, so we pass the exact rollout path we already know.
+	Path           string
 	Cwd            string
 	Model          string
 	ApprovalPolicy string
@@ -503,6 +509,9 @@ type ThreadResumeParams struct {
 
 func (p ThreadResumeParams) toMap() map[string]any {
 	out := map[string]any{"threadId": p.ThreadID}
+	if p.Path != "" {
+		out["path"] = p.Path
+	}
 	if p.Cwd != "" {
 		out["cwd"] = p.Cwd
 	}
