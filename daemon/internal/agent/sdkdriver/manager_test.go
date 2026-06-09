@@ -1274,11 +1274,16 @@ func TestPermissionMCPConfigCarriesDecisionWindow(t *testing.T) {
 type stubSessionResolver struct {
 	calls []string
 	cwd   string
+	path  string
 }
 
 func (s *stubSessionResolver) CwdForSession(sid string) string {
 	s.calls = append(s.calls, sid)
 	return s.cwd
+}
+
+func (s *stubSessionResolver) PathForSession(sid string) string {
+	return s.path
 }
 
 // TestManagerFallsBackToSessionResolverWhenCwdEmpty covers the
