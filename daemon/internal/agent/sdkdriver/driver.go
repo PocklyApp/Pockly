@@ -68,6 +68,12 @@ type Config struct {
 	// project dir recorded in the session catalog.
 	Cwd string
 
+	// ResumePath is the on-disk rollout file for a resumed session, when known.
+	// Codex resumes by this path (it loads the thread directly from disk, which
+	// a freshly-spawned app-server can't do from threadId alone). Empty for new
+	// sessions and unused by the claude driver.
+	ResumePath string
+
 	// BinaryPath is the absolute path to the `claude` (or `codex`)
 	// executable. Resolved by the manager via resolveExecutable.
 	BinaryPath string

@@ -86,6 +86,25 @@ func TestThreadResumeParamsMatchesSchema(t *testing.T) {
 	if _, ok := raw["excludeTurns"]; ok {
 		t.Fatalf("thread/resume must not send schema-unknown excludeTurns: %#v", raw)
 	}
+	// An empty path must be omitted (the schema treats "" as absent).
+	if _, ok := raw["path"]; ok {
+		t.Fatalf("empty path must be omitted: %#v", raw)
+	}
+}
+
+func TestThreadResumeParamsSendsPathWhenSet(t *testing.T) {
+	// Resuming by path lets a freshly-spawned app-server load the thread from
+	// disk (resuming by threadId alone yields "thread not found").
+	raw := ThreadResumeParams{
+		ThreadID: "019eaafd",
+		Path:     "/Users/me/.codex/sessions/2026/06/09/rollout-...-019eaafd.jsonl",
+	}.toMap()
+	if raw["path"] != "/Users/me/.codex/sessions/2026/06/09/rollout-...-019eaafd.jsonl" {
+		t.Fatalf("path = %#v, want the rollout path", raw["path"])
+	}
+	if raw["threadId"] != "019eaafd" {
+		t.Fatalf("threadId still required alongside path: %#v", raw)
+	}
 }
 
 func TestRequestTimeoutCoversBlockedWrite(t *testing.T) {

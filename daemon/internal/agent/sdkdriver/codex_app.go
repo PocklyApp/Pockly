@@ -123,6 +123,7 @@ func (d *Driver) ensureCodexThread(ctx context.Context) (string, error) {
 	} else {
 		res, err = app.ThreadResume(ctx, codexapp.ThreadResumeParams{
 			ThreadID:       d.cfg.SessionID,
+			Path:           d.cfg.ResumePath,
 			Cwd:            d.cfg.Cwd,
 			Model:          strings.TrimSpace(d.cfg.Model),
 			ApprovalPolicy: approvalPolicy,
