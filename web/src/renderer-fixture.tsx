@@ -37,6 +37,7 @@ import {
   contextWindowForAgent,
   sessionDiffs,
   SessionDiffSheet,
+  ClaudeCodePillsRow,
 } from "./App";
 import type { SessionListItem, SessionTurn } from "./api";
 import "./i18n";
@@ -197,6 +198,30 @@ function FixturePage({ fixtureName }: { fixtureName: string }) {
   );
 }
 
+// Mounts the REAL composer run-config pills row (ClaudeCodePillsRow) so a
+// spec can drive its agent-settings fetch effect under network control: fail
+// the fetch (the daemon-offline error surfaces), then succeed it and assert
+// the stale error self-heals via the 4s retry. No synthetic copy of the
+// component — this is the production component, fetching through the real
+// getAgentSettings/auth path, with Playwright page.route controlling the wire.
+function PillsRetryFixture() {
+  return (
+    <div className="fixture-root" data-fixture="pills-retry">
+      <div className="composer-pills-row" style={{ padding: "12px 4px" }}>
+        <ClaudeCodePillsRow
+          sessionId="fx"
+          deviceId="fx"
+          agent="claude-code"
+          disabled={false}
+          onModelChange={() => {}}
+          onEffortChange={() => {}}
+          onPermissionModeChange={() => {}}
+        />
+      </div>
+    </div>
+  );
+}
+
 function parseFixtureName(): string {
   const params = new URLSearchParams(window.location.search);
   return params.get("fixture") || "";
@@ -208,5 +233,9 @@ export function mountRendererFixture(rootEl: HTMLElement) {
   // routing accident).
   document.documentElement.setAttribute("data-renderer-fixture", "1");
   const fixtureName = parseFixtureName();
+  if (fixtureName === "pills-retry") {
+    createRoot(rootEl).render(<PillsRetryFixture />);
+    return;
+  }
   createRoot(rootEl).render(<FixturePage fixtureName={fixtureName} />);
 }
