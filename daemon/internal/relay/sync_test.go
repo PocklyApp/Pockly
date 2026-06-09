@@ -486,11 +486,25 @@ func mustWriteFile(t *testing.T, path string, body string) {
 	}
 }
 
-func writeCodexRollout(t *testing.T, codexHome, tsDash, sessionID, cwd, userText, assistantText string) string {
+// writeCodexRollout writes a fixture codex rollout file and returns its path
+// plus the RFC3339Nano timestamp the catalog will assign to the session.
+//
+// The catalog derives a codex session's recency from the rollout file's mtime
+// (see index.buildCatalogSession, which prefers mtime over the dashed filename
+// stamp). So we pin the mtime to tsDash here — without it every codex fixture
+// inherits wall-clock time at test runtime, which makes the file look
+// brand-new and breaks any test that asserts recency ordering against the
+// other (mtime-pinned) fixtures.
+func writeCodexRollout(t *testing.T, codexHome, tsDash, sessionID, cwd, userText, assistantText string) (string, string) {
 	t.Helper()
 	if len(tsDash) != len("2026-05-20T10-00-00") {
 		t.Fatalf("bad codex rollout timestamp %q", tsDash)
 	}
+	rolloutTime, err := time.ParseInLocation("2006-01-02T15-04-05", tsDash, time.UTC)
+	if err != nil {
+		t.Fatalf("parse codex rollout timestamp %q: %v", tsDash, err)
+	}
+	catalogTS := rolloutTime.UTC().Format(time.RFC3339Nano)
 	recordTS := tsDash[:13] + ":" + tsDash[14:16] + ":" + tsDash[17:19] + "Z"
 	dir := filepath.Join(codexHome, "sessions", tsDash[0:4], tsDash[5:7], tsDash[8:10])
 	mustMkdirAll(t, dir)
@@ -505,7 +519,10 @@ func writeCodexRollout(t *testing.T, codexHome, tsDash, sessionID, cwd, userText
 		lines = append(lines, fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":%q}]}}`, recordTS, assistantText))
 	}
 	mustWriteFile(t, path, strings.Join(lines, "\n")+"\n")
-	return path
+	if err := os.Chtimes(path, rolloutTime, rolloutTime); err != nil {
+		t.Fatal(err)
+	}
+	return path, catalogTS
 }
 
 // TestBuildCatalogSyncRequestBoundsBodyToByteBudget is the regression for the
@@ -560,10 +577,13 @@ func TestBuildCatalogSyncRequestBoundsBodyToByteBudget(t *testing.T) {
 
 	recentCodexID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 	oldCodexID := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
-	writeCodexRollout(t, codexHome, "2026-01-04T00-00-00", recentCodexID, "/tmp/codex-new", "codex latest", "codex answer")
-	writeCodexRollout(t, codexHome, "2025-12-31T23-59-59", oldCodexID, "/tmp/codex-old", "codex oldest", "codex old answer")
-	tsByID[recentCodexID] = "2026-01-04T00-00-00"
-	tsByID[oldCodexID] = "2025-12-31T23-59-59"
+	// Pin the codex mtimes so the recent one sorts above every claude session
+	// (newest of 2026-01-01..2026-01-03) and the old one below all of them, and
+	// record the catalog timestamps for the recency assertion below.
+	_, recentCodexTS := writeCodexRollout(t, codexHome, "2026-01-04T00-00-00", recentCodexID, "/tmp/codex-new", "codex latest", "codex answer")
+	_, oldCodexTS := writeCodexRollout(t, codexHome, "2025-12-31T23-59-59", oldCodexID, "/tmp/codex-old", "codex oldest", "codex old answer")
+	tsByID[recentCodexID] = recentCodexTS
+	tsByID[oldCodexID] = oldCodexTS
 
 	idx := index.New(index.Config{ClaudeHome: claudeHome, CodexHome: codexHome, RefreshInterval: time.Minute})
 	if err := idx.Refresh(); err != nil {
