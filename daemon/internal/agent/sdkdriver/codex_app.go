@@ -94,6 +94,9 @@ func (d *Driver) closeCodexApp() {
 	d.mu.Lock()
 	app := d.codex
 	d.codex = nil
+	// The next app-server is a fresh process with no loaded threads, so force
+	// ensureCodexThread to start/resume again before the next TurnStart.
+	d.codexThreadID = ""
 	d.mu.Unlock()
 	if app != nil {
 		_ = app.Close()
@@ -102,14 +105,19 @@ func (d *Driver) closeCodexApp() {
 
 func (d *Driver) ensureCodexThread(ctx context.Context) (string, error) {
 	d.mu.Lock()
-	current := d.session.ClaudeSessionID()
+	loaded := d.codexThreadID
 	app := d.codex
 	d.mu.Unlock()
 	if app == nil {
 		return "", errors.New("codex app-server not started")
 	}
-	if current != "" && (!d.cfg.NewSession || current != d.cfg.SessionID) {
-		return current, nil
+	// Skip start/resume only when THIS app-server instance has already loaded
+	// the thread. The session's bound id is not a proxy for that: the driver
+	// pre-binds it on spawn, so keying the skip off it meant ThreadResume was
+	// never called on a freshly-spawned app-server, and the subsequent
+	// TurnStart failed with "thread not found".
+	if loaded != "" {
+		return loaded, nil
 	}
 	approvalPolicy := codexApprovalPolicy(d.cfg.PermissionMode)
 	var res codexapp.ThreadStartResult
@@ -133,6 +141,9 @@ func (d *Driver) ensureCodexThread(ctx context.Context) (string, error) {
 		return "", err
 	}
 	cwd := firstNonEmpty(res.Cwd, d.cfg.Cwd)
+	d.mu.Lock()
+	d.codexThreadID = res.ThreadID
+	d.mu.Unlock()
 	d.session.BindSessionMetadata(res.ThreadID, cwd)
 	return res.ThreadID, nil
 }
