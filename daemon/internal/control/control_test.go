@@ -385,6 +385,40 @@ func TestRouteStartTaskRejectsAgentThatExitsBeforeReady(t *testing.T) {
 	}
 }
 
+func TestControlBackoffGrowsThenCaps(t *testing.T) {
+	if got := nextControlBackoff(controlReconnectInitial); got != 2*controlReconnectInitial {
+		t.Fatalf("first backoff = %v, want %v", got, 2*controlReconnectInitial)
+	}
+	if got := nextControlBackoff(controlReconnectMax); got != controlReconnectMax {
+		t.Fatalf("backoff at cap = %v, want %v (must not exceed cap)", got, controlReconnectMax)
+	}
+	d := controlReconnectInitial
+	for i := 0; i < 32; i++ {
+		next := nextControlBackoff(d)
+		if next < d {
+			t.Fatalf("backoff went backwards: %v -> %v", d, next)
+		}
+		if next > controlReconnectMax {
+			t.Fatalf("backoff exceeded cap: %v", next)
+		}
+		d = next
+	}
+	if d != controlReconnectMax {
+		t.Fatalf("backoff never reached cap, stuck at %v", d)
+	}
+}
+
+func TestJitteredBackoffStaysWithinBounds(t *testing.T) {
+	for _, d := range []time.Duration{controlReconnectInitial, time.Second, controlReconnectMax} {
+		for i := 0; i < 64; i++ {
+			got := jitteredBackoff(d)
+			if got > d || got < d-d/4 {
+				t.Fatalf("jitteredBackoff(%v) = %v, want within [%v, %v]", d, got, d-d/4, d)
+			}
+		}
+	}
+}
+
 // Regression: codex assigns its thread id only after a slow app-server cold
 // start. The old 5s ceiling (which also read a stale bound id at timer-fire)
 // gave up before the id arrived, so the caller never emitted session_created
