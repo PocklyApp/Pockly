@@ -57,9 +57,16 @@ type fakeCodexAppRuntime struct {
 	ignoreTurnCtx  bool
 	silentTurn     bool
 	emptyCompleted bool
-	signalOnly     bool
-	errorOnly      bool
-	closed         bool
+	// streamThenEmptyCompleted streams agentMessage deltas, then sends an
+	// item/completed whose text is EMPTY — exercising the fallback that
+	// finalizes the durable assistant row from the accumulated delta text.
+	streamThenEmptyCompleted bool
+	// streamThenNoCompleted streams agentMessage deltas, then jumps straight
+	// to turn/completed with NO item/completed — exercising the flush.
+	streamThenNoCompleted bool
+	signalOnly            bool
+	errorOnly             bool
+	closed                bool
 }
 
 func (f *fakeCodexAppRuntime) factory(ctx context.Context, cfg codexapp.Config) (CodexAppRuntime, error) {
@@ -131,6 +138,27 @@ func (f *fakeCodexAppRuntime) TurnStart(ctx context.Context, p codexapp.TurnStar
 			cfg.OnNotification(codexapp.Notification{
 				Method: "turn/completed",
 				Params: json.RawMessage(`{"threadId":"` + p.ThreadID + `","turn":{"id":"turn-empty","status":"completed","items":[]}}`),
+			})
+			return nil
+		}
+		if f.streamThenEmptyCompleted || f.streamThenNoCompleted {
+			cfg.OnNotification(codexapp.Notification{
+				Method: "item/agentMessage/delta",
+				Params: json.RawMessage(`{"threadId":"` + p.ThreadID + `","turnId":"turn-s","itemId":"msg-s","delta":"Hello, "}`),
+			})
+			cfg.OnNotification(codexapp.Notification{
+				Method: "item/agentMessage/delta",
+				Params: json.RawMessage(`{"threadId":"` + p.ThreadID + `","turnId":"turn-s","itemId":"msg-s","delta":"world"}`),
+			})
+			if f.streamThenEmptyCompleted {
+				cfg.OnNotification(codexapp.Notification{
+					Method: "item/completed",
+					Params: json.RawMessage(`{"threadId":"` + p.ThreadID + `","turnId":"turn-s","item":{"id":"msg-s","type":"agentMessage","text":""}}`),
+				})
+			}
+			cfg.OnNotification(codexapp.Notification{
+				Method: "turn/completed",
+				Params: json.RawMessage(`{"threadId":"` + p.ThreadID + `","turn":{"id":"turn-s","status":"completed","items":[]}}`),
 			})
 			return nil
 		}
@@ -507,6 +535,94 @@ func TestManagerCodexEmptyCompletedTurnEmitsRetryableAgentError(t *testing.T) {
 		return false
 	}) {
 		t.Fatalf("empty codex completed turn did not emit agent_error; events=%+v", sink.Snapshot())
+	}
+}
+
+// codexDurableReplyText scans emitted events for a durable assistant
+// message_added row and returns its text, plus whether a codex_turn_empty
+// agent_error was emitted.
+func codexDurableReplyText(events []SDKTerminalEvent) (reply string, sawEmptyError bool) {
+	for _, e := range events {
+		if e.Kind == string(terminal.EventAgentError) && strings.Contains(e.Error, "codex_turn_empty") {
+			sawEmptyError = true
+		}
+		if e.Kind != string(terminal.EventMessageAdded) {
+			continue
+		}
+		var p struct {
+			Message struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal([]byte(e.Payload), &p) != nil {
+			continue
+		}
+		for _, c := range p.Message.Content {
+			if c.Type == "text" && strings.TrimSpace(c.Text) != "" {
+				reply = c.Text
+			}
+		}
+	}
+	return reply, sawEmptyError
+}
+
+// When item/completed carries empty text, the durable assistant row is
+// finalized from the accumulated streamed deltas — the reply is never lost.
+func TestManagerCodexEmptyCompletedFinalizesFromStreamedDeltas(t *testing.T) {
+	rec := &recordingExec{}
+	termMgr := terminal.NewManager()
+	fake := &fakeCodexAppRuntime{threadID: "codex-thread-stream-empty", streamThenEmptyCompleted: true}
+	sink := &stubEventSink{}
+	m := NewManager(ManagerConfig{
+		Terminal: termMgr, Exec: rec.Capture, BinaryResolve: fakeResolve,
+		CodexAppFactory: fake.factory, EventSink: sink,
+	})
+	ext, err := m.EnsureNewDriver(context.Background(), "provisional-codex-stream-empty", t.TempDir(), AgentCodex)
+	if err != nil {
+		t.Fatalf("EnsureDriver codex: %v", err)
+	}
+	if err := ext.SendRaw("hi\r"); err != nil {
+		t.Fatalf("SendRaw: %v", err)
+	}
+	if !pollUntil(10*time.Millisecond, 1500*time.Millisecond, func() bool {
+		reply, _ := codexDurableReplyText(sink.Snapshot())
+		return reply == "Hello, world"
+	}) {
+		reply, sawEmpty := codexDurableReplyText(sink.Snapshot())
+		t.Fatalf("expected durable reply %q from accumulated deltas; got reply=%q empty_error=%v events=%+v", "Hello, world", reply, sawEmpty, sink.Snapshot())
+	}
+	if _, sawEmpty := codexDurableReplyText(sink.Snapshot()); sawEmpty {
+		t.Fatalf("should not emit codex_turn_empty when streamed text was finalized")
+	}
+}
+
+// When item/completed never arrives but deltas streamed, turn/completed flushes
+// the accumulated text as the durable row instead of erroring "no reply".
+func TestManagerCodexNoCompletedFlushesStreamedDeltas(t *testing.T) {
+	rec := &recordingExec{}
+	termMgr := terminal.NewManager()
+	fake := &fakeCodexAppRuntime{threadID: "codex-thread-stream-flush", streamThenNoCompleted: true}
+	sink := &stubEventSink{}
+	m := NewManager(ManagerConfig{
+		Terminal: termMgr, Exec: rec.Capture, BinaryResolve: fakeResolve,
+		CodexAppFactory: fake.factory, EventSink: sink,
+	})
+	ext, err := m.EnsureNewDriver(context.Background(), "provisional-codex-stream-flush", t.TempDir(), AgentCodex)
+	if err != nil {
+		t.Fatalf("EnsureDriver codex: %v", err)
+	}
+	if err := ext.SendRaw("hi\r"); err != nil {
+		t.Fatalf("SendRaw: %v", err)
+	}
+	if !pollUntil(10*time.Millisecond, 1500*time.Millisecond, func() bool {
+		reply, _ := codexDurableReplyText(sink.Snapshot())
+		return reply == "Hello, world"
+	}) {
+		reply, sawEmpty := codexDurableReplyText(sink.Snapshot())
+		t.Fatalf("expected flushed reply %q; got reply=%q empty_error=%v events=%+v", "Hello, world", reply, sawEmpty, sink.Snapshot())
 	}
 }
 

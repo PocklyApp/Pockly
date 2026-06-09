@@ -32,6 +32,15 @@ type codexItemState struct {
 	Command        string
 	Cwd            string
 	ToolUseEmitted bool
+	// AgentText accumulates item/agentMessage/delta chunks so a durable
+	// assistant row can ALWAYS be emitted — even if item/completed carries
+	// empty text or never arrives (errored/interrupted turn). Without this the
+	// streamed reply has no durable counterpart and the web drops it on
+	// reconcile → "no reply".
+	AgentText string
+	// MessageEmitted guards against finalizing the same agentMessage twice
+	// (once on item/completed, once on the turn/completed flush).
+	MessageEmitted bool
 }
 
 var codexTurnTimeout = 120 * time.Second
@@ -274,14 +283,25 @@ func (d *Driver) handleCodexNotification(n codexapp.Notification) {
 		d.markCodexTurnSignal()
 		d.handleCodexCommandOutputDelta(n.Params)
 	case "item/agentMessage/delta":
-		// Live-only feedback; the durable assistant_text row is emitted when
-		// Codex sends item/completed with the full item text.
+		// Stream the delta live AND accumulate it per item id, so the durable
+		// assistant row can be finalized from the accumulated text if
+		// item/completed carries empty text or never arrives.
 		var p struct {
-			Delta string `json:"delta"`
+			ItemID string `json:"itemId"`
+			Delta  string `json:"delta"`
 		}
-		if json.Unmarshal(n.Params, &p) == nil && strings.TrimSpace(p.Delta) != "" {
+		if json.Unmarshal(n.Params, &p) == nil && p.Delta != "" {
 			d.markCodexTurnSignal()
-			d.session.Emit(terminal.EventTextDelta, terminal.SessionLive, terminal.TurnStreaming, p.Delta, "")
+			if p.ItemID != "" {
+				d.mu.Lock()
+				st := d.codexItems[p.ItemID]
+				st.AgentText += p.Delta
+				d.codexItems[p.ItemID] = st
+				d.mu.Unlock()
+			}
+			if strings.TrimSpace(p.Delta) != "" {
+				d.session.Emit(terminal.EventTextDelta, terminal.SessionLive, terminal.TurnStreaming, p.Delta, "")
+			}
 		}
 	case "error":
 		d.markCodexTurnSignal()
@@ -292,6 +312,9 @@ func (d *Driver) handleCodexNotification(n codexapp.Notification) {
 			d.cfg.Logger("sdkdriver: codex error notification sid=%s error=%s", d.cfg.SessionID, msg)
 		}
 	case "turn/completed":
+		// Flush any agentMessage whose deltas streamed but whose item/completed
+		// never arrived (errored/interrupted turn) so the reply isn't lost.
+		d.flushUnemittedCodexAgentText()
 		d.mu.Lock()
 		hadSignal := d.codexTurnHadSignal
 		hadDurableOutput := d.codexTurnHadDurableOutput
@@ -327,6 +350,28 @@ func (d *Driver) markCodexTurnDurableOutput() {
 	d.codexTurnHadSignal = true
 	d.codexTurnHadDurableOutput = true
 	d.mu.Unlock()
+}
+
+// flushUnemittedCodexAgentText finalizes any agentMessage that streamed deltas
+// but whose item/completed never arrived (e.g. the turn errored or was
+// interrupted after streaming). It emits the accumulated text as the durable
+// assistant row exactly once, so a streamed reply is never silently lost.
+func (d *Driver) flushUnemittedCodexAgentText() {
+	type pending struct{ id, text string }
+	var toEmit []pending
+	d.mu.Lock()
+	for id, st := range d.codexItems {
+		if st.MessageEmitted || strings.TrimSpace(st.AgentText) == "" {
+			continue
+		}
+		st.MessageEmitted = true
+		d.codexItems[id] = st
+		toEmit = append(toEmit, pending{id: id, text: st.AgentText})
+	}
+	d.mu.Unlock()
+	for _, p := range toEmit {
+		d.emitClaudeLikeText("assistant", p.id, p.text)
+	}
 }
 
 func codexNotificationErrorMessage(raw json.RawMessage) string {
@@ -456,7 +501,20 @@ func (d *Driver) handleCodexItemCompleted(raw json.RawMessage) {
 	}
 	switch item.Type {
 	case "agentMessage":
-		d.emitClaudeLikeText("assistant", item.ID, item.Text)
+		// Prefer the completed item's full text; fall back to the accumulated
+		// streamed deltas when it's empty so a non-empty reply is never lost.
+		text := item.Text
+		if strings.TrimSpace(text) == "" {
+			d.mu.Lock()
+			text = d.codexItems[item.ID].AgentText
+			d.mu.Unlock()
+		}
+		d.mu.Lock()
+		st := d.codexItems[item.ID]
+		st.MessageEmitted = true
+		d.codexItems[item.ID] = st
+		d.mu.Unlock()
+		d.emitClaudeLikeText("assistant", item.ID, text)
 	case "reasoning":
 		text := strings.Join(append(item.Summary, item.Content...), "\n\n")
 		d.emitClaudeLikeThinking(item.ID, text)
