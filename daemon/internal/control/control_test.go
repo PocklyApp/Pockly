@@ -385,6 +385,32 @@ func TestRouteStartTaskRejectsAgentThatExitsBeforeReady(t *testing.T) {
 	}
 }
 
+// Regression: codex assigns its thread id only after a slow app-server cold
+// start. The old 5s ceiling (which also read a stale bound id at timer-fire)
+// gave up before the id arrived, so the caller never emitted session_created
+// and the web bounced its draft. The bind must be tolerated well past 5s.
+func TestWaitForExternalSessionBoundToleratesSlowColdStart(t *testing.T) {
+	ext := liveterminal.NewExternalSession()
+	events := make(chan liveterminal.Event) // no driver events; rely on the bind poll
+	const provisional = "draft_sid"
+	const realSID = "019eaafd-2207-7c13-a105-daa8a04d73d8"
+	go func() {
+		time.Sleep(6 * time.Second) // past the retired 5s ceiling
+		ext.BindSessionMetadata(realSID, "")
+	}()
+	start := time.Now()
+	got, err := waitForExternalSessionBound(testCtx, ext, events, provisional)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != realSID {
+		t.Fatalf("bound sid = %q, want %q", got, realSID)
+	}
+	if elapsed := time.Since(start); elapsed < 5*time.Second {
+		t.Fatalf("returned before the bind could land (%v) — would have read a stale id", elapsed)
+	}
+}
+
 func TestRouteStartTaskPrefersSDKDriverWhenAvailable(t *testing.T) {
 	tmp := t.TempDir()
 	fakeClaude := filepath.Join(tmp, "claude")
