@@ -120,6 +120,7 @@ func (d *Driver) ensureCodexThread(ctx context.Context) (string, error) {
 		return loaded, nil
 	}
 	approvalPolicy := codexApprovalPolicy(d.cfg.PermissionMode)
+	sandbox := codexSandbox(d.cfg.PermissionMode)
 	var res codexapp.ThreadStartResult
 	var err error
 	if d.cfg.NewSession {
@@ -127,6 +128,7 @@ func (d *Driver) ensureCodexThread(ctx context.Context) (string, error) {
 			Cwd:            d.cfg.Cwd,
 			Model:          strings.TrimSpace(d.cfg.Model),
 			ApprovalPolicy: approvalPolicy,
+			Sandbox:        sandbox,
 		})
 	} else {
 		res, err = app.ThreadResume(ctx, codexapp.ThreadResumeParams{
@@ -135,6 +137,7 @@ func (d *Driver) ensureCodexThread(ctx context.Context) (string, error) {
 			Cwd:            d.cfg.Cwd,
 			Model:          strings.TrimSpace(d.cfg.Model),
 			ApprovalPolicy: approvalPolicy,
+			Sandbox:        sandbox,
 		})
 	}
 	if err != nil {
@@ -700,16 +703,69 @@ func (d *Driver) emitClaudeLikeToolResult(id, result string, isErr bool) {
 	d.session.Emit(terminal.EventMessageAdded, terminal.SessionLive, terminal.TurnStreaming, string(raw), "")
 }
 
+// Codex permission presets — Pockly UI tokens, each encoding a codex
+// (approvalPolicy, sandbox) pair to mirror codex's own three-way approval
+// picker (see codex's TUI). The daemon's agent-settings snapshot offers
+// exactly these for codex sessions; the claude-vocabulary tokens
+// (default/acceptEdits/...) are still accepted as legacy aliases so a
+// session that recorded one before this change keeps mapping sensibly.
+const (
+	// CodexModeRequestApproval — "请求批准": edit the workspace freely but ask
+	// before touching files outside it or the network. on-request + workspaceWrite.
+	CodexModeRequestApproval = "request-approval"
+	// CodexModeApproveForMe — "替我审批": only interrupt for risky/blocked ops.
+	// on-failure + workspaceWrite.
+	CodexModeApproveForMe = "approve-for-me"
+	// CodexModeFullAccess — "完全访问权限": no approvals, full disk + network.
+	// never + dangerFullAccess.
+	CodexModeFullAccess = "full-access"
+)
+
+// CodexPermissionModes is the ordered preset list the codex run-config pill shows.
+func CodexPermissionModes() []string {
+	return []string{CodexModeRequestApproval, CodexModeApproveForMe, CodexModeFullAccess}
+}
+
+// CodexEffortLevels are the reasoning levels codex's UI exposes (no
+// none/minimal/max — those are claude-only or non-UI).
+func CodexEffortLevels() []string {
+	return []string{"low", "medium", "high", "xhigh"}
+}
+
+// codexApprovalPolicy maps a Pockly permission token to codex's AskForApproval
+// string. Empty token returns "" so the daemon omits approvalPolicy entirely and
+// codex falls back to the user's own config.toml default ("follow codex config").
 func codexApprovalPolicy(mode string) string {
 	switch strings.TrimSpace(mode) {
-	case "auto", "acceptEdits":
+	case "":
+		return ""
+	case CodexModeApproveForMe, "auto", "acceptEdits":
 		return "on-failure"
-	case "bypassPermissions", "dontAsk":
+	case CodexModeFullAccess, "bypassPermissions", "dontAsk":
 		return "never"
-	case "plan", "default":
+	case CodexModeRequestApproval, "plan", "default":
 		return "on-request"
 	default:
+		return "on-request"
+	}
+}
+
+// codexSandbox maps a Pockly permission token to a codex sandbox mode string.
+// The app-server's `sandbox` field is a kebab-case enum
+// (read-only | workspace-write | danger-full-access), NOT the tagged-object
+// SandboxPolicy the generated schema shows — verified against the real binary.
+// Empty token returns "" so the daemon omits sandbox and codex uses its own
+// config.toml default. A non-empty token always pins BOTH approval and sandbox
+// so an explicit pick fully defines the mode (e.g. request-approval must force
+// workspace-write even if the user's config default were danger-full-access).
+func codexSandbox(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case "":
 		return ""
+	case CodexModeFullAccess, "bypassPermissions", "dontAsk":
+		return "danger-full-access"
+	default:
+		return "workspace-write"
 	}
 }
 

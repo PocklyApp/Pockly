@@ -6193,6 +6193,15 @@ function effortLabelFor(effort: string | undefined) {
 
 function permissionLabelFor(mode: string | undefined) {
   switch (mode) {
+    // Codex approval presets (disjoint from Claude's vocabulary, so the token
+    // itself selects the label — no agent flag needed).
+    case "request-approval":
+      return tx("pills.permCodexRequest");
+    case "approve-for-me":
+      return tx("pills.permCodexAuto");
+    case "full-access":
+      return tx("pills.permCodexFull");
+    // Claude Code permission modes.
     case "acceptEdits":
       return tx("pills.permissionAcceptEdits");
     case "plan":
