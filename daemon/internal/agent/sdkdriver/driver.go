@@ -183,7 +183,13 @@ type Driver struct {
 	// exit can be recovered by the next inject on the same sid.
 	subprocessDone chan struct{}
 	codex          CodexAppRuntime
-	codexItems     map[string]codexItemState
+	// codexThreadID is the thread the CURRENT codex app-server instance has
+	// actually started/resumed. Cleared whenever the app-server is closed so a
+	// freshly-spawned one re-resumes before the first TurnStart — keying the
+	// skip off the session's bound id instead skipped ThreadResume and made
+	// TurnStart fail with "thread not found".
+	codexThreadID string
+	codexItems    map[string]codexItemState
 }
 
 var (
