@@ -5682,7 +5682,7 @@ function WorkspaceComposerDock({
 //
 // Only mounted when the selected session's agent === "claude-code" so
 // Codex / future agents don't render an unsupported control surface.
-function ClaudeCodePillsRow({
+export function ClaudeCodePillsRow({
   sessionId,
   deviceId,
   agent,
