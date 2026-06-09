@@ -568,6 +568,15 @@ const (
 	// connection (e.g. a proxied socket that silently went away)
 	// can't wedge the shared writer — and therefore the keepalive — forever.
 	controlWriteWait = 10 * time.Second
+	// controlReadWait is how long the read loop tolerates silence before
+	// declaring the connection dead. A TUN/HTTP proxy can vanish the underlying
+	// TCP without sending a WS close frame; the blocking ReadJSON would then
+	// hang forever and the daemon would wrongly believe it is still online while
+	// Nexus has already dropped it — exactly the "daemon offline" the user can't
+	// clear. We drive a WS ping every controlKeepaliveInterval and require any
+	// inbound frame (PONG, or data) within this window, else reconnect. 3x the
+	// ping cadence tolerates a couple of lost frames without false positives.
+	controlReadWait = 60 * time.Second
 )
 
 var (
@@ -699,6 +708,37 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 	}
 	done := make(chan struct{})
 	defer close(done)
+	// Detect a silently-dropped link. A TUN/HTTP proxy can vanish the TCP
+	// without a WS close frame, leaving ReadJSON blocked forever while the
+	// daemon believes it is still online (and Nexus has already dropped it).
+	// Require some inbound frame within controlReadWait; a received PONG (or any
+	// data) below pushes the deadline out. Cloudflare answers pings even while
+	// the Durable Object hibernates, and a TUN proxy tunnels control frames
+	// transparently, so a missing PONG means the link is genuinely gone.
+	_ = conn.SetReadDeadline(time.Now().Add(controlReadWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(controlReadWait))
+	})
+	// Drive WS pings on the keepalive cadence. WriteControl is safe to call
+	// concurrently with the JSON writer; a ping write failure closes the conn so
+	// the read loop unblocks and the outer loop reconnects.
+	go func() {
+		ticker := time.NewTicker(controlKeepaliveInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(controlWriteWait)); err != nil {
+					_ = conn.Close()
+					return
+				}
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 	// Keep an idle control WS alive through edge/proxy infrastructure (see
 	// controlKeepalive). A failed keepalive write closes the conn so the
 	// ReadJSON loop below unblocks and the outer loop reconnects.
@@ -726,6 +766,8 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 		if err := conn.ReadJSON(&msg); err != nil {
 			return err
 		}
+		// Any inbound frame proves the link is alive; push the read deadline out.
+		_ = conn.SetReadDeadline(time.Now().Add(controlReadWait))
 		switch msg.Type {
 		case "INJECT_REQUEST":
 			if msg.Request == nil {
