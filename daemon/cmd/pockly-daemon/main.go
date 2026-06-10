@@ -3594,23 +3594,33 @@ func (a agentSettingsAdapter) DeleteSession(req control.SessionDeleteRequest) co
 	return control.SessionDeleteResult{RequestID: req.RequestID, Status: "ok", Deleted: []string{ref.Path}}
 }
 
-// Reveal opens a local path in the OS file browser (Finder). macOS only; the
-// path must exist so a stale/garbage request can't probe the filesystem
-// beyond an existence check.
+// Reveal opens a local path in the OS file browser — Finder on macOS, File
+// Explorer on Windows, the xdg default on Linux. The path must exist so a
+// stale/garbage request can't probe the filesystem beyond an existence check.
+// The opener is spawned without waiting on its exit status: explorer.exe
+// famously exits non-zero even on success, and a hung opener must not stall
+// the control loop.
 func (a agentSettingsAdapter) Reveal(req control.RevealRequest) control.RevealResult {
 	path := strings.TrimSpace(req.Path)
 	if path == "" {
 		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: "path_required"}
 	}
-	if runtime.GOOS != "darwin" {
-		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: "reveal_unsupported_on_" + runtime.GOOS}
-	}
 	if _, err := os.Stat(path); err != nil {
 		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: "path_not_found"}
 	}
-	if err := exec.Command("open", path).Run(); err != nil {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", path)
+	case "windows":
+		cmd = exec.Command("explorer", path)
+	default:
+		cmd = exec.Command("xdg-open", path)
+	}
+	if err := cmd.Start(); err != nil {
 		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: err.Error()}
 	}
+	go func() { _ = cmd.Wait() }()
 	return control.RevealResult{RequestID: req.RequestID, Status: "ok"}
 }
 
