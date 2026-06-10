@@ -78,6 +78,14 @@ type Index struct {
 	// firstMessagesFull caches the longer first-message copy (≈800 chars)
 	// Nexus uses for title generation. Keyed + GC'd like firstMessages.
 	firstMessagesFull map[string]string
+	// firstScanDone closes after the first completed Refresh. The initial
+	// scan of a large session home takes tens of seconds, and the daemon
+	// boots it in the BACKGROUND so the local API and the Nexus control WS
+	// come up within ~a second of process start (shrinking the visible
+	// "daemon offline" window across restarts). Read paths that need a
+	// complete index (FindSession) gate on this instead of racing the scan.
+	firstScanOnce sync.Once
+	firstScanDone chan struct{}
 }
 
 // Status is a read-only snapshot of the indexer's health. It is exposed
@@ -97,6 +105,7 @@ func New(cfg Config) *Index {
 		changes:           make(chan struct{}, 1),
 		firstMessages:     map[string]string{},
 		firstMessagesFull: map[string]string{},
+		firstScanDone:     make(chan struct{}),
 	}
 }
 
@@ -204,6 +213,16 @@ func (i *Index) Refresh() error {
 	return i.refreshLocked()
 }
 
+// waitFirstScan blocks until the initial background scan has completed, with
+// a generous ceiling so a pathologically slow disk degrades to the old
+// race-the-scan behavior instead of deadlocking callers.
+func (i *Index) waitFirstScan() {
+	select {
+	case <-i.firstScanDone:
+	case <-time.After(2 * time.Minute):
+	}
+}
+
 // RefreshIfStale rebuilds the snapshot only when the last successful scan is
 // older than maxAge. It still refreshes immediately if the previous scan failed.
 func (i *Index) RefreshIfStale(maxAge time.Duration) error {
@@ -239,6 +258,9 @@ func (i *Index) refreshLocked() error {
 	}
 	i.lastErr = err
 	i.mu.Unlock()
+	// Any completed scan — even a failed one — unblocks the first-scan gate:
+	// waiters must not hang on a permanently broken home dir.
+	i.firstScanOnce.Do(func() { close(i.firstScanDone) })
 	if changed {
 		i.notifyChanged()
 	}
@@ -374,8 +396,11 @@ func (i *Index) Status() Status {
 	return status
 }
 
-// FindSession returns the indexed path for a session ID.
+// FindSession returns the indexed path for a session ID. It waits for the
+// initial background scan to complete first — correctness paths (inject
+// resume, session delete) must never act on the boot-time empty index.
 func (i *Index) FindSession(sessionID string) (SessionRef, bool) {
+	i.waitFirstScan()
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	ref, ok := i.sessions[sessionID]
