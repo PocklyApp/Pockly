@@ -420,6 +420,13 @@ func ValidateModelForCwd(cwd, model string, extraAllowed ...string) error {
 	if model == "" {
 		return nil
 	}
+	// The alias trio is valid for claude regardless of what the menu offers
+	// (the official-lineup menu omits them, but /model sonnet still works).
+	for _, alias := range []string{"sonnet", "opus", "haiku"} {
+		if model == alias {
+			return nil
+		}
+	}
 	for _, extra := range extraAllowed {
 		if strings.TrimSpace(extra) == model {
 			return nil
@@ -492,6 +499,48 @@ func ReadModelOptions(cwd string) []string {
 	return out
 }
 
+// officialClaudeModels is Claude Code's current first-party model lineup —
+// what its own /model picker offers a subscription / first-party-API user.
+// Shown instead of the bare alias trio when no custom Anthropic-compatible
+// provider is configured, so the web pill matches the CLI's picker. Refreshed
+// with daemon releases (the same staleness model as the CLI's bundled list).
+// "[1m]" selects the 1M-context variant — the id convention both `--model`
+// and the TUI `/model` accept.
+var officialClaudeModels = []ModelOption{
+	{Value: "claude-fable-5", Label: "Fable 5", ResolvedModel: "claude-fable-5", Source: "official"},
+	{Value: "claude-fable-5[1m]", Label: "Fable 5 (1M)", ResolvedModel: "claude-fable-5[1m]", Source: "official"},
+	{Value: "claude-opus-4-8", Label: "Opus 4.8", ResolvedModel: "claude-opus-4-8", Source: "official"},
+	{Value: "claude-opus-4-8[1m]", Label: "Opus 4.8 (1M)", ResolvedModel: "claude-opus-4-8[1m]", Source: "official"},
+	{Value: "claude-sonnet-4-6", Label: "Sonnet 4.6", ResolvedModel: "claude-sonnet-4-6", Source: "official"},
+	{Value: "claude-haiku-4-5", Label: "Haiku 4.5", ResolvedModel: "claude-haiku-4-5", Source: "official"},
+}
+
+// usesCustomAnthropicProvider reports whether claude is pointed at an
+// Anthropic-COMPATIBLE provider (CC Switch, relays, self-hosted gateways)
+// rather than the first party. Those setups define their own model names via
+// ANTHROPIC_MODEL / ANTHROPIC_DEFAULT_*_MODEL, so the official lineup would
+// be wrong for them and the alias trio (which the provider remaps) is right.
+func usesCustomAnthropicProvider(settingsEnv map[string]string) bool {
+	get := func(key string) string {
+		return firstNonEmpty(settingsEnv[key], os.Getenv(key))
+	}
+	if base := strings.TrimSpace(get("ANTHROPIC_BASE_URL")); base != "" && !strings.Contains(base, "api.anthropic.com") {
+		return true
+	}
+	for _, key := range []string{
+		"ANTHROPIC_MODEL",
+		"ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL",
+		"ANTHROPIC_DEFAULT_SONNET_MODEL",
+		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
+	} {
+		if strings.TrimSpace(get(key)) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // ReadModelOptionDetails returns the structured version of ReadModelOptions.
 // It keeps the submitted value stable while exposing alias target resolution for
 // UI and diagnostics.
@@ -513,9 +562,24 @@ func ReadModelOptionDetails(cwd string) []ModelOption {
 			Source:        strings.TrimSpace(source),
 		})
 	}
-	for _, alias := range []string{"sonnet", "opus", "haiku"} {
-		add(alias, resolveModelAliasWithEnv(alias, settingsEnv), "alias")
+	if usesCustomAnthropicProvider(settingsEnv) {
+		// Compatible-provider setups remap the alias trio via
+		// ANTHROPIC_DEFAULT_*_MODEL; their own model names join below from
+		// config/env.
+		for _, alias := range []string{"sonnet", "opus", "haiku"} {
+			add(alias, resolveModelAliasWithEnv(alias, settingsEnv), "alias")
+		}
+	} else {
+		// First-party: offer what Claude Code's own picker offers.
+		for _, official := range officialClaudeModels {
+			if seen[official.Value] {
+				continue
+			}
+			seen[official.Value] = true
+			out = append(out, official)
+		}
 	}
+	head := len(out)
 	if settingsPath, err := claudelauncher.SettingsPath(); err == nil {
 		add(readModelField(settingsPath), "", "user_config")
 	}
@@ -528,10 +592,10 @@ func ReadModelOptionDetails(cwd string) []ModelOption {
 	}
 	add(settingsEnv["ANTHROPIC_MODEL"], "", claudelauncher.SettingsEnvSource)
 	add(os.Getenv("ANTHROPIC_MODEL"), "", "env")
-	// Keep the official aliases first; sort the rest for stable UI.
-	if len(out) > 3 {
-		sort.SliceStable(out[3:], func(i, j int) bool {
-			return out[3+i].Value < out[3+j].Value
+	// Keep the lineup/aliases first; sort the config-derived rest for stable UI.
+	if len(out) > head {
+		sort.SliceStable(out[head:], func(i, j int) bool {
+			return out[head+i].Value < out[head+j].Value
 		})
 	}
 	return out
