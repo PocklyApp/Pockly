@@ -1159,6 +1159,45 @@ button.account-panel.account-button.is-active {
   gap: 6px;
 }
 
+.drawer-project-head-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.drawer-project-head-row > button.drawer-project-head {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
+}
+
+/* Per-project quick action (new session). Subtle by default, full on hover. */
+.drawer-project-action {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.drawer-project-head-row:hover .drawer-project-action,
+.drawer-project-action:focus-visible {
+  opacity: 1;
+}
+
+.drawer-project-action:hover {
+  background: var(--accent, rgba(127, 127, 127, 0.12));
+  color: var(--foreground);
+}
+
 button.drawer-project-head {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto;
