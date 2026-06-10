@@ -30,6 +30,8 @@ export class InMemoryNexusStore {
     this.feedback = new Map();
     this.sessions = new Map();
     this.turns = new Map();
+    this.sessionPrefs = new Map();
+    this.projectPrefs = new Map();
   }
 
   async upsertUser(user) {
@@ -286,6 +288,47 @@ export class InMemoryNexusStore {
 
   async getSession(userID, deviceID, sessionID) {
     return this.sessions.get(sessionKey(userID, deviceID, sessionID)) ?? null;
+  }
+
+  // ---- UI preferences (pin / archive / rename) -------------------------
+  // Written only by the web; never touched by daemon sync.
+
+  async listSessionPrefsForUser(userID) {
+    return [...this.sessionPrefs.values()].filter((pref) => pref.user_id === userID);
+  }
+
+  async upsertSessionPref(pref) {
+    const key = sessionKey(pref.user_id, pref.device_id, pref.session_id);
+    const existing = this.sessionPrefs.get(key);
+    const next = { ...(existing ?? { pinned: 0, archived: 0, custom_title: null }), ...withoutUndefined(pref) };
+    this.sessionPrefs.set(key, next);
+    return next;
+  }
+
+  async deleteSessionPref(userID, deviceID, sessionID) {
+    this.sessionPrefs.delete(sessionKey(userID, deviceID, sessionID));
+  }
+
+  async listProjectPrefsForUser(userID) {
+    return [...this.projectPrefs.values()].filter((pref) => pref.user_id === userID);
+  }
+
+  async upsertProjectPref(pref) {
+    const key = sessionKey(pref.user_id, pref.device_id, pref.cwd);
+    const existing = this.projectPrefs.get(key);
+    const next = { ...(existing ?? { pinned: 0, archived: 0, removed: 0, custom_label: null }), ...withoutUndefined(pref) };
+    this.projectPrefs.set(key, next);
+    return next;
+  }
+
+  async deleteSessionData(userID, deviceID, sessionID) {
+    this.sessions.delete(sessionKey(userID, deviceID, sessionID));
+    this.sessionPrefs.delete(sessionKey(userID, deviceID, sessionID));
+    for (const [key, turn] of this.turns) {
+      if (turn.user_id === userID && turn.device_id === deviceID && turn.session_id === sessionID) {
+        this.turns.delete(key);
+      }
+    }
   }
 
   async upsertTurn(turn) {
@@ -889,6 +932,96 @@ export class SQLNexusStore {
       SELECT * FROM sessions WHERE user_id = ? AND device_id = ? AND session_id = ?
     `).bind(userID, deviceID, sessionID).first();
     return row ? normalizeSessionRow(row) : null;
+  }
+
+  // ---- UI preferences (pin / archive / rename) -------------------------
+  // Written only by the web; daemon sync never touches these tables.
+
+  async listSessionPrefsForUser(userID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM session_prefs WHERE user_id = ?
+    `).bind(userID).all();
+    return result.results ?? [];
+  }
+
+  async upsertSessionPref(pref) {
+    // COALESCE keeps fields the caller didn't send (null binds) unchanged,
+    // so a pin toggle can't clobber a rename and vice versa.
+    await this.db.prepare(`
+      INSERT INTO session_prefs (user_id, device_id, session_id, pinned, archived, custom_title, updated_at)
+      VALUES (?, ?, ?, COALESCE(?, 0), COALESCE(?, 0), ?, ?)
+      ON CONFLICT(user_id, device_id, session_id) DO UPDATE SET
+        pinned = COALESCE(?, pinned),
+        archived = COALESCE(?, archived),
+        custom_title = COALESCE(?, custom_title),
+        updated_at = ?
+    `).bind(
+      pref.user_id,
+      pref.device_id,
+      pref.session_id,
+      pref.pinned ?? null,
+      pref.archived ?? null,
+      pref.custom_title ?? null,
+      pref.updated_at,
+      pref.pinned ?? null,
+      pref.archived ?? null,
+      pref.custom_title ?? null,
+      pref.updated_at,
+    ).run();
+    return await this.db.prepare(`
+      SELECT * FROM session_prefs WHERE user_id = ? AND device_id = ? AND session_id = ?
+    `).bind(pref.user_id, pref.device_id, pref.session_id).first();
+  }
+
+  async deleteSessionPref(userID, deviceID, sessionID) {
+    await this.db.prepare(`
+      DELETE FROM session_prefs WHERE user_id = ? AND device_id = ? AND session_id = ?
+    `).bind(userID, deviceID, sessionID).run();
+  }
+
+  async listProjectPrefsForUser(userID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM project_prefs WHERE user_id = ?
+    `).bind(userID).all();
+    return result.results ?? [];
+  }
+
+  async upsertProjectPref(pref) {
+    await this.db.prepare(`
+      INSERT INTO project_prefs (user_id, device_id, cwd, pinned, archived, removed, custom_label, updated_at)
+      VALUES (?, ?, ?, COALESCE(?, 0), COALESCE(?, 0), COALESCE(?, 0), ?, ?)
+      ON CONFLICT(user_id, device_id, cwd) DO UPDATE SET
+        pinned = COALESCE(?, pinned),
+        archived = COALESCE(?, archived),
+        removed = COALESCE(?, removed),
+        custom_label = COALESCE(?, custom_label),
+        updated_at = ?
+    `).bind(
+      pref.user_id,
+      pref.device_id,
+      pref.cwd,
+      pref.pinned ?? null,
+      pref.archived ?? null,
+      pref.removed ?? null,
+      pref.custom_label ?? null,
+      pref.updated_at,
+      pref.pinned ?? null,
+      pref.archived ?? null,
+      pref.removed ?? null,
+      pref.custom_label ?? null,
+      pref.updated_at,
+    ).run();
+    return await this.db.prepare(`
+      SELECT * FROM project_prefs WHERE user_id = ? AND device_id = ? AND cwd = ?
+    `).bind(pref.user_id, pref.device_id, pref.cwd).first();
+  }
+
+  async deleteSessionData(userID, deviceID, sessionID) {
+    await this.db.batch([
+      this.db.prepare(`DELETE FROM session_turns WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
+      this.db.prepare(`DELETE FROM sessions WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
+      this.db.prepare(`DELETE FROM session_prefs WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
+    ]);
   }
 
   _upsertTurnStatement(turn) {

@@ -316,6 +316,46 @@ type GitDiffHandler interface {
 	Diff(req GitDiffGet) GitDiffResult
 }
 
+// SessionDeleteRequest asks the daemon to PERMANENTLY delete a session's local
+// transcript file(s) — the claude jsonl or codex rollout. Irreversible; the
+// web gates it behind an explicit confirm dialog.
+type SessionDeleteRequest struct {
+	RequestID string `json:"request_id"`
+	SessionID string `json:"session_id"`
+	Agent     string `json:"agent,omitempty"`
+}
+
+// SessionDeleteResult reports which files were removed (or why not).
+type SessionDeleteResult struct {
+	RequestID string   `json:"request_id"`
+	Status    string   `json:"status"` // "ok" | "error"
+	Error     string   `json:"error,omitempty"`
+	Deleted   []string `json:"deleted,omitempty"`
+}
+
+// SessionDeleteHandler bridges SESSION_DELETE to main.go (which can resolve
+// the on-disk path via the session index). nil disables the surface.
+type SessionDeleteHandler interface {
+	DeleteSession(req SessionDeleteRequest) SessionDeleteResult
+}
+
+// RevealRequest asks the daemon to reveal a local path in the OS file browser
+// (Finder on macOS). Used by the sidebar's "show in Finder" project action.
+type RevealRequest struct {
+	RequestID string `json:"request_id"`
+	Path      string `json:"path"`
+}
+
+type RevealResult struct {
+	RequestID string `json:"request_id"`
+	Status    string `json:"status"` // "ok" | "error"
+	Error     string `json:"error,omitempty"`
+}
+
+type RevealHandler interface {
+	Reveal(req RevealRequest) RevealResult
+}
+
 // AgentDefaultsGet is a session-less variant of AgentSettingsGet that
 // asks the daemon to compute the available model / permission_mode /
 // effort options for a given cwd, WITHOUT requiring a live
@@ -394,8 +434,13 @@ type envelope struct {
 	// Precise git diff for the Diffs drawer (uncommitted changes vs HEAD).
 	GitDiffGet    *GitDiffGet    `json:"git_diff_get,omitempty"`
 	GitDiffResult *GitDiffResult `json:"git_diff_result,omitempty"`
-	RequestID     string         `json:"request_id,omitempty"`
-	Busy          bool           `json:"busy,omitempty"`
+	// Permanent local-session deletion + reveal-in-Finder (sidebar actions).
+	SessionDelete       *SessionDeleteRequest `json:"session_delete,omitempty"`
+	SessionDeleteResult *SessionDeleteResult  `json:"session_delete_result,omitempty"`
+	Reveal              *RevealRequest        `json:"reveal,omitempty"`
+	RevealResult        *RevealResult         `json:"reveal_result,omitempty"`
+	RequestID           string                `json:"request_id,omitempty"`
+	Busy                bool                  `json:"busy,omitempty"`
 }
 
 type Client struct {
@@ -428,6 +473,11 @@ type Client struct {
 	// GitDiff answers GIT_DIFF_GET by running `git diff` in the session's
 	// working tree. nil disables the precise-diff surface.
 	GitDiff GitDiffHandler
+	// SessionDelete answers SESSION_DELETE by removing the session's local
+	// transcript file(s). nil disables the surface.
+	SessionDelete SessionDeleteHandler
+	// Reveal answers REVEAL by opening the path in the OS file browser.
+	Reveal RevealHandler
 	// SDKDriver is the headless `claude --resume` driver that handles
 	// inject requests for sids without a live PTY wrapper. Spec entry:
 	// docs/architecture.md "Agent Driver 模型" (2026-05-25). nil disables
@@ -922,6 +972,34 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 				}
 				sendMu.Lock()
 				_ = conn.WriteJSON(envelope{Type: "GIT_DIFF_RESULT", GitDiffResult: &result})
+				sendMu.Unlock()
+			}()
+		case "SESSION_DELETE":
+			if msg.SessionDelete == nil {
+				continue
+			}
+			deleteReq := *msg.SessionDelete
+			go func() {
+				result := SessionDeleteResult{RequestID: deleteReq.RequestID, Status: "error", Error: "session delete handler not configured"}
+				if cfg.SessionDelete != nil {
+					result = cfg.SessionDelete.DeleteSession(deleteReq)
+				}
+				sendMu.Lock()
+				_ = conn.WriteJSON(envelope{Type: "SESSION_DELETE_RESULT", SessionDeleteResult: &result})
+				sendMu.Unlock()
+			}()
+		case "REVEAL":
+			if msg.Reveal == nil {
+				continue
+			}
+			revealReq := *msg.Reveal
+			go func() {
+				result := RevealResult{RequestID: revealReq.RequestID, Status: "error", Error: "reveal handler not configured"}
+				if cfg.Reveal != nil {
+					result = cfg.Reveal.Reveal(revealReq)
+				}
+				sendMu.Lock()
+				_ = conn.WriteJSON(envelope{Type: "REVEAL_RESULT", RevealResult: &result})
 				sendMu.Unlock()
 			}()
 		}

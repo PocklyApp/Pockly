@@ -1136,6 +1136,8 @@ func runServe(args []string) (err error) {
 						AgentSettings:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						AgentDefaults:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						GitDiff:           agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
+						SessionDelete:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
+						Reveal:            agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						SDKDriver:         sdkDriverAdapter{manager: sdkManager, settings: agentSettingsStore},
 					}); err != nil {
 						log.Printf("Nexus control stopped: %v", err)
@@ -3558,6 +3560,58 @@ func (a agentSettingsAdapter) applyPTYModelWithConfirmation(terminalSessionID, c
 		return lastErr
 	}
 	return fmt.Errorf("model_switch_not_confirmed: expected=%s", expectedTarget)
+}
+
+// DeleteSession PERMANENTLY removes a session's local transcript file (the
+// claude jsonl or codex rollout) resolved via the session index. Irreversible —
+// the web gates it behind an explicit confirm dialog, and Nexus deletes its
+// own copy of the session only after this succeeds.
+func (a agentSettingsAdapter) DeleteSession(req control.SessionDeleteRequest) control.SessionDeleteResult {
+	sid := strings.TrimSpace(req.SessionID)
+	if sid == "" {
+		return control.SessionDeleteResult{RequestID: req.RequestID, Status: "error", Error: "session_id_required"}
+	}
+	if a.index == nil {
+		return control.SessionDeleteResult{RequestID: req.RequestID, Status: "error", Error: "index_unavailable"}
+	}
+	ref, ok := a.index.FindSession(sid)
+	if (!ok || ref.Path == "") && a.index.Refresh() == nil {
+		ref, ok = a.index.FindSession(sid)
+	}
+	if !ok || strings.TrimSpace(ref.Path) == "" {
+		return control.SessionDeleteResult{RequestID: req.RequestID, Status: "error", Error: "session_not_found"}
+	}
+	if err := os.Remove(ref.Path); err != nil {
+		if os.IsNotExist(err) {
+			// Already gone — treat as deleted so the web/Nexus cleanup proceeds.
+			return control.SessionDeleteResult{RequestID: req.RequestID, Status: "ok", Deleted: []string{ref.Path}}
+		}
+		return control.SessionDeleteResult{RequestID: req.RequestID, Status: "error", Error: err.Error()}
+	}
+	log.Printf("session delete: removed %s (sid=%s agent=%s)", ref.Path, sid, ref.Agent)
+	// Refresh so the next catalog sync stops announcing the deleted session.
+	_ = a.index.Refresh()
+	return control.SessionDeleteResult{RequestID: req.RequestID, Status: "ok", Deleted: []string{ref.Path}}
+}
+
+// Reveal opens a local path in the OS file browser (Finder). macOS only; the
+// path must exist so a stale/garbage request can't probe the filesystem
+// beyond an existence check.
+func (a agentSettingsAdapter) Reveal(req control.RevealRequest) control.RevealResult {
+	path := strings.TrimSpace(req.Path)
+	if path == "" {
+		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: "path_required"}
+	}
+	if runtime.GOOS != "darwin" {
+		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: "reveal_unsupported_on_" + runtime.GOOS}
+	}
+	if _, err := os.Stat(path); err != nil {
+		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: "path_not_found"}
+	}
+	if err := exec.Command("open", path).Run(); err != nil {
+		return control.RevealResult{RequestID: req.RequestID, Status: "error", Error: err.Error()}
+	}
+	return control.RevealResult{RequestID: req.RequestID, Status: "ok"}
 }
 
 func (a agentSettingsAdapter) findClaudeSessionRef(sid string) (index.SessionRef, bool) {

@@ -838,6 +838,101 @@ export async function getSessionDiff(input: {
   );
 }
 
+// ── UI preferences (pin / archive / rename) ────────────────────────────
+// Per-user, server-synced (so they follow the account across browsers).
+// Stored in dedicated tables the daemon catalog sync never touches.
+
+export type SessionPref = {
+  device_id: string;
+  session_id: string;
+  pinned: boolean;
+  archived: boolean;
+  custom_title: string;
+};
+
+export type ProjectPref = {
+  device_id: string;
+  cwd: string;
+  pinned: boolean;
+  archived: boolean;
+  removed: boolean;
+  custom_label: string;
+};
+
+export type PrefsSnapshot = { session_prefs: SessionPref[]; project_prefs: ProjectPref[] };
+
+export async function getPrefs(): Promise<PrefsSnapshot> {
+  const auth = await authenticateBrowserDevice();
+  return fetchJSON<PrefsSnapshot>("/api/prefs", {
+    headers: { Authorization: `Bearer ${auth.device_access_token}` },
+  });
+}
+
+// Partial updates: omitted fields keep their stored value (server-side
+// COALESCE), so a pin toggle can't clobber a rename and vice versa.
+export async function setSessionPref(input: {
+  sessionId: string;
+  deviceId: string;
+  pinned?: boolean;
+  archived?: boolean;
+  customTitle?: string;
+}): Promise<SessionPref> {
+  const auth = await authenticateBrowserDevice();
+  return fetchJSON<SessionPref>(`/api/sessions/${encodeURIComponent(input.sessionId)}/prefs`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${auth.device_access_token}` },
+    body: JSON.stringify({
+      device_id: input.deviceId,
+      ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
+      ...(input.archived === undefined ? {} : { archived: input.archived }),
+      ...(input.customTitle === undefined ? {} : { custom_title: input.customTitle }),
+    }),
+  });
+}
+
+export async function setProjectPref(input: {
+  deviceId: string;
+  cwd: string;
+  pinned?: boolean;
+  archived?: boolean;
+  removed?: boolean;
+  customLabel?: string;
+}): Promise<ProjectPref> {
+  const auth = await authenticateBrowserDevice();
+  return fetchJSON<ProjectPref>("/api/projects/prefs", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${auth.device_access_token}` },
+    body: JSON.stringify({
+      device_id: input.deviceId,
+      cwd: input.cwd,
+      ...(input.pinned === undefined ? {} : { pinned: input.pinned }),
+      ...(input.archived === undefined ? {} : { archived: input.archived }),
+      ...(input.removed === undefined ? {} : { removed: input.removed }),
+      ...(input.customLabel === undefined ? {} : { custom_label: input.customLabel }),
+    }),
+  });
+}
+
+// PERMANENT session deletion: the daemon removes the local transcript file,
+// then Nexus drops its own copy (session + turns + prefs). Irreversible —
+// always confirm with the user first.
+export async function deleteSession(input: { sessionId: string; deviceId: string }): Promise<{ status: string; deleted: string[] }> {
+  const auth = await authenticateBrowserDevice();
+  return fetchJSON<{ status: string; deleted: string[] }>(
+    `/api/sessions/${encodeURIComponent(input.sessionId)}/delete?device_id=${encodeURIComponent(input.deviceId)}`,
+    { method: "POST", headers: { Authorization: `Bearer ${auth.device_access_token}` } },
+  );
+}
+
+// Reveal the session's working directory in the daemon's file browser (Finder).
+export async function revealSessionInFinder(input: { sessionId: string; deviceId: string }): Promise<{ status: string }> {
+  const auth = await authenticateBrowserDevice();
+  return fetchJSON<{ status: string }>(
+    `/api/sessions/${encodeURIComponent(input.sessionId)}/reveal?device_id=${encodeURIComponent(input.deviceId)}`,
+    { method: "POST", headers: { Authorization: `Bearer ${auth.device_access_token}` } },
+  );
+}
+
 // Session-less defaults for the draft composer. Returns the available
 // model/permission/effort lists for a daemon + cwd before a real session
 // exists, so the first message can use project/user model aliases.
