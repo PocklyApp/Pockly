@@ -38,7 +38,13 @@ async function installRoutes(
 
     // The one phase-controlled endpoint: the daemon-backed run config.
     if (url.includes("/agent-settings")) {
-      if (getPhase() === "fail") return json({ error: "daemon offline" }, 503);
+      if (getPhase() === "fail") {
+        // Small delay so each failing fetch takes ~250ms — long enough that if
+        // the effect (wrongly) cleared the error at the start of each retry,
+        // the continuous-visibility probe below would catch the blink.
+        await new Promise((r) => setTimeout(r, 250));
+        return json({ error: "daemon offline" }, 503);
+      }
       return json(SNAPSHOT, 200);
     }
     // Browser-device handshake (always succeeds): register → challenge →
@@ -84,7 +90,7 @@ test.describe("composer run-config pills — stale daemon-offline self-heal", ()
     await expect(page.locator(".composer-pill-config")).toContainText(/sonnet/i, { timeout: 4000 });
   });
 
-  test("probe: while the backend stays down, the retry re-sets the error (doesn't go silently blank)", async ({ page }) => {
+  test("no-flash: while the backend stays down, the daemon-offline error stays CONTINUOUSLY visible (never blinks on each retry)", async ({ page }) => {
     const phase: Phase = "fail"; // stays "fail" for this probe — never recovers
     await installRoutes(page, () => phase);
 
@@ -92,12 +98,22 @@ test.describe("composer run-config pills — stale daemon-offline self-heal", ()
 
     const errorLabel = page.locator(".composer-pills-error");
     await expect(errorLabel).toBeVisible({ timeout: 8000 });
+    await expect(errorLabel).toHaveText(/daemon offline/i);
 
-    // Wait past one full retry cycle (>4s). A failed retry clears then
-    // re-sets the error; sampling after the cycle must still show it —
-    // i.e. the failure keeps being surfaced, not swallowed.
-    await page.waitForTimeout(5000);
-    await expect(errorLabel).toBeVisible();
+    // Sample densely across a full retry cycle (>4s). The bug was the effect
+    // clearing the error (and snapshot) at the START of each retry, so the
+    // label blinked off ~once per cycle ("appears 1s, gone 2s, repeat"). With
+    // the fix the cold-failure error is never cleared on retry, so it must be
+    // visible at EVERY sample — no blink.
+    let everHidden = false;
+    for (let i = 0; i < 30; i += 1) {
+      if (!(await errorLabel.isVisible())) {
+        everHidden = true;
+        break;
+      }
+      await page.waitForTimeout(200);
+    }
+    expect(everHidden).toBe(false);
     await expect(errorLabel).toHaveText(/daemon offline/i);
   });
 });

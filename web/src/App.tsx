@@ -5837,36 +5837,47 @@ export function ClaudeCodePillsRow({
 
   // Fetch on mount / real-session switch. AbortController gates a stale
   // response from clobbering a newer session's snapshot.
+  // Reset the composer-mirrored state + clear the pills ONLY when the
+  // session/device identity changes — NOT on a background retry (retryTick).
+  // Clearing snapshot + resetting model/effort on every retry made a transient
+  // agent-settings blip (daemon momentarily unreachable through a flaky proxy)
+  // nuke the already-loaded pills and flash "daemon offline" under them every
+  // few seconds. Keeping the last-good snapshot across retries lets a
+  // background failure self-heal silently.
+  useEffect(() => {
+    if (!sessionId || !deviceId || draftMode) return;
+    setSnapshot(null);
+    setError("");
+    // Reset effort/model/permission so sendPromptForSession never inherits a
+    // stale choice from a prior session; draft-session start_task consumes
+    // these before a real agent-settings row exists.
+    onModelChange?.("");
+    onPermissionModeChange?.("default");
+    onEffortChange("none");
+  }, [sessionId, deviceId, draftMode, onModelChange, onEffortChange, onPermissionModeChange]);
+
   useEffect(() => {
     if (!sessionId || !deviceId || draftMode) return;
     const ctrl = new AbortController();
     let retryTimer = 0;
     setLoading(true);
-    setError("");
-    setSnapshot(null);
-    // Reset effort immediately so sendPromptForSession never inherits a
-    // stale choice from a prior session while the fetch is in flight or
-    // if the fetch fails. Model / permission reset for the same reason:
-    // draft-session start_task consumes those values before a real
-    // agent-settings row exists.
-    onModelChange?.("");
-    onPermissionModeChange?.("default");
-    onEffortChange("none");
     getAgentSettings({ sessionId, deviceId, signal: ctrl.signal })
       .then((data) => {
         setSnapshot(data);
-        // Sync local effort up to App.tsx so the send path uses the
-        // remembered choice without waiting for the user to re-pick it.
+        setError("");
+        // Sync local model/effort/permission up to App.tsx so the send path
+        // uses the remembered choice without waiting for the user to re-pick.
         onModelChange?.(data.current.model ?? "");
         onPermissionModeChange?.(data.current.permission_mode ?? "default");
         onEffortChange(data.current.effort ?? "none");
       })
       .catch((err: unknown) => {
         if (ctrl.signal.aborted) return;
+        // Record the error and retry so a transient failure self-heals. The
+        // error is RENDERED only when no snapshot is loaded yet (cold failure)
+        // — see the composer-pills-error gate — so a background-refresh blip
+        // after the pills loaded never flashes the alarm.
         setError(err instanceof Error ? err.message : String(err));
-        // Self-heal a transient failure (daemon momentarily offline /
-        // reconnecting / just reinstalled): retry so the run-config + the
-        // surfaced error clear once it's back, rather than sticking forever.
         retryTimer = window.setTimeout(() => setRetryTick((t) => t + 1), 4000);
       })
       .finally(() => {
@@ -5973,7 +5984,11 @@ export function ClaudeCodePillsRow({
           <span className="composer-diff-badge">{sheetDiffs.length}</span>
         </button>
       ) : null}
-      {error ? <div className="composer-pills-error" role="status">{error}</div> : null}
+      {/* Only surface the error on a COLD failure (no pills loaded yet). Once a
+          snapshot has loaded, a transient background-refresh failure is kept
+          silent (the retry self-heals) so "daemon offline" never flashes under
+          the pills on a flaky connection. */}
+      {error && !snapshot ? <div className="composer-pills-error" role="status">{error}</div> : null}
       {sheetDiffs.length > 0 ? (
         <SessionDiffSheet diffs={sheetDiffs} open={diffsOpen} onClose={() => setDiffsOpen(false)} />
       ) : null}
