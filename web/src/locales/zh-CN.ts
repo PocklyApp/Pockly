@@ -132,6 +132,7 @@ export const zhCN = {
     actionsAria: "工作区操作",
     search: "搜索",
     projects: "项目",
+    newSessionInProject: "在此新建会话",
     conversations: "对话",
     showMore: "显示更多",
     itemsLeft: "剩余",

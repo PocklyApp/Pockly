@@ -3148,9 +3148,12 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     }
   }
 
-  function createDraftConversation(cwdOverride?: string, agentOverride?: AgentKind) {
+  function createDraftConversation(cwdOverride?: string, agentOverride?: AgentKind, deviceOverride?: string) {
     const cwd = (cwdOverride ?? "").trim();
-    if (!newConversationDaemon) {
+    // deviceOverride lets a per-project "new session" start on that project's
+    // own computer rather than the rail's currently-selected daemon.
+    const device = (deviceOverride ?? newConversationDaemon).trim();
+    if (!device) {
       setInjectStatus(tx("task.noDaemonBody"));
       return null;
     }
@@ -3159,7 +3162,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     const draft: DraftConversation = {
       isDraft: true,
       session_id: `draft_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
-      device_id: newConversationDaemon,
+      device_id: device,
       agent,
       cwd,
       snippet: tx("task.draftSnippet"),
@@ -3811,6 +3814,10 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         currentDeviceId={deviceFilter}
         onDeviceFilter={setExplicitDeviceFilter}
         onNavigate={(next) => void navigate(next)}
+        onNewSessionInProject={(cwd, deviceId, agent) => {
+          createDraftConversation(cwd, agent, deviceId);
+          setRailDrawerOpen(false);
+        }}
         drawerOpen={railDrawerOpen}
         onDrawerOpenChange={setRailDrawerOpen}
       />
@@ -4541,6 +4548,7 @@ function Rail({
   currentDeviceId,
   onDeviceFilter,
   onNavigate,
+  onNewSessionInProject,
   drawerOpen,
   onDrawerOpenChange,
 }: {
@@ -4553,6 +4561,7 @@ function Rail({
   currentDeviceId: string;
   onDeviceFilter: (value: string) => void;
   onNavigate: (route: Route) => void;
+  onNewSessionInProject: (cwd: string, deviceId: string, agent: AgentKind) => void;
   drawerOpen: boolean;
   onDrawerOpenChange: (open: boolean) => void;
 }) {
@@ -4676,19 +4685,33 @@ function Rail({
                   const remaining = ordered.length - visible.length;
                   return (
                     <article key={project.key} className={isOpen ? "drawer-project is-open" : "drawer-project"}>
-                      <button
-                        type="button"
-                        className="drawer-project-head ui-button-ghost"
-                        aria-expanded={isOpen}
-                        onClick={() => setOpenProjects((state) => ({ ...state, [project.key]: !(state[project.key] ?? defaultOpen) }))}
-                      >
-                        <span className="drawer-project-caret" style={{ transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }} aria-hidden="true">
-                          <ChevronRight size={14} />
-                        </span>
-                        <Folder className="drawer-project-folder" size={16} aria-hidden="true" />
-                        <span>{project.label}</span>
-                        <span className="drawer-project-count">{project.sessions.length}</span>
-                      </button>
+                      <div className="drawer-project-head-row">
+                        <button
+                          type="button"
+                          className="drawer-project-head ui-button-ghost"
+                          aria-expanded={isOpen}
+                          onClick={() => setOpenProjects((state) => ({ ...state, [project.key]: !(state[project.key] ?? defaultOpen) }))}
+                        >
+                          <span className="drawer-project-caret" style={{ transform: isOpen ? "rotate(90deg)" : "rotate(0deg)" }} aria-hidden="true">
+                            <ChevronRight size={14} />
+                          </span>
+                          <Folder className="drawer-project-folder" size={16} aria-hidden="true" />
+                          <span className="drawer-project-label">{project.label}</span>
+                          <span className="drawer-project-count">{project.sessions.length}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="drawer-project-action ui-button-ghost"
+                          title={tx("workspace.newSessionInProject")}
+                          aria-label={tx("workspace.newSessionInProject")}
+                          onClick={() => {
+                            const seed = ordered[0];
+                            if (seed) onNewSessionInProject(seed.cwd || "", seed.device_id, seed.agent as AgentKind);
+                          }}
+                        >
+                          <SquarePen size={14} aria-hidden="true" />
+                        </button>
+                      </div>
                       {isOpen ? (
                         <div className="drawer-session-mini-list">
                           {visible.map((session) => (
