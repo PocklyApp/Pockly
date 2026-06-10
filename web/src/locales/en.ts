@@ -359,6 +359,8 @@ export const en = {
     renamePromptSession: "Conversation title (empty to reset):",
     archiveSession: "Archive",
     revealInFinder: "Show in Finder",
+    revealInExplorer: "Show in File Explorer",
+    revealInFiles: "Show in file manager",
     deleteSession: "Delete",
     deleteTitle: "Delete this conversation?",
     deleteBody: "\"{{title}}\" will be deleted from this computer's local files AND from Pockly's server.",
