@@ -1742,6 +1742,32 @@ export function App() {
     setInjectStatus(message);
   }
 
+  // After an inject completes the daemon syncs the durable turns to the server
+  // within a few seconds. The live event stream can DROP events on a flaky link
+  // (a proxy killing the control WS), and codex emits SEVERAL messages per turn
+  // (commentary → tool → final answer) — so a dropped final reply otherwise
+  // stays invisible until a manual page reload. Re-hydrate the authoritative
+  // server copy a few times to backfill whatever the live stream missed.
+  // reconcileHydratedTurns(authoritative) folds the durable copies in and drops
+  // stale live ghosts; it's idempotent, so redundant passes are harmless.
+  async function backfillTurnsAfterInject(selection: ReaderSelection) {
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2500));
+      const sel = selectedRef.current;
+      if (!sel || sel.sessionId !== selection.sessionId || sel.deviceId !== selection.deviceId) return;
+      try {
+        const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId);
+        const stillOn = selectedRef.current;
+        if (!stillOn || stillOn.sessionId !== selection.sessionId || stillOn.deviceId !== selection.deviceId) return;
+        const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
+        setTurns((current) => reconcileHydratedTurns(current, hydrated, true));
+        setTurnsHydration(refreshed);
+      } catch {
+        // Transient (sync still catching up / link blip) — keep retrying.
+      }
+    }
+  }
+
   // discardDraft removes a placeholder draft conversation that never advanced
   // to a real daemon session — e.g. user cancelled before the agent started,
   // or the agent failed before publishing its session id. Safe to call even
@@ -3603,6 +3629,10 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           break;
         }
         finishLiveAgentRun("Live reply ready.");
+        // Self-heal: pull the authoritative turns from the server so a reply
+        // the live stream dropped (e.g. codex's final answer over a flaky link)
+        // appears without a manual page reload.
+        if (selectedRef.current) void backfillTurnsAfterInject(selectedRef.current);
         break;
       case "inject_cancelled":
         injectPhaseRef.current = { requestId: event.request_id, phase: "cancelled" };
