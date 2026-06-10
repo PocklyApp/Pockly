@@ -4591,6 +4591,12 @@ button.ui-button-secondary.load-earlier-button:hover:not(:disabled) {
 .markdown-block {
   min-width: 0;
   color: var(--foreground);
+  /* Long unbroken tokens — inline code spans, URLs, file paths — must break
+     at the overflow point instead of widening the conversation into a
+     horizontal scrollbar. break-word (not anywhere) so table min-content
+     sizing is unaffected; inherited, so links/code/list items are covered.
+     <pre> keeps its own horizontal scroll (white-space: pre opts out). */
+  overflow-wrap: break-word;
 }
 
 /* LaTeX math (KaTeX). The marked extension emits empty sentinel
