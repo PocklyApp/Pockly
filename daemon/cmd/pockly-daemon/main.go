@@ -1079,6 +1079,12 @@ func runServe(args []string) (err error) {
 				// --permission-prompt-tool mcp__pockly__request_permission
 				// inside sdkdriver.Driver.buildArgs.
 				daemonExe, _ := os.Executable()
+				// Let the model pill ask the INSTALLED claude CLI for its
+				// live /model picker list (agentsettings/cli_models.go),
+				// resolved the same wrapper-skipping way SDK spawns are.
+				agentsettings.SetClaudeBinaryResolver(func() (string, error) {
+					return sdkdriver.ResolveExecutable("claude")
+				})
 				sdkManager := sdkdriver.NewManager(sdkdriver.ManagerConfig{
 					Terminal:          terminalManager,
 					Logger:            log.Printf,
