@@ -492,11 +492,19 @@ func TestApplyRejectsNoSession(t *testing.T) {
 	}
 }
 
-func TestReadModelOptionsAlwaysIncludesAliases(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	got := ReadModelOptions(dir)
-	for _, want := range []string{"sonnet", "opus", "haiku"} {
+// Without a custom Anthropic-compatible provider, the menu is the OFFICIAL
+// Claude Code lineup (what the CLI's own /model picker shows), not the bare
+// alias trio. Env-dependent like its sibling tests: a dev machine whose
+// ~/.claude settings configure a custom provider flips the branch.
+func TestReadModelOptionsOfficialLineupWithoutCustomProvider(t *testing.T) {
+	for _, key := range []string{
+		"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN",
+		"ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+	} {
+		t.Setenv(key, "")
+	}
+	got := ReadModelOptions(t.TempDir())
+	for _, want := range []string{"claude-fable-5", "claude-fable-5[1m]", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"} {
 		found := false
 		for _, m := range got {
 			if m == want {
@@ -505,7 +513,43 @@ func TestReadModelOptionsAlwaysIncludesAliases(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("expected %q in ReadModelOptions output, got %v", want, got)
+			t.Errorf("expected official model %q in menu, got %v", want, got)
+		}
+	}
+	// Labels are the human names the CLI picker shows.
+	for _, opt := range ReadModelOptionDetails(t.TempDir()) {
+		if opt.Value == "claude-fable-5" && opt.Label != "Fable 5" {
+			t.Errorf("claude-fable-5 label = %q, want %q", opt.Label, "Fable 5")
+		}
+	}
+	// Aliases stay universally SUBMITTABLE even though the menu omits them.
+	for _, alias := range []string{"sonnet", "opus", "haiku"} {
+		if err := ValidateModelForCwd("", alias); err != nil {
+			t.Errorf("alias %q should validate without being offered: %v", alias, err)
+		}
+	}
+}
+
+// A custom provider (ANTHROPIC_MODEL etc.) keeps the alias trio — the
+// provider remaps those, and the official lineup would be wrong for it.
+func TestReadModelOptionsKeepsAliasesForCustomProvider(t *testing.T) {
+	t.Setenv("ANTHROPIC_MODEL", "anthropic-compatible-fast")
+	got := ReadModelOptions(t.TempDir())
+	for _, want := range []string{"sonnet", "opus", "haiku", "anthropic-compatible-fast"} {
+		found := false
+		for _, m := range got {
+			if m == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %q in custom-provider menu, got %v", want, got)
+		}
+	}
+	for _, m := range got {
+		if m == "claude-fable-5" {
+			t.Errorf("official lineup should not be offered under a custom provider, got %v", got)
 		}
 	}
 }
