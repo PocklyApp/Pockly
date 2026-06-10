@@ -124,13 +124,21 @@ func NewHandler(cfg Config) http.Handler {
 }
 
 // StartBackgroundRefresh keeps the index warm until ctx is cancelled.
+//
+// The initial scan runs in the BACKGROUND: on a home dir with thousands of
+// sessions it takes tens of seconds, and blocking boot on it kept the local
+// API down and the Nexus control WS disconnected for that whole window —
+// every restart/reinstall surfaced as a long "daemon offline" on the web.
+// Read paths that need a complete index (Index.FindSession) gate on the
+// first scan instead of racing it; list-shaped consumers (catalog sync)
+// simply see an empty index until the scan lands and pick the sessions up
+// on their next tick.
 func StartBackgroundRefresh(ctx context.Context, cfg Config) *index.Index {
 	idx := index.New(index.Config{
 		ClaudeHome:      cfg.ClaudeHome,
 		CodexHome:       cfg.CodexHome,
 		RefreshInterval: cfg.RefreshInterval,
 	})
-	_ = idx.Refresh()
 	go idx.Start(ctx)
 	return idx
 }
