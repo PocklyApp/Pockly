@@ -11573,8 +11573,15 @@ export function visibleConversationTurns(turns: SessionTurn[]) {
   // of >=4 became a "4 次连续调用" ToolGroupCard while shorter/mixed runs stayed
   // narrative. Let every tool run flow through the narrative path so the styling
   // is uniform.
+  // dedupeAssistantTextEchoes runs FIRST so a reply stored twice (live SDK
+  // bridge copy + uuid-less jsonl sync copy — endemic to codex, whose rollouts
+  // have no per-message ids) collapses before mergeAdjacentAssistantTurns
+  // would otherwise fuse both copies into one bubble showing the sentence
+  // twice.
   return mergeAdjacentToolPairs(
-    mergeAdjacentAssistantTurns(nestSidechainTurns(turns.filter(isRenderableConversationTurn))),
+    mergeAdjacentAssistantTurns(
+      nestSidechainTurns(dedupeAssistantTextEchoes(turns.filter(isRenderableConversationTurn))),
+    ),
   );
 }
 
@@ -12216,6 +12223,77 @@ function dedupeTurnsByUuid(turns: SessionTurn[]): SessionTurn[] {
 //     re-preserved, so each pass can mint another copy.
 // Observed live: a single follow-up rendered as 5+ identical bubbles.
 //
+// dedupeAssistantTextEchoes collapses ONE assistant reply that the pipeline
+// stored TWICE — the assistant-side sibling of dedupeUserMessageGhosts.
+//
+// Why it happens (worst for codex): the live SDK bridge stores the reply with
+// the app-server item id as its uuid, while the jsonl history sync stores the
+// SAME reply again with NO uuid at all — codex rollouts don't persist
+// per-message ids (verified empirically: response_item.message payloads carry
+// only {type, role, content, phase}). dedupeTurnsByUuid therefore can't fold
+// the pair, both copies live in the server table under different seqs, and the
+// same sentence renders twice. The optimistic live bubble (synthetic seq, no
+// uuid) is a third copy when text-match reconcile misses.
+//
+// Rule: two assistant_text turns with the same whitespace-normalized text are
+// one message stored twice when they are NOT both uuid-bearing (two DISTINCT
+// uuids = genuinely repeated replies — keep both) AND they happened at ~the
+// same moment (timestamps within ASSISTANT_ECHO_WINDOW_MS) or one copy is a
+// live artifact (synthetic/fractional seq). Same-uuid copies always collapse.
+// The survivor prefers the uuid-bearing copy (stable block identity) at the
+// earlier copy's position. Genuine repeats minutes apart are untouched.
+//
+// Runs at RENDER time (visibleConversationTurns) so it also hides pairs that
+// are already persisted server-side — a state-merge-only dedup can't help a
+// session whose duplicate rows are in the table.
+const ASSISTANT_ECHO_WINDOW_MS = 120_000;
+
+export function dedupeAssistantTextEchoes(turns: SessionTurn[]): SessionTurn[] {
+  const isArtifact = (t: SessionTurn) => t.seq >= 900_000_000 || !Number.isInteger(t.seq);
+  const uuidOf = (t: SessionTurn) => (typeof t.payload?.uuid === "string" ? t.payload.uuid : "");
+  const keptByText = new Map<string, number[]>(); // normalized text → indices into out
+  const out: SessionTurn[] = [];
+  for (const turn of turns) {
+    if (turn.kind !== "assistant_text") {
+      out.push(turn);
+      continue;
+    }
+    const text = (turn.payload?.text ?? "").replace(/\s+/g, " ").trim();
+    if (!text) {
+      out.push(turn);
+      continue;
+    }
+    const peers = keptByText.get(text) ?? [];
+    let absorbed = false;
+    for (const idx of peers) {
+      const kept = out[idx];
+      const keptUuid = uuidOf(kept);
+      const turnUuid = uuidOf(turn);
+      const sameUuid = Boolean(keptUuid) && keptUuid === turnUuid;
+      if (!sameUuid) {
+        // Two distinct uuids = two durable jsonl records = genuine repeats.
+        if (keptUuid && turnUuid) continue;
+        const tKept = Date.parse(kept.timestamp);
+        const tTurn = Date.parse(turn.timestamp);
+        const closeInTime =
+          Number.isFinite(tKept) && Number.isFinite(tTurn) &&
+          Math.abs(tKept - tTurn) <= ASSISTANT_ECHO_WINDOW_MS;
+        if (!closeInTime && !isArtifact(kept) && !isArtifact(turn)) continue;
+      }
+      // Same message stored twice → keep ONE. Prefer the uuid-bearing copy,
+      // surfaced at the earlier copy's seq so ordering is stable.
+      if (!keptUuid && turnUuid) out[idx] = { ...turn, seq: kept.seq };
+      absorbed = true;
+      break;
+    }
+    if (absorbed) continue;
+    peers.push(out.length);
+    keptByText.set(text, peers);
+    out.push(turn);
+  }
+  return out;
+}
+
 // Rule: group user_message turns by trimmed text. A genuine hydrated
 // copy is one with an INTEGER seq < 9e8. If a text has any genuine copy,
 // drop all of that text's artifact copies (optimistic or fractional).
