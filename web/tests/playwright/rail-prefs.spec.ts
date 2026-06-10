@@ -10,7 +10,9 @@
 
 import { test, expect } from "@playwright/test";
 
-const DEVICE = { device_id: "dd_test", device_name: "Test Mac", device_type: "daemon", status: "active", remote_access_enabled: true };
+// os drives the reveal menu label ("在 Finder 中显示" on darwin; Windows
+// daemons get 资源管理器, anything else the generic file-manager label).
+const DEVICE = { device_id: "dd_test", device_name: "Test Mac", device_type: "daemon", status: "active", remote_access_enabled: true, os: "darwin" };
 
 function session(id: string, cwd: string, ts: string) {
   return {
