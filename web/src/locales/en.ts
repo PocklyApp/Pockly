@@ -132,6 +132,7 @@ export const en = {
     actionsAria: "Workspace actions",
     search: "Search",
     projects: "Projects",
+    newSessionInProject: "New session here",
     conversations: "Conversations",
     showMore: "Show more",
     itemsLeft: "left",
