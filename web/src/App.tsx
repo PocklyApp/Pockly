@@ -46,7 +46,12 @@ import {
   getAgentSettings,
   getSessionDiff,
   getAgentDefaults,
+  getPrefs,
   setAgentSettings,
+  setSessionPref,
+  setProjectPref,
+  deleteSession,
+  revealSessionInFinder,
   sendTerminalInput,
   sendDevTerminalInput,
   stopTerminalSession,
@@ -73,6 +78,8 @@ import {
   type ListDirResult,
   type HostSummary,
   type SessionListItem,
+  type SessionPref,
+  type ProjectPref,
   type SessionSubscription,
   type SessionTurnsResponse,
   type SyncSessionEvent,
@@ -112,7 +119,9 @@ import {
   MessageSquare,
   Mic,
   MonitorOff,
+  MoreHorizontal,
   Palette,
+  Pin,
   PlusCircle,
   RefreshCw,
   SendHorizontal,
@@ -530,6 +539,11 @@ export function App() {
   // labels. Population happens via the auth-aware effect below; mount
   // starts empty so the cache is never visible to an anonymous user.
   const [sessionTitles, setSessionTitles] = useState<Record<string, string>>({});
+  // Server-synced UI preferences (pin / archive / rename), keyed
+  // `${device_id}:${session_id}` and `${device_id}:${cwd}`. Loaded once per
+  // login; mutations apply optimistically then POST, refetching on failure.
+  const [sessionPrefs, setSessionPrefs] = useState<Record<string, SessionPref>>({});
+  const [projectPrefs, setProjectPrefs] = useState<Record<string, ProjectPref>>({});
   const [turnsHydration, setTurnsHydration] = useState<SessionTurnsResponse | null>(null);
   const [pairStatus, setPairStatus] = useState("");
   const [sessionsStatus, setSessionsStatus] = useState("");
@@ -658,8 +672,17 @@ export function App() {
     [draftConversation, selected, sessions],
   );
   const sessionsWithDraft = useMemo(
-    () => (draftConversation ? [draftConversation, ...sessions.filter((session) => session.session_id !== draftConversation.session_id || session.device_id !== draftConversation.device_id)] : sessions),
-    [draftConversation, sessions],
+    () => {
+      const base = draftConversation ? [draftConversation, ...sessions.filter((session) => session.session_id !== draftConversation.session_id || session.device_id !== draftConversation.device_id)] : sessions;
+      // Apply user renames by overriding the server `title` field — every
+      // consumer (rail, list, header) displays the rename with no per-site
+      // changes, because sessionDisplayName already prefers `title`.
+      return base.map((session) => {
+        const customTitle = sessionPrefs[`${session.device_id}:${session.session_id}`]?.custom_title?.trim();
+        return customTitle ? { ...session, title: customTitle } : session;
+      });
+    },
+    [draftConversation, sessions, sessionPrefs],
   );
 
   // When the currently-selected session is the active draft, the
@@ -1184,6 +1207,91 @@ export function App() {
       setSessionTitles({});
     }
   }, [auth.status, auth.status === "authenticated" ? auth.email : ""]);
+
+  // Server-synced pin/archive/rename prefs: load once per login.
+  const refreshPrefs = useCallback(async () => {
+    try {
+      const snapshot = await getPrefs();
+      setSessionPrefs(Object.fromEntries(snapshot.session_prefs.map((pref) => [`${pref.device_id}:${pref.session_id}`, pref])));
+      setProjectPrefs(Object.fromEntries(snapshot.project_prefs.map((pref) => [`${pref.device_id}:${pref.cwd}`, pref])));
+    } catch {
+      // Prefs are cosmetic — a transient failure just leaves defaults.
+    }
+  }, []);
+  useEffect(() => {
+    if (auth.status === "authenticated") {
+      void refreshPrefs();
+    } else {
+      setSessionPrefs({});
+      setProjectPrefs({});
+    }
+  }, [auth.status, refreshPrefs]);
+
+  // Optimistic pref mutators: update local state immediately, POST in the
+  // background, re-pull server truth on failure so the UI never lies.
+  const applySessionPref = useCallback((deviceId: string, sessionId: string, patch: { pinned?: boolean; archived?: boolean; customTitle?: string }) => {
+    const key = `${deviceId}:${sessionId}`;
+    setSessionPrefs((current) => ({
+      ...current,
+      [key]: {
+        device_id: deviceId,
+        session_id: sessionId,
+        pinned: patch.pinned ?? current[key]?.pinned ?? false,
+        archived: patch.archived ?? current[key]?.archived ?? false,
+        custom_title: patch.customTitle ?? current[key]?.custom_title ?? "",
+      },
+    }));
+    setSessionPref({ sessionId, deviceId, ...patch }).catch(() => void refreshPrefs());
+  }, [refreshPrefs]);
+  const applyProjectPref = useCallback((deviceId: string, cwd: string, patch: { pinned?: boolean; archived?: boolean; removed?: boolean; customLabel?: string }) => {
+    const key = `${deviceId}:${cwd}`;
+    setProjectPrefs((current) => ({
+      ...current,
+      [key]: {
+        device_id: deviceId,
+        cwd,
+        pinned: patch.pinned ?? current[key]?.pinned ?? false,
+        archived: patch.archived ?? current[key]?.archived ?? false,
+        removed: patch.removed ?? current[key]?.removed ?? false,
+        custom_label: patch.customLabel ?? current[key]?.custom_label ?? "",
+      },
+    }));
+    setProjectPref({ deviceId, cwd, ...patch }).catch(() => void refreshPrefs());
+  }, [refreshPrefs]);
+
+  // Pending PERMANENT session delete, gated behind the confirm modal.
+  const [deleteTarget, setDeleteTarget] = useState<{ sessionId: string; deviceId: string; title: string } | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const confirmDeleteSession = useCallback(async () => {
+    if (!deleteTarget) return;
+    setDeleteBusy(true);
+    setDeleteError("");
+    try {
+      await deleteSession({ sessionId: deleteTarget.sessionId, deviceId: deleteTarget.deviceId });
+      setSessions((current) => current.filter((session) => !(session.session_id === deleteTarget.sessionId && session.device_id === deleteTarget.deviceId)));
+      setSelected((current) => {
+        if (current?.sessionId === deleteTarget.sessionId && current.deviceId === deleteTarget.deviceId) {
+          setTurns([]);
+          setTurnsHydration(null);
+          setTurnsStatus("");
+          replaceRoute({ view: "workspaceSessions" });
+          return null;
+        }
+        return current;
+      });
+      setDeleteTarget(null);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleteBusy(false);
+    }
+  }, [deleteTarget]);
+  const requestRevealInFinder = useCallback((sessionId: string, deviceId: string) => {
+    revealSessionInFinder({ sessionId, deviceId }).catch((error: unknown) => {
+      setInjectStatus(error instanceof Error ? error.message : String(error));
+    });
+  }, []);
 
   function handleWorkspaceAuthExpired(error: AuthExpiredError) {
     const message = error.message || "session expired";
@@ -3818,6 +3926,12 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           createDraftConversation(cwd, agent, deviceId);
           setRailDrawerOpen(false);
         }}
+        sessionPrefs={sessionPrefs}
+        projectPrefs={projectPrefs}
+        onSessionPrefChange={applySessionPref}
+        onProjectPrefChange={applyProjectPref}
+        onDeleteSession={(sessionId, deviceId, title) => setDeleteTarget({ sessionId, deviceId, title })}
+        onRevealInFinder={requestRevealInFinder}
         drawerOpen={railDrawerOpen}
         onDrawerOpenChange={setRailDrawerOpen}
       />
@@ -3924,6 +4038,18 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           onSubmit={(cwd, agent) => onCreateNewConversation(cwd, agent)}
           onCancel={() => void onCancelInject()}
           onClose={() => setNewConversationDrawerOpen(false)}
+        />
+      ) : null}
+      {deleteTarget ? (
+        <ConfirmDeleteSessionDialog
+          title={deleteTarget.title}
+          busy={deleteBusy}
+          error={deleteError}
+          onConfirm={() => void confirmDeleteSession()}
+          onCancel={() => {
+            setDeleteTarget(null);
+            setDeleteError("");
+          }}
         />
       ) : null}
       {driftPrompt ? (
@@ -4538,6 +4664,71 @@ function RailDevicePicker({
   );
 }
 
+// RailItemMenu is the compact ⋯ dropdown on sidebar project/session rows.
+// Items run on click; the menu closes on selection, outside press, or Escape.
+function RailItemMenu({ ariaLabel, items }: {
+  ariaLabel: string;
+  items: { key: string; label: string; danger?: boolean; onSelect: () => void }[];
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onOutside = (event: MouseEvent | TouchEvent) => {
+      if (event.target instanceof Node && ref.current?.contains(event.target)) return;
+      setOpen(false);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onOutside, true);
+    document.addEventListener("touchstart", onOutside, true);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onOutside, true);
+      document.removeEventListener("touchstart", onOutside, true);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  return (
+    <div className="rail-menu" ref={ref}>
+      <button
+        type="button"
+        className="drawer-project-action ui-button-ghost"
+        title={ariaLabel}
+        aria-label={ariaLabel}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        onClick={(event) => {
+          event.stopPropagation();
+          setOpen((value) => !value);
+        }}
+      >
+        <MoreHorizontal size={14} aria-hidden="true" />
+      </button>
+      {open ? (
+        <div className="rail-menu-pop" role="menu">
+          {items.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              role="menuitem"
+              className={item.danger ? "rail-menu-item is-danger" : "rail-menu-item"}
+              onClick={(event) => {
+                event.stopPropagation();
+                setOpen(false);
+                item.onSelect();
+              }}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function Rail({
   auth,
   route,
@@ -4549,6 +4740,12 @@ function Rail({
   onDeviceFilter,
   onNavigate,
   onNewSessionInProject,
+  sessionPrefs,
+  projectPrefs,
+  onSessionPrefChange,
+  onProjectPrefChange,
+  onDeleteSession,
+  onRevealInFinder,
   drawerOpen,
   onDrawerOpenChange,
 }: {
@@ -4562,6 +4759,12 @@ function Rail({
   onDeviceFilter: (value: string) => void;
   onNavigate: (route: Route) => void;
   onNewSessionInProject: (cwd: string, deviceId: string, agent: AgentKind) => void;
+  sessionPrefs: Record<string, SessionPref>;
+  projectPrefs: Record<string, ProjectPref>;
+  onSessionPrefChange: (deviceId: string, sessionId: string, patch: { pinned?: boolean; archived?: boolean; customTitle?: string }) => void;
+  onProjectPrefChange: (deviceId: string, cwd: string, patch: { pinned?: boolean; archived?: boolean; removed?: boolean; customLabel?: string }) => void;
+  onDeleteSession: (sessionId: string, deviceId: string, title: string) => void;
+  onRevealInFinder: (sessionId: string, deviceId: string) => void;
   drawerOpen: boolean;
   onDrawerOpenChange: (open: boolean) => void;
 }) {
@@ -4571,8 +4774,30 @@ function Rail({
   const drawerRef = useRef<HTMLDivElement | null>(null);
   // The rail filters by the computer picker; `sessions` already arrives scoped
   // to the selected computer.
-  const drawerProjects = useMemo(() => buildDrawerProjects(sessions), [sessions]);
-  const drawerLooseSessions = useMemo(() => buildDrawerLooseSessions(sessions), [sessions]);
+  const projectPrefFor = (deviceId: string, cwd: string) => projectPrefs[`${deviceId}:${cwd}`];
+  const sessionPrefFor = (session: SessionListItem) => sessionPrefs[`${session.device_id}:${session.session_id}`];
+  // Prefs-aware ordering: pinned projects first (then recency), removed and
+  // archived projects hidden; within a project pinned sessions first and
+  // archived sessions hidden. Same for the loose conversations list.
+  const drawerProjects = useMemo(() => {
+    return buildDrawerProjects(sessions)
+      .filter((project) => {
+        const pref = projectPrefFor(project.deviceId, project.cwd);
+        return !pref?.removed && !pref?.archived;
+      })
+      .sort((a, b) => {
+        const ap = projectPrefFor(a.deviceId, a.cwd)?.pinned ? 1 : 0;
+        const bp = projectPrefFor(b.deviceId, b.cwd)?.pinned ? 1 : 0;
+        return bp - ap;
+      });
+     
+  }, [sessions, projectPrefs]);
+  const drawerLooseSessions = useMemo(() => {
+    return buildDrawerLooseSessions(sessions)
+      .filter((session) => !sessionPrefFor(session)?.archived)
+      .sort((a, b) => (sessionPrefFor(b)?.pinned ? 1 : 0) - (sessionPrefFor(a)?.pinned ? 1 : 0));
+     
+  }, [sessions, sessionPrefs]);
   // Collapsible nav + "show more" state.
   const activeSessionId = route.view === "workspaceSession" ? route.sessionId : "";
   const [openProjects, setOpenProjects] = useState<Record<string, boolean>>({});
@@ -4581,6 +4806,57 @@ function Rail({
   const go = (next: Route) => {
     setDrawerOpen(false);
     onNavigate(next);
+  };
+  // Shared session row (used by both the in-project list and the loose
+  // conversations list): the session button + a ⋯ menu (pin / rename /
+  // archive). The row is a div so the menu isn't an invalid nested button.
+  const renderSessionRow = (session: SessionListItem) => {
+    const pref = sessionPrefFor(session);
+    const isActive = route.view === "workspaceSession" && route.sessionId === session.session_id && route.deviceId === session.device_id;
+    return (
+      <div key={`${session.device_id}:${session.session_id}`} className="drawer-session-mini-row">
+        <button
+          type="button"
+          className={isActive ? "drawer-session-mini ui-button-ghost is-active" : "drawer-session-mini ui-button-ghost"}
+          onClick={() => go({ view: "workspaceSession", sessionId: session.session_id, deviceId: session.device_id })}
+        >
+          <AgentLogo agent={session.agent} />
+          <span className="drawer-session-title">{sessionDisplayName(session, sessionTitles[session.session_id])}</span>
+          {pref?.pinned ? <Pin className="drawer-pin-mark" size={11} aria-hidden="true" /> : null}
+          <time>{shortTime(session.last_timestamp)}</time>
+        </button>
+        <RailItemMenu
+          ariaLabel={tx("railMenu.sessionMenuAria")}
+          items={[
+            {
+              key: "pin",
+              label: pref?.pinned ? tx("railMenu.unpin") : tx("railMenu.pin"),
+              onSelect: () => onSessionPrefChange(session.device_id, session.session_id, { pinned: !pref?.pinned }),
+            },
+            {
+              key: "rename",
+              label: tx("railMenu.renameSession"),
+              onSelect: () => {
+                const next = window.prompt(tx("railMenu.renamePromptSession"), pref?.custom_title || sessionDisplayName(session, sessionTitles[session.session_id]));
+                if (next === null) return;
+                onSessionPrefChange(session.device_id, session.session_id, { customTitle: next.trim() });
+              },
+            },
+            {
+              key: "archive",
+              label: tx("railMenu.archiveSession"),
+              onSelect: () => onSessionPrefChange(session.device_id, session.session_id, { archived: true }),
+            },
+            {
+              key: "delete",
+              label: tx("railMenu.deleteSession"),
+              danger: true,
+              onSelect: () => onDeleteSession(session.session_id, session.device_id, sessionDisplayName(session, sessionTitles[session.session_id])),
+            },
+          ]}
+        />
+      </div>
+    );
   };
   const renderMiniSessionList = (list: SessionListItem[]) => {
     const buckets = bucketSessionsByRecency(list);
@@ -4592,18 +4868,7 @@ function Rail({
       {buckets.map((bucket) => (
         <Fragment key={bucket.key}>
           {showHeaders ? <div className="drawer-date-header">{recencyBucketLabel(bucket.key)}</div> : null}
-          {bucket.sessions.map((session) => (
-            <button
-              key={`${session.device_id}:${session.session_id}`}
-              type="button"
-              className={route.view === "workspaceSession" && route.sessionId === session.session_id && route.deviceId === session.device_id ? "drawer-session-mini ui-button-ghost is-active" : "drawer-session-mini ui-button-ghost"}
-              onClick={() => go({ view: "workspaceSession", sessionId: session.session_id, deviceId: session.device_id })}
-            >
-              <AgentLogo agent={session.agent} />
-              <span className="drawer-session-title">{sessionDisplayName(session, sessionTitles[session.session_id])}</span>
-              <time>{shortTime(session.last_timestamp)}</time>
-            </button>
-          ))}
+          {bucket.sessions.map(renderSessionRow)}
         </Fragment>
       ))}
     </div>
@@ -4677,9 +4942,13 @@ function Rail({
             {drawerProjects.length > 0 ? (
               <div className="drawer-project-list">
                 {drawerProjects.map((project, index) => {
+                  const projectPref = projectPrefFor(project.deviceId, project.cwd);
                   const defaultOpen = index === 0 || project.sessions.some((session) => session.session_id === activeSessionId);
                   const isOpen = openProjects[project.key] ?? defaultOpen;
-                  const ordered = [...project.sessions].sort((a, b) => Date.parse(b.last_timestamp || "") - Date.parse(a.last_timestamp || ""));
+                  const ordered = [...project.sessions]
+                    .filter((session) => !sessionPrefFor(session)?.archived)
+                    .sort((a, b) => Date.parse(b.last_timestamp || "") - Date.parse(a.last_timestamp || ""))
+                    .sort((a, b) => (sessionPrefFor(b)?.pinned ? 1 : 0) - (sessionPrefFor(a)?.pinned ? 1 : 0));
                   const shown = shownPerProject[project.key] ?? RAIL_PROJECT_INITIAL;
                   const visible = ordered.slice(0, shown);
                   const remaining = ordered.length - visible.length;
@@ -4696,9 +4965,48 @@ function Rail({
                             <ChevronRight size={14} />
                           </span>
                           <Folder className="drawer-project-folder" size={16} aria-hidden="true" />
-                          <span className="drawer-project-label">{project.label}</span>
+                          <span className="drawer-project-label">{projectPref?.custom_label?.trim() || project.label}</span>
+                          {projectPref?.pinned ? <Pin className="drawer-pin-mark" size={12} aria-hidden="true" /> : null}
                           <span className="drawer-project-count">{project.sessions.length}</span>
                         </button>
+                        <RailItemMenu
+                          ariaLabel={tx("railMenu.projectMenuAria")}
+                          items={[
+                            {
+                              key: "pin",
+                              label: projectPref?.pinned ? tx("railMenu.unpin") : tx("railMenu.pin"),
+                              onSelect: () => onProjectPrefChange(project.deviceId, project.cwd, { pinned: !projectPref?.pinned }),
+                            },
+                            {
+                              key: "reveal",
+                              label: tx("railMenu.revealInFinder"),
+                              onSelect: () => {
+                                const seed = ordered[0] ?? project.sessions[0];
+                                if (seed) onRevealInFinder(seed.session_id, seed.device_id);
+                              },
+                            },
+                            {
+                              key: "rename",
+                              label: tx("railMenu.renameProject"),
+                              onSelect: () => {
+                                const next = window.prompt(tx("railMenu.renamePromptProject"), projectPref?.custom_label || project.label);
+                                if (next === null) return;
+                                onProjectPrefChange(project.deviceId, project.cwd, { customLabel: next.trim() });
+                              },
+                            },
+                            {
+                              key: "archive",
+                              label: tx("railMenu.archiveProject"),
+                              onSelect: () => onProjectPrefChange(project.deviceId, project.cwd, { archived: true }),
+                            },
+                            {
+                              key: "remove",
+                              label: tx("railMenu.removeProject"),
+                              danger: true,
+                              onSelect: () => onProjectPrefChange(project.deviceId, project.cwd, { removed: true }),
+                            },
+                          ]}
+                        />
                         <button
                           type="button"
                           className="drawer-project-action ui-button-ghost"
@@ -4714,18 +5022,7 @@ function Rail({
                       </div>
                       {isOpen ? (
                         <div className="drawer-session-mini-list">
-                          {visible.map((session) => (
-                            <button
-                              key={`${session.device_id}:${session.session_id}`}
-                              type="button"
-                              className={route.view === "workspaceSession" && route.sessionId === session.session_id && route.deviceId === session.device_id ? "drawer-session-mini ui-button-ghost is-active" : "drawer-session-mini ui-button-ghost"}
-                              onClick={() => go({ view: "workspaceSession", sessionId: session.session_id, deviceId: session.device_id })}
-                            >
-                              <AgentLogo agent={session.agent} />
-                              <span className="drawer-session-title">{sessionDisplayName(session, sessionTitles[session.session_id])}</span>
-                              <time>{shortTime(session.last_timestamp)}</time>
-                            </button>
-                          ))}
+                          {visible.map(renderSessionRow)}
                           {remaining > 0 ? (
                             <button
                               type="button"
@@ -8096,6 +8393,41 @@ function SettingsPage({
 //     in the box = your text is safe" the contract.
 //   - Cancel: stay on the (now read-only) old session; the caller
 //     restores composer text so cancellation also doesn't lose work.
+// ConfirmDeleteSessionDialog gates the PERMANENT session delete: the daemon
+// removes the local transcript file (claude jsonl / codex rollout), then the
+// server drops its copy. There is no undo, so the modal spells that out and
+// the destructive button is visually distinct.
+function ConfirmDeleteSessionDialog({
+  title,
+  busy,
+  error,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  busy: boolean;
+  error: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Dialog open={true} onOpenChange={(open) => { if (!open && !busy) onCancel(); }}>
+      <DialogContent className="ws-modal">
+        <DialogTitle asChild><h3>{tx("railMenu.deleteTitle")}</h3></DialogTitle>
+        <DialogDescription asChild><p>{tx("railMenu.deleteBody", { title })}</p></DialogDescription>
+        <p className="ws-modal-note">{tx("railMenu.deleteNote")}</p>
+        {error ? <p className="ws-modal-error" role="alert">{error}</p> : null}
+        <div className="ws-modal-actions">
+          <button type="button" className="ws-modal-btn is-cancel" disabled={busy} onClick={onCancel}>{tx("common.cancel")}</button>
+          <button type="button" className="ws-modal-btn is-danger" disabled={busy} onClick={onConfirm}>
+            {busy ? tx("railMenu.deleting") : tx("railMenu.deleteConfirm")}
+          </button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function SessionDriftDialog({
   actualSid,
   savedTextPreview,

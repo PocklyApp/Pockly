@@ -981,6 +981,93 @@ describe("worker-native Nexus api", () => {
     assert.equal(transcriptions.length, 1);
     assert.ok(transcriptions[0].audio instanceof File);
   });
+
+  it("stores per-user session and project prefs without partial-update clobbering", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const empty = await call(env, "GET", "/api/prefs", null, auth);
+    assert.equal(empty.status, 200);
+    assert.deepEqual(await empty.json(), { session_prefs: [], project_prefs: [] });
+
+    // Pin a session, then rename it in a SEPARATE call — the rename must not
+    // clobber the pin (COALESCE semantics), and vice versa.
+    const pin = await call(env, "POST", "/api/sessions/sess-1/prefs", {
+      device_id: "dev-1",
+      pinned: true,
+    }, auth);
+    assert.equal(pin.status, 200);
+    const rename = await call(env, "POST", "/api/sessions/sess-1/prefs", {
+      device_id: "dev-1",
+      custom_title: "我的会话",
+    }, auth);
+    assert.equal(rename.status, 200);
+    assert.deepEqual(await rename.json(), {
+      device_id: "dev-1",
+      session_id: "sess-1",
+      pinned: true,
+      archived: false,
+      custom_title: "我的会话",
+    });
+
+    // Project prefs: pin + rename + archive accumulate the same way.
+    const proj = await call(env, "POST", "/api/projects/prefs", {
+      device_id: "dev-1",
+      cwd: "/Users/me/aqua",
+      pinned: true,
+    }, auth);
+    assert.equal(proj.status, 200);
+    const projRename = await call(env, "POST", "/api/projects/prefs", {
+      device_id: "dev-1",
+      cwd: "/Users/me/aqua",
+      custom_label: "Aqua 主仓",
+    }, auth);
+    assert.deepEqual(await projRename.json(), {
+      device_id: "dev-1",
+      cwd: "/Users/me/aqua",
+      pinned: true,
+      archived: false,
+      removed: false,
+      custom_label: "Aqua 主仓",
+    });
+
+    const listed = await call(env, "GET", "/api/prefs", null, auth);
+    const body = await listed.json();
+    assert.equal(body.session_prefs.length, 1);
+    assert.equal(body.session_prefs[0].pinned, true);
+    assert.equal(body.session_prefs[0].custom_title, "我的会话");
+    assert.equal(body.project_prefs.length, 1);
+    assert.equal(body.project_prefs[0].pinned, true);
+    assert.equal(body.project_prefs[0].custom_label, "Aqua 主仓");
+
+    // Unpinning with an explicit false lands (false ≠ "absent").
+    await call(env, "POST", "/api/sessions/sess-1/prefs", {
+      device_id: "dev-1",
+      pinned: false,
+    }, auth);
+    const afterUnpin = await (await call(env, "GET", "/api/prefs", null, auth)).json();
+    assert.equal(afterUnpin.session_prefs[0].pinned, false);
+    assert.equal(afterUnpin.session_prefs[0].custom_title, "我的会话");
+
+    // Missing device_id is rejected.
+    const bad = await call(env, "POST", "/api/sessions/sess-1/prefs", { pinned: true }, auth);
+    assert.equal(bad.status, 400);
+
+    // Prefs are per-user: a second user sees none.
+    const otherCookie = sessionCookie(await call(env, "POST", "/api/dev/login", {
+      email: "other@example.local",
+      name: "Other",
+    }));
+    const otherKeys = await generateSigningKeyPair();
+    const otherBrowser = await registerBrowser(env, otherCookie, otherKeys.publicKey);
+    const otherList = await call(env, "GET", "/api/prefs", null, {
+      authorization: `Bearer ${otherBrowser.device_access_token}`,
+    });
+    assert.deepEqual(await otherList.json(), { session_prefs: [], project_prefs: [] });
+  });
 });
 
 function testEnv(options = {}) {
