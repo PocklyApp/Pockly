@@ -570,8 +570,14 @@ func ReadModelOptionDetails(cwd string) []ModelOption {
 			add(alias, resolveModelAliasWithEnv(alias, settingsEnv), "alias")
 		}
 	} else {
-		// First-party: offer what Claude Code's own picker offers.
-		for _, official := range officialClaudeModels {
+		// First-party: ask the INSTALLED CLI what its own /model picker
+		// offers (live, never stale — see cli_models.go). The static lineup
+		// is only the fallback for query failure / no resolver configured.
+		lineup := claudeCLIModelOptions()
+		if len(lineup) == 0 {
+			lineup = officialClaudeModels
+		}
+		for _, official := range lineup {
 			if seen[official.Value] {
 				continue
 			}
