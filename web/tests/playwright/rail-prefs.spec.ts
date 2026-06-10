@@ -94,7 +94,7 @@ test.describe("sidebar project/session menus", () => {
     await aquaProject.locator(".rail-menu > button").click();
     const menu = page.locator(".rail-menu-pop");
     await expect(menu).toBeVisible();
-    await expect(menu.locator(".rail-menu-item")).toHaveText(["置顶", "在 Finder 中显示", "重命名项目", "归档对话", "移除"]);
+    await expect(menu.locator(".rail-menu-item")).toHaveText(["置顶", "重命名项目", "归档对话", "移除"]);
     await menu.getByText("置顶", { exact: true }).click();
     await expect.poll(() => prefPosts.length).toBeGreaterThan(0);
     expect(prefPosts[0].body).toMatchObject({ device_id: "dd_test", cwd: "/Users/me/aqua", pinned: true });

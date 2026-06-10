@@ -51,7 +51,6 @@ import {
   setSessionPref,
   setProjectPref,
   deleteSession,
-  revealSessionInFinder,
   sendTerminalInput,
   sendDevTerminalInput,
   stopTerminalSession,
@@ -1287,12 +1286,6 @@ export function App() {
       setDeleteBusy(false);
     }
   }, [deleteTarget]);
-  const requestRevealInFinder = useCallback((sessionId: string, deviceId: string) => {
-    revealSessionInFinder({ sessionId, deviceId }).catch((error: unknown) => {
-      setInjectStatus(error instanceof Error ? error.message : String(error));
-    });
-  }, []);
-
   function handleWorkspaceAuthExpired(error: AuthExpiredError) {
     const message = error.message || "session expired";
     autoConnectGenerationRef.current += 1;
@@ -3931,7 +3924,6 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         onSessionPrefChange={applySessionPref}
         onProjectPrefChange={applyProjectPref}
         onDeleteSession={(sessionId, deviceId, title) => setDeleteTarget({ sessionId, deviceId, title })}
-        onRevealInFinder={requestRevealInFinder}
         drawerOpen={railDrawerOpen}
         onDrawerOpenChange={setRailDrawerOpen}
       />
@@ -4745,7 +4737,6 @@ function Rail({
   onSessionPrefChange,
   onProjectPrefChange,
   onDeleteSession,
-  onRevealInFinder,
   drawerOpen,
   onDrawerOpenChange,
 }: {
@@ -4764,7 +4755,6 @@ function Rail({
   onSessionPrefChange: (deviceId: string, sessionId: string, patch: { pinned?: boolean; archived?: boolean; customTitle?: string }) => void;
   onProjectPrefChange: (deviceId: string, cwd: string, patch: { pinned?: boolean; archived?: boolean; removed?: boolean; customLabel?: string }) => void;
   onDeleteSession: (sessionId: string, deviceId: string, title: string) => void;
-  onRevealInFinder: (sessionId: string, deviceId: string) => void;
   drawerOpen: boolean;
   onDrawerOpenChange: (open: boolean) => void;
 }) {
@@ -4776,15 +4766,6 @@ function Rail({
   // to the selected computer.
   const projectPrefFor = (deviceId: string, cwd: string) => projectPrefs[`${deviceId}:${cwd}`];
   const sessionPrefFor = (session: SessionListItem) => sessionPrefs[`${session.device_id}:${session.session_id}`];
-  // The reveal label names the actual file browser of the PROJECT'S computer
-  // (the daemon may run on a different OS than this browser): Finder on
-  // macOS, File Explorer on Windows, generic otherwise.
-  const revealLabelFor = (deviceId: string) => {
-    const os = (devices.find((device) => device.device_id === deviceId)?.os || "").toLowerCase();
-    if (os.includes("darwin") || os.includes("mac")) return tx("railMenu.revealInFinder");
-    if (os.includes("win")) return tx("railMenu.revealInExplorer");
-    return tx("railMenu.revealInFiles");
-  };
   // Prefs-aware ordering: pinned projects first (then recency), removed and
   // archived projects hidden; within a project pinned sessions first and
   // archived sessions hidden. Same for the loose conversations list.
@@ -4985,14 +4966,6 @@ function Rail({
                               key: "pin",
                               label: projectPref?.pinned ? tx("railMenu.unpin") : tx("railMenu.pin"),
                               onSelect: () => onProjectPrefChange(project.deviceId, project.cwd, { pinned: !projectPref?.pinned }),
-                            },
-                            {
-                              key: "reveal",
-                              label: revealLabelFor(project.deviceId),
-                              onSelect: () => {
-                                const seed = ordered[0] ?? project.sessions[0];
-                                if (seed) onRevealInFinder(seed.session_id, seed.device_id);
-                              },
                             },
                             {
                               key: "rename",
