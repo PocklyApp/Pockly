@@ -82,6 +82,8 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (path === "/api/voice/transcriptions") return await transcribeVoice(request, store, env);
     if (path === "/api/feedback") return await submitFeedback(request, store);
     if (path === "/api/sessions") return await listSessions(request, store, env);
+    if (path === "/api/prefs") return await listPrefs(request, store);
+    if (path === "/api/projects/prefs") return await setProjectPrefs(request, store);
     if (path === "/api/tasks") return await startTask(request, store, env);
     if (path === "/api/terminal-sessions") return await terminalSessions(request, store, env);
     if (path === "/api/agent-defaults") return await agentDefaults(request, store, env, url);
@@ -113,7 +115,10 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     const sessionTurns = path.match(/^\/api\/sessions\/([^/]+)\/turns$/);
     if (sessionTurns) return await listSessionTurns(request, store, decodeURIComponent(sessionTurns[1]), url);
 
-    const sessionAction = path.match(/^\/api\/sessions\/([^/]+)\/(inject|sync|agent-settings|diff)$/);
+    const sessionPrefs = path.match(/^\/api\/sessions\/([^/]+)\/prefs$/);
+    if (sessionPrefs) return await setSessionPrefs(request, store, decodeURIComponent(sessionPrefs[1]));
+
+    const sessionAction = path.match(/^\/api\/sessions\/([^/]+)\/(inject|sync|agent-settings|diff|delete|reveal)$/);
     if (sessionAction) return await sessionControlAction(request, store, env, decodeURIComponent(sessionAction[1]), sessionAction[2], url);
 
     const permissionAction = path.match(/^\/api\/permission-requests\/([^/]+)\/decide$/);
@@ -1041,6 +1046,95 @@ async function listSessions(request, store, env) {
   return jsonResponse({ sessions: rows });
 }
 
+// ---- UI preferences (pin / archive / rename) ----------------------------
+// Per-user, stored in dedicated tables so daemon catalog sync never clobbers
+// them. Written only by the web.
+
+function normalizeBoolPref(value) {
+  if (value === undefined || value === null) return undefined;
+  return value ? 1 : 0;
+}
+
+async function listPrefs(request, store) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user } = await requireDeviceAuth(request, store);
+  const [sessionPrefs, projectPrefs] = await Promise.all([
+    store.listSessionPrefsForUser(user.user_id),
+    store.listProjectPrefsForUser(user.user_id),
+  ]);
+  return jsonResponse({
+    session_prefs: sessionPrefs.map((pref) => ({
+      device_id: pref.device_id,
+      session_id: pref.session_id,
+      pinned: Boolean(pref.pinned),
+      archived: Boolean(pref.archived),
+      custom_title: pref.custom_title || "",
+    })),
+    project_prefs: projectPrefs.map((pref) => ({
+      device_id: pref.device_id,
+      cwd: pref.cwd,
+      pinned: Boolean(pref.pinned),
+      archived: Boolean(pref.archived),
+      removed: Boolean(pref.removed),
+      custom_label: pref.custom_label || "",
+    })),
+  });
+}
+
+async function setSessionPrefs(request, store, sessionID) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  const { user } = await requireDeviceAuth(request, store);
+  const body = await request.json().catch(() => null);
+  const deviceID = String(body?.device_id ?? "");
+  if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
+  // custom_title: empty string clears back to the derived title (stored NULL
+  // would be kept by COALESCE, so map "" → null only when absent; an explicit
+  // "" is stored as "" and treated as unset by the reader).
+  const pref = await store.upsertSessionPref({
+    user_id: user.user_id,
+    device_id: deviceID,
+    session_id: sessionID,
+    pinned: normalizeBoolPref(body?.pinned),
+    archived: normalizeBoolPref(body?.archived),
+    custom_title: body?.custom_title === undefined ? undefined : String(body.custom_title),
+    updated_at: new Date().toISOString(),
+  });
+  return jsonResponse({
+    device_id: pref.device_id,
+    session_id: pref.session_id,
+    pinned: Boolean(pref.pinned),
+    archived: Boolean(pref.archived),
+    custom_title: pref.custom_title || "",
+  });
+}
+
+async function setProjectPrefs(request, store) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  const { user } = await requireDeviceAuth(request, store);
+  const body = await request.json().catch(() => null);
+  const deviceID = String(body?.device_id ?? "");
+  const cwd = String(body?.cwd ?? "");
+  if (!deviceID || !cwd) return errorResponse("device_id and cwd are required", ErrorCode.BadRequest, { status: 400 });
+  const pref = await store.upsertProjectPref({
+    user_id: user.user_id,
+    device_id: deviceID,
+    cwd,
+    pinned: normalizeBoolPref(body?.pinned),
+    archived: normalizeBoolPref(body?.archived),
+    removed: normalizeBoolPref(body?.removed),
+    custom_label: body?.custom_label === undefined ? undefined : String(body.custom_label),
+    updated_at: new Date().toISOString(),
+  });
+  return jsonResponse({
+    device_id: pref.device_id,
+    cwd: pref.cwd,
+    pinned: Boolean(pref.pinned),
+    archived: Boolean(pref.archived),
+    removed: Boolean(pref.removed),
+    custom_label: pref.custom_label || "",
+  });
+}
+
 async function listSessionTurns(request, store, sessionID, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store);
@@ -1288,8 +1382,60 @@ async function sessionControlAction(request, store, env, sessionID, action, url)
       return await sessionAgentSettings(request, store, env, sessionID, url);
     case "diff":
       return await sessionDiff(request, store, env, sessionID, url);
+    case "delete":
+      return await sessionDelete(request, store, env, sessionID, url);
+    case "reveal":
+      return await sessionReveal(request, store, env, sessionID, url);
     default:
       return errorResponse("not found", ErrorCode.NotFound, { status: 404 });
+  }
+}
+
+// sessionDelete PERMANENTLY deletes a session: the daemon removes the local
+// transcript file first; only on success does Nexus drop its own copy
+// (session row + turns + prefs). The web gates this behind a confirm dialog.
+async function sessionDelete(request, store, env, sessionID, url) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
+  const control = createControlHubForUser(env, user.user_id);
+  const daemonDeviceID = requiredString(url.searchParams.get("device_id") ?? "", "device_id");
+  const { daemon, session } = await requireUserDaemonSession(store, user.user_id, daemonDeviceID, sessionID);
+  const requestID = randomID("sd");
+  try {
+    const result = await control.requestResponse(daemon.device_id, {
+      type: "SESSION_DELETE",
+      session_delete: { request_id: requestID, session_id: sessionID, agent: session.agent || "" },
+    }, "SESSION_DELETE_RESULT", requestID, 30_000);
+    if (result.status !== "ok") {
+      return errorResponse(result.error || "session delete failed", ErrorCode.BadRequest, { status: result.error === "session_not_found" ? 404 : 400 });
+    }
+    await store.deleteSessionData(user.user_id, daemon.device_id, sessionID);
+    return jsonResponse({ status: "ok", deleted: result.deleted || [] });
+  } catch (error) {
+    return mapControlError(error);
+  }
+}
+
+// sessionReveal opens the session's working directory in the daemon's OS file
+// browser (Finder). Path comes from the server-side session row — never from
+// the client — so the surface can't be used to probe arbitrary paths.
+async function sessionReveal(request, store, env, sessionID, url) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
+  const control = createControlHubForUser(env, user.user_id);
+  const daemonDeviceID = requiredString(url.searchParams.get("device_id") ?? "", "device_id");
+  const { daemon, session } = await requireUserDaemonSession(store, user.user_id, daemonDeviceID, sessionID);
+  if (!session.cwd) return errorResponse("session has no working directory", ErrorCode.BadRequest, { status: 400 });
+  const requestID = randomID("rv");
+  try {
+    const result = await control.requestResponse(daemon.device_id, {
+      type: "REVEAL",
+      reveal: { request_id: requestID, path: session.cwd },
+    }, "REVEAL_RESULT", requestID, 15_000);
+    if (result.status !== "ok") return errorResponse(result.error || "reveal failed", ErrorCode.BadRequest, { status: 400 });
+    return jsonResponse({ status: "ok" });
+  } catch (error) {
+    return mapControlError(error);
   }
 }
 

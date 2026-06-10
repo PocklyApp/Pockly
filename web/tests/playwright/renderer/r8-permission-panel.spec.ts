@@ -134,7 +134,9 @@ test.describe("permission panel", () => {
 
     const card = page.locator(".permission-panel .permission-card");
     await expect(card).toBeVisible();
-    await expect(card.locator(".permission-card-title")).toHaveText("Claude is waiting on the computer");
+    // Matches locales/en.ts permissions copy ("The agent is…", agent-neutral
+    // since codex shares this card). The spec predated that wording.
+    await expect(card.locator(".permission-card-title")).toHaveText("The agent is waiting on the computer");
     await expect(card.getByText("Approve or cancel it on the connected computer.")).toBeVisible();
     await expect(card.getByRole("button")).toHaveCount(0);
     await expect(page.locator(".fixture-turns .permission-card")).toHaveCount(0);

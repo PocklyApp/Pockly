@@ -343,6 +343,10 @@ export class InMemoryControlHub {
         return this.deliverPending(type, envelope.agent_defaults_result || envelope.AgentDefaultsResult);
       case "GIT_DIFF_RESULT":
         return this.deliverPending(type, envelope.git_diff_result || envelope.GitDiffResult);
+      case "SESSION_DELETE_RESULT":
+        return this.deliverPending(type, envelope.session_delete_result || envelope.SessionDeleteResult);
+      case "REVEAL_RESULT":
+        return this.deliverPending(type, envelope.reveal_result || envelope.RevealResult);
       case "TERMINAL_EVENT":
         return this.publishTerminalEvent(envelope.terminal_event || envelope.TerminalEvent, options);
       default:

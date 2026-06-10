@@ -1171,6 +1171,75 @@ button.account-panel.account-button.is-active {
   width: auto;
 }
 
+/* ⋯ dropdown on project/session rows. */
+.rail-menu {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+}
+
+.rail-menu-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 60;
+  min-width: 150px;
+  display: grid;
+  padding: 5px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--popover, var(--background));
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+.rail-menu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rail-menu-item:hover {
+  background: var(--accent, rgba(127, 127, 127, 0.12));
+}
+
+.rail-menu-item.is-danger {
+  color: var(--destructive, #c0392b);
+}
+
+/* Session row = session button + ⋯ menu; menu fades in on hover/focus. */
+.drawer-session-mini-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.drawer-session-mini-row > .drawer-session-mini {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.drawer-session-mini-row .rail-menu > .drawer-project-action {
+  opacity: 0;
+}
+
+.drawer-session-mini-row:hover .rail-menu > .drawer-project-action,
+.drawer-session-mini-row .rail-menu > .drawer-project-action:focus-visible,
+.drawer-session-mini-row .rail-menu > .drawer-project-action[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.drawer-pin-mark {
+  flex: none;
+  color: var(--muted-foreground);
+}
+
 /* Per-project quick action (new session). Subtle by default, full on hover. */
 .drawer-project-action {
   flex: none;
