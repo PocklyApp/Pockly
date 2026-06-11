@@ -1030,16 +1030,23 @@ async function daemonSync(request, store) {
   await store.touchDevice(device.device_id, now);
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
   const turns = Array.isArray(body.turns) ? body.turns : [];
-  const uploadedTurnsBySession = new Map();
+  const uploadedTurnStatsBySession = new Map();
   for (const turn of turns) {
     const sessionID = String(turn.session_id ?? "");
-    uploadedTurnsBySession.set(sessionID, (uploadedTurnsBySession.get(sessionID) ?? 0) + 1);
+    const seq = Number(turn.seq ?? 0) || 0;
+    const stats = uploadedTurnStatsBySession.get(sessionID) || { count: 0, min_seq: 0, max_seq: 0 };
+    stats.count += 1;
+    if (seq > 0) {
+      stats.min_seq = stats.min_seq > 0 ? Math.min(stats.min_seq, seq) : seq;
+      stats.max_seq = Math.max(stats.max_seq, seq);
+    }
+    uploadedTurnStatsBySession.set(sessionID, stats);
   }
   await store.upsertTurns(turns.map((turn) => syncTurnRecord(user, device, turn, now)));
   if (body.full_reconcile) {
     await store.deleteMissingDeviceSessions(user.user_id, device.device_id, sessions.map((session) => String(session.session_id)));
   }
-  await store.upsertSessions(await Promise.all(sessions.map((session) => syncSessionRecord(store, user, device, session, now, uploadedTurnsBySession.get(String(session.session_id)) ?? 0))));
+  await store.upsertSessions(await Promise.all(sessions.map((session) => syncSessionRecord(store, user, device, session, now, uploadedTurnStatsBySession.get(String(session.session_id))))));
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
@@ -2545,19 +2552,22 @@ async function assertDaemonAssignable(store, daemonDeviceID, userID, publicKey) 
   }
 }
 
-async function syncSessionRecord(store, user, device, session, now, uploadedTurnCount) {
+async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats) {
   const existing = await store.getSession(user.user_id, device.device_id, requiredString(session.session_id, "session_id"));
-  const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnCount);
+  const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnStats);
   const persistedTurnCount = stats
     ? stats.count
     : Number(existing?.synced_turn_count ?? 0);
   const minSeq = Number(session.min_seq ?? 0);
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
+  const uploadedTurnCount = Number(uploadedTurnStats?.count ?? 0) || 0;
+  const uploadedSyncedMinSeq = Number(stats?.min_seq ?? uploadedTurnStats?.min_seq ?? minSeq) || 0;
+  const uploadedSyncedMaxSeq = Number(stats?.max_seq ?? uploadedTurnStats?.max_seq ?? maxSeq) || 0;
   const syncedMinSeq = uploadedTurnCount > 0
-    ? mergeSyncedMinSeq(existing?.synced_min_seq, minSeq)
+    ? mergeSyncedMinSeq(existing?.synced_min_seq, uploadedSyncedMinSeq)
     : mergeSyncedMinSeq(existing?.synced_min_seq, stats?.min_seq ?? 0);
   const syncedMaxSeq = uploadedTurnCount > 0
-    ? Math.max(Number(existing?.synced_max_seq ?? 0), maxSeq)
+    ? Math.max(Number(existing?.synced_max_seq ?? 0), uploadedSyncedMaxSeq)
     : Math.max(Number(existing?.synced_max_seq ?? 0), stats?.max_seq ?? 0);
   return {
     user_id: user.user_id,
@@ -2592,8 +2602,11 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
   };
 }
 
-async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnCount) {
+async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnStats) {
+  const uploadedTurnCount = Number(uploadedTurnStats?.count ?? 0) || 0;
   if (uploadedTurnCount > 0) {
+    const merged = mergeUploadedTurnStats(existing, session, uploadedTurnStats);
+    if (!merged.requires_full_stats) return merged;
     return await sessionTurnStats(store, userID, deviceID, sessionID);
   }
   // Repair older rows whose session metadata was left at catalog_only/0 even
@@ -2607,6 +2620,56 @@ async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing
     if (stats.count > 0) return stats;
   }
   return null;
+}
+
+function mergeUploadedTurnStats(existing, session, uploadedTurnStats) {
+  const uploadedCount = Number(uploadedTurnStats?.count ?? 0) || 0;
+  const uploadedMinSeq = Number(uploadedTurnStats?.min_seq ?? session.min_seq ?? 0) || 0;
+  const uploadedMaxSeq = Number(uploadedTurnStats?.max_seq ?? session.max_seq ?? session.last_seq ?? 0) || 0;
+  if (uploadedCount <= 0 || uploadedMinSeq <= 0 || uploadedMaxSeq <= 0 || uploadedMaxSeq < uploadedMinSeq) {
+    return { requires_full_stats: true };
+  }
+
+  const currentCount = Number(existing?.synced_turn_count ?? 0) || 0;
+  const currentMinSeq = Number(existing?.synced_min_seq ?? 0) || 0;
+  const currentMaxSeq = Number(existing?.synced_max_seq ?? 0) || 0;
+  if (currentCount <= 0 || currentMinSeq <= 0 || currentMaxSeq <= 0 || currentMaxSeq < currentMinSeq) {
+    return {
+      count: uploadedCount,
+      min_seq: uploadedMinSeq,
+      max_seq: uploadedMaxSeq,
+      latest_contiguous_min_seq: uploadedMinSeq,
+    };
+  }
+
+  const currentSpan = currentMaxSeq - currentMinSeq + 1;
+  const currentRangeIsComplete = currentCount >= currentSpan;
+  const disjointBelow = uploadedMaxSeq < currentMinSeq;
+  const disjointAbove = uploadedMinSeq > currentMaxSeq;
+  if (!currentRangeIsComplete && !disjointBelow && !disjointAbove) {
+    // Existing min/max can hide gaps (for example 1-40 and 141-240). In that
+    // case a contained upload may fill a hole, so use the store's seq-only
+    // stats query instead of guessing from the compressed session row.
+    return { requires_full_stats: true };
+  }
+
+  let additionalCount = 0;
+  if (uploadedMinSeq < currentMinSeq) {
+    additionalCount += Math.min(uploadedMaxSeq, currentMinSeq - 1) - uploadedMinSeq + 1;
+  }
+  if (uploadedMaxSeq > currentMaxSeq) {
+    additionalCount += uploadedMaxSeq - Math.max(uploadedMinSeq, currentMaxSeq + 1) + 1;
+  }
+  const nextMinSeq = Math.min(currentMinSeq, uploadedMinSeq);
+  const nextMaxSeq = Math.max(currentMaxSeq, uploadedMaxSeq);
+  const nextCount = currentCount + additionalCount;
+  const nextSpan = nextMaxSeq - nextMinSeq + 1;
+  return {
+    count: Math.min(nextCount, nextSpan),
+    min_seq: nextMinSeq,
+    max_seq: nextMaxSeq,
+    latest_contiguous_min_seq: nextCount >= nextSpan ? nextMinSeq : currentMinSeq,
+  };
 }
 
 async function sessionTurnStats(store, userID, deviceID, sessionID) {

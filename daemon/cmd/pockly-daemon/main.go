@@ -2362,17 +2362,27 @@ const (
 )
 
 type nexusSyncPolicy struct {
-	SyncWindowDays    int
-	InitialTurnLimit  int
-	PriorityTurnLimit int
+	ProactiveHistorySync bool
+	SyncWindowDays       int
+	InitialTurnLimit     int
+	PriorityTurnLimit    int
 }
 
 func defaultNexusSyncPolicy() nexusSyncPolicy {
+	proactive := envBoolDefault("POCKLY_PROACTIVE_HISTORY_SYNC", false)
 	return nexusSyncPolicy{
-		SyncWindowDays:    envInt("POCKLY_SYNC_WINDOW_DAYS", defaultSyncWindowDays, 0, 3650),
-		InitialTurnLimit:  envInt("POCKLY_INITIAL_TURN_LIMIT", defaultInitialTurnLimit, 1, 100),
-		PriorityTurnLimit: envInt("POCKLY_PRIORITY_TURN_LIMIT", defaultPriorityTurnLimit, 1, 100),
+		ProactiveHistorySync: proactive,
+		SyncWindowDays:       proactiveHistorySyncWindowDays(proactive),
+		InitialTurnLimit:     envInt("POCKLY_INITIAL_TURN_LIMIT", defaultInitialTurnLimit, 1, 100),
+		PriorityTurnLimit:    envInt("POCKLY_PRIORITY_TURN_LIMIT", defaultPriorityTurnLimit, 1, 100),
 	}
+}
+
+func proactiveHistorySyncWindowDays(enabled bool) int {
+	if !enabled {
+		return 0
+	}
+	return envInt("POCKLY_SYNC_WINDOW_DAYS", defaultSyncWindowDays, 0, 3650)
 }
 
 type syncHint struct {
@@ -2544,7 +2554,7 @@ func catalogSyncMinInterval() time.Duration {
 }
 
 func windowSyncMinInterval() time.Duration {
-	return envDuration("POCKLY_WINDOW_SYNC_MIN_INTERVAL", 15*time.Second, 0, time.Hour)
+	return envDuration("POCKLY_WINDOW_SYNC_MIN_INTERVAL", 60*time.Second, 0, time.Hour)
 }
 
 func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hintCache *syncHintCache, pushedHints *pushedHintStore, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) (int, int) {
@@ -2570,8 +2580,6 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		if hint, ok := hints[session.SessionID]; ok {
 			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
 			beforeSeq = beforeSeqForHint(hint)
-		} else if sessionActiveWithin(session, now, activeSessionWindow) {
-			limit = maxInt(limit, policy.PriorityTurnLimit)
 		}
 		req, err := relay.BuildSingleSessionWindowSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, relay.SessionWindow{Limit: limit, BeforeSeq: beforeSeq}, nil)
 		if err != nil {
@@ -2736,7 +2744,7 @@ func recentNexusSessions(sessions []pair.SyncSession, max int, policy nexusSyncP
 			continue
 		}
 		priority := sessionSyncPriority(session, hints, now)
-		if !priority && !sessionWithinSyncWindow(session, cutoff) {
+		if !priority && (!policy.ProactiveHistorySync || !sessionWithinSyncWindow(session, cutoff)) {
 			continue
 		}
 		candidates = append(candidates, session)

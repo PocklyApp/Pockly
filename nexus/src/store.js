@@ -623,8 +623,10 @@ export class SQLNexusStore {
   }
 
   async touchDevice(deviceID, at) {
-    await this.db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE device_id = ?`).bind(at, at, deviceID).run();
     const device = await this.getDevice(deviceID);
+    if (!device) return null;
+    if (!shouldPersistDeviceTouch(device.last_seen_at, at)) return device;
+    await this.db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE device_id = ?`).bind(at, at, deviceID).run();
     if (device?.computer_id && device.device_type === "daemon") {
       await this.db.prepare(`
         UPDATE computers
@@ -1402,11 +1404,18 @@ function turnKey(userID, deviceID, sessionID, seq) {
 }
 
 function eventID() {
-	const millis = String(Date.now()).padStart(13, "0");
-	nextEventCounter = (nextEventCounter + 1) % 1_000_000;
-	const suffix = String(nextEventCounter).padStart(6, "0");
-	const random = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
-	return `ev_${millis}_${suffix}_${random}`;
+  const millis = String(Date.now()).padStart(13, "0");
+  nextEventCounter = (nextEventCounter + 1) % 1_000_000;
+  const suffix = String(nextEventCounter).padStart(6, "0");
+  const random = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+  return `ev_${millis}_${suffix}_${random}`;
+}
+
+function shouldPersistDeviceTouch(previous, next) {
+  const previousMs = Date.parse(previous || "");
+  const nextMs = Date.parse(next || "");
+  if (!Number.isFinite(previousMs) || !Number.isFinite(nextMs)) return true;
+  return nextMs - previousMs >= 60_000;
 }
 
 function clampLimit(value, fallback) {

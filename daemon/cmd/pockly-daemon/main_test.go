@@ -365,12 +365,16 @@ func TestCatalogSyncFullReconcileRequiresCompleteCatalog(t *testing.T) {
 }
 
 func TestDefaultNexusSyncPolicyUsesLowCostLazyDefaults(t *testing.T) {
+	t.Setenv("POCKLY_PROACTIVE_HISTORY_SYNC", "")
 	t.Setenv("POCKLY_SYNC_WINDOW_DAYS", "")
 	t.Setenv("POCKLY_INITIAL_TURN_LIMIT", "")
 
 	policy := defaultNexusSyncPolicy()
-	if policy.SyncWindowDays != 7 {
-		t.Fatalf("SyncWindowDays = %d, want 7", policy.SyncWindowDays)
+	if policy.ProactiveHistorySync {
+		t.Fatal("ProactiveHistorySync = true, want false by default")
+	}
+	if policy.SyncWindowDays != 0 {
+		t.Fatalf("SyncWindowDays = %d, want 0 when proactive history sync is disabled", policy.SyncWindowDays)
 	}
 	if policy.InitialTurnLimit != 20 {
 		t.Fatalf("InitialTurnLimit = %d, want 20", policy.InitialTurnLimit)
@@ -378,10 +382,14 @@ func TestDefaultNexusSyncPolicyUsesLowCostLazyDefaults(t *testing.T) {
 }
 
 func TestDefaultNexusSyncPolicyAllowsNeutralOverrides(t *testing.T) {
+	t.Setenv("POCKLY_PROACTIVE_HISTORY_SYNC", "1")
 	t.Setenv("POCKLY_SYNC_WINDOW_DAYS", "14")
 	t.Setenv("POCKLY_INITIAL_TURN_LIMIT", "40")
 
 	policy := defaultNexusSyncPolicy()
+	if !policy.ProactiveHistorySync {
+		t.Fatal("ProactiveHistorySync = false, want true")
+	}
 	if policy.SyncWindowDays != 14 {
 		t.Fatalf("SyncWindowDays = %d, want 14", policy.SyncWindowDays)
 	}
@@ -409,7 +417,32 @@ func TestSyncHintsPollIntervalDefaultsToLowFrequencyFallback(t *testing.T) {
 	}
 }
 
-func TestRecentNexusSessionsFiltersOutsideSyncWindow(t *testing.T) {
+func TestWindowSyncMinIntervalDefaultsToLowCostCadence(t *testing.T) {
+	t.Setenv("POCKLY_WINDOW_SYNC_MIN_INTERVAL", "")
+	if got := windowSyncMinInterval(); got != time.Minute {
+		t.Fatalf("windowSyncMinInterval() = %v, want 1m", got)
+	}
+	t.Setenv("POCKLY_WINDOW_SYNC_MIN_INTERVAL", "15s")
+	if got := windowSyncMinInterval(); got != 15*time.Second {
+		t.Fatalf("windowSyncMinInterval() override = %v, want 15s", got)
+	}
+}
+
+func TestRecentNexusSessionsSkipsPassiveHistoryByDefault(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := []pair.SyncSession{
+		{SessionID: "recent", LastTimestamp: now.Add(-2 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "channel_recent", LastTimestamp: now.Add(-30 * 24 * time.Hour).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "active", LastTimestamp: now.Add(-2 * time.Minute).Format(time.RFC3339)},
+	}
+
+	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	if len(got) != 1 || got[0].SessionID != "active" {
+		t.Fatalf("recentNexusSessions = %+v, want only active session when proactive history sync is disabled", got)
+	}
+}
+
+func TestRecentNexusSessionsFiltersOutsideSyncWindowWhenProactiveEnabled(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	sessions := []pair.SyncSession{
 		{SessionID: "recent", LastTimestamp: now.Add(-2 * 24 * time.Hour).Format(time.RFC3339)},
@@ -420,7 +453,7 @@ func TestRecentNexusSessionsFiltersOutsideSyncWindow(t *testing.T) {
 		{SessionID: "missing_time"},
 	}
 
-	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{ProactiveHistorySync: true, SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
 	ids := make([]string, 0, len(got))
 	for _, session := range got {
 		ids = append(ids, session.SessionID)
@@ -437,7 +470,7 @@ func TestRecentNexusSessionsCanDisableWindowForSelfHostedBackfill(t *testing.T) 
 		{SessionID: "old", LastTimestamp: now.Add(-30 * 24 * time.Hour).Format(time.RFC3339)},
 		{SessionID: "recent", LastTimestamp: now.Add(-1 * time.Hour).Format(time.RFC3339)},
 	}
-	got := recentNexusSessions(sessions, 1, nexusSyncPolicy{SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	got := recentNexusSessions(sessions, 1, nexusSyncPolicy{ProactiveHistorySync: true, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
 	if len(got) != 1 || got[0].SessionID != "recent" {
 		t.Fatalf("recentNexusSessions max/sort = %+v, want only recent", got)
 	}
@@ -454,12 +487,12 @@ func TestRecentNexusSessionsIncludesPriorityHintsOutsideWindow(t *testing.T) {
 		"pinned_old": {Reason: "pinned", PreferredMin: 100},
 	}
 
-	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, hints, now)
+	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, hints, now)
 	ids := make([]string, 0, len(got))
 	for _, session := range got {
 		ids = append(ids, session.SessionID)
 	}
-	want := []string{"pinned_old", "recent"}
+	want := []string{"pinned_old"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("recentNexusSessions ids = %v, want %v", ids, want)
 	}
@@ -525,7 +558,7 @@ func TestRecentNexusSessionsPrioritizesActiveSessionsUnderTickLimit(t *testing.T
 		{SessionID: "recent_newer", LastTimestamp: now.Add(-1 * time.Minute).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-30 * time.Minute).Format(time.RFC3339)},
 		{SessionID: "active_older", LastTimestamp: now.Add(-2 * time.Minute).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-2 * time.Minute).Format(time.RFC3339)},
 	}
-	got := recentNexusSessions(sessions, 1, nexusSyncPolicy{SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	got := recentNexusSessions(sessions, 1, nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
 	if len(got) != 1 || got[0].SessionID != "active_older" {
 		t.Fatalf("recentNexusSessions = %+v, want active_older first under max limit", got)
 	}

@@ -439,6 +439,54 @@ describe("worker-native Nexus api", () => {
     assert.equal(session.has_older_turns, false);
   });
 
+  it("does not inflate synced turn count when the daemon retries the same window", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const turns = [];
+    for (let seq = 81; seq <= 100; seq += 1) {
+      turns.push({
+        session_id: "sess_retry_window",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T09:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      });
+    }
+    const syncPayload = {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_retry_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "retry window",
+        last_seq: 100,
+        last_timestamp: "2026-06-06T09:59:00.000Z",
+        sync_state: "partial",
+        turn_count: 100,
+        min_seq: 81,
+        max_seq: 100,
+        has_older: true,
+      }],
+      turns,
+    };
+
+    assert.equal((await call(env, "POST", "/api/daemon/sync", syncPayload, daemonAuth)).status, 200);
+    assert.equal((await call(env, "POST", "/api/daemon/sync", syncPayload, daemonAuth)).status, 200);
+
+    const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
+    const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_retry_window");
+    assert.equal(session.synced_turn_count, 20);
+    assert.equal(session.synced_min_seq, 81);
+    assert.equal(session.synced_max_seq, 100);
+    assert.equal(session.sync_state, "partial");
+  });
+
   it("repairs stale catalog-only metadata when turns already exist", async () => {
     const env = testEnv();
     const cookie = await loginCookie(env);
