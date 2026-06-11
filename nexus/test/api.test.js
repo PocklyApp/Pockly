@@ -487,7 +487,7 @@ describe("worker-native Nexus api", () => {
     assert.equal(session.sync_state, "partial");
   });
 
-  it("repairs stale catalog-only metadata when turns already exist", async () => {
+  it("repairs stale catalog-only metadata on single-session turn reads", async () => {
     const env = testEnv();
     const cookie = await loginCookie(env);
     const browserKeys = await generateSigningKeyPair();
@@ -568,11 +568,10 @@ describe("worker-native Nexus api", () => {
 
     const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
     const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_repair");
-    assert.equal(session.synced_turn_count, 20);
-    assert.equal(session.synced_min_seq, 81);
-    assert.equal(session.synced_max_seq, 100);
-    assert.equal(session.sync_state, "partial");
-    assert.equal(session.has_older_turns, true);
+    assert.equal(session.synced_turn_count, 0);
+    assert.equal(session.synced_min_seq, 0);
+    assert.equal(session.synced_max_seq, 0);
+    assert.equal(session.sync_state, "catalog_only");
 
     const turnsRes = await call(env, "GET", `/api/sessions/sess_repair/turns?device_id=${daemon.daemon_device_id}`, null, browserAuth);
     const body = await turnsRes.json();
@@ -580,6 +579,14 @@ describe("worker-native Nexus api", () => {
     assert.equal(body.synced_min_seq, 81);
     assert.equal(body.synced_max_seq, 100);
     assert.equal(body.has_older_turns, true);
+
+    const repaired = await call(env, "GET", "/api/sessions", null, browserAuth);
+    const repairedSession = (await repaired.json()).sessions.find((item) => item.session_id === "sess_repair");
+    assert.equal(repairedSession.synced_turn_count, 20);
+    assert.equal(repairedSession.synced_min_seq, 81);
+    assert.equal(repairedSession.synced_max_seq, 100);
+    assert.equal(repairedSession.sync_state, "partial");
+    assert.equal(repairedSession.has_older_turns, true);
   });
 
   it("uses one batch presence lookup for large session catalogs", async () => {
@@ -630,6 +637,57 @@ describe("worker-native Nexus api", () => {
     assert.equal(telemetryEvents[0].sessions_count, 336);
     assert.equal(telemetryEvents[0].unique_daemon_count, 1);
     assert.equal(telemetryEvents[0].presence_batch_size, 1);
+  });
+
+  it("syncs large catalog reconciles without per-session session or stats queries", async () => {
+    const env = testEnv();
+    const store = new CountingNexusStore();
+    env.POCKLY_NEXUS_STORE = store;
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const sessions = Array.from({ length: 336 }, (_, index) => ({
+      session_id: `sess_reconcile_${String(index).padStart(3, "0")}`,
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: `session ${index}`,
+      last_seq: 100,
+      last_timestamp: new Date(Date.UTC(2026, 5, 6, 2, 0, index % 60)).toISOString(),
+      sync_state: "catalog_only",
+      turn_count: 100,
+    }));
+
+    const initial = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions,
+      turns: [],
+    }, daemonAuth);
+    assert.equal(initial.status, 200);
+
+    store.resetCounts();
+    const reconcile = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: sessions.slice(1),
+      turns: [],
+    }, daemonAuth);
+    assert.equal(reconcile.status, 200);
+    assert.equal(store.counts.listDeviceSessions, 1);
+    assert.equal(store.counts.deleteMissingDeviceSessionsFromExisting, 1);
+    assert.equal(store.counts.deleteMissingDeviceSessions, 0);
+    assert.equal(store.counts.getSession, 0);
+    assert.equal(store.counts.getSessionTurnStats, 0);
+    assert.equal(store.counts.listTurns, 0);
+
+    const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
+    assert.equal(listed.status, 200);
+    const body = await listed.json();
+    assert.equal(body.sessions.some((session) => session.session_id === "sess_reconcile_000"), false);
+    assert.equal(body.sessions.length, 335);
   });
 
   it("uses batch presence for host lists", async () => {
@@ -2382,6 +2440,54 @@ class CountingControlHub extends InMemoryControlHub {
     }
     this.onlineDeviceBatches.push(ids);
     return Object.fromEntries(ids.map((deviceID) => [deviceID, this.onlineDeviceIDs.has(deviceID)]));
+  }
+}
+
+class CountingNexusStore extends InMemoryNexusStore {
+  constructor() {
+    super();
+    this.resetCounts();
+  }
+
+  resetCounts() {
+    this.counts = {
+      listDeviceSessions: 0,
+      deleteMissingDeviceSessions: 0,
+      deleteMissingDeviceSessionsFromExisting: 0,
+      getSession: 0,
+      getSessionTurnStats: 0,
+      listTurns: 0,
+    };
+  }
+
+  async listDeviceSessions(...args) {
+    this.counts.listDeviceSessions += 1;
+    return await super.listDeviceSessions(...args);
+  }
+
+  async deleteMissingDeviceSessions(...args) {
+    this.counts.deleteMissingDeviceSessions += 1;
+    return await super.deleteMissingDeviceSessions(...args);
+  }
+
+  async deleteMissingDeviceSessionsFromExisting(...args) {
+    this.counts.deleteMissingDeviceSessionsFromExisting += 1;
+    return await super.deleteMissingDeviceSessionsFromExisting(...args);
+  }
+
+  async getSession(...args) {
+    this.counts.getSession += 1;
+    return await super.getSession(...args);
+  }
+
+  async getSessionTurnStats(...args) {
+    this.counts.getSessionTurnStats += 1;
+    return await super.getSessionTurnStats(...args);
+  }
+
+  async listTurns(...args) {
+    this.counts.listTurns += 1;
+    return await super.listTurns(...args);
   }
 }
 

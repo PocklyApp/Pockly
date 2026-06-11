@@ -271,9 +271,14 @@ export class InMemoryNexusStore {
   }
 
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
-    const keep = new Set(keepSessionIDs);
-    for (const [key, session] of [...this.sessions.entries()]) {
-      if (session.user_id === userID && session.device_id === deviceID && !keep.has(session.session_id)) {
+    await this.deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, await this.listDeviceSessions(userID, deviceID));
+  }
+
+  async deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, existingSessions) {
+    const keep = new Set(keepSessionIDs.map((id) => String(id)));
+    for (const session of existingSessions) {
+      if (!keep.has(String(session.session_id))) {
+        const key = sessionKey(userID, deviceID, session.session_id);
         this.sessions.delete(key);
         for (const [turnKey, turn] of [...this.turns.entries()]) {
           if (turn.user_id === userID && turn.device_id === deviceID && turn.session_id === session.session_id) {
@@ -287,6 +292,12 @@ export class InMemoryNexusStore {
   async listSessionsForUser(userID) {
     return [...this.sessions.values()]
       .filter((session) => session.user_id === userID)
+      .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  }
+
+  async listDeviceSessions(userID, deviceID) {
+    return [...this.sessions.values()]
+      .filter((session) => session.user_id === userID && session.device_id === deviceID)
       .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   }
 
@@ -979,20 +990,17 @@ export class SQLNexusStore {
   }
 
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
+    await this.deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, await this.listDeviceSessions(userID, deviceID));
+  }
+
+  async deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, existingSessions) {
     if (keepSessionIDs.length === 0) {
       await this.db.prepare(`DELETE FROM session_turns WHERE user_id = ? AND device_id = ?`).bind(userID, deviceID).run();
       await this.db.prepare(`DELETE FROM sessions WHERE user_id = ? AND device_id = ?`).bind(userID, deviceID).run();
       return;
     }
-    // Compute the stale sessions (present for this device but not in the new
-    // catalog) and delete them in small batches. A single
-    // `NOT IN (...all kept ids...)` binds one parameter per kept session, which
-    // can overflow database parameter limits on large catalogs.
     const keep = new Set(keepSessionIDs.map((id) => String(id)));
-    const existing = await this.db.prepare(`
-      SELECT session_id FROM sessions WHERE user_id = ? AND device_id = ?
-    `).bind(userID, deviceID).all();
-    const stale = (existing.results ?? [])
+    const stale = existingSessions
       .map((row) => String(row.session_id))
       .filter((id) => !keep.has(id));
     const CHUNK = 50;
@@ -1014,6 +1022,13 @@ export class SQLNexusStore {
     const result = await this.db.prepare(`
       SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC
     `).bind(userID).all();
+    return (result.results ?? []).map(normalizeSessionRow);
+  }
+
+  async listDeviceSessions(userID, deviceID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM sessions WHERE user_id = ? AND device_id = ? ORDER BY updated_at DESC
+    `).bind(userID, deviceID).all();
     return (result.results ?? []).map(normalizeSessionRow);
   }
 
