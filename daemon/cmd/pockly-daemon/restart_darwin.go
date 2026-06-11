@@ -16,7 +16,7 @@ import (
 // daemon on this platform. Printed when we choose NOT to auto-reload
 // (e.g. dry-run path) so the user can do it manually.
 func reloadCommandPlatform() string {
-	return "launchctl kickstart -k gui/$(id -u)/com.pockly.daemon"
+	return "launchctl enable gui/$(id -u)/com.pockly.daemon && launchctl kickstart -k gui/$(id -u)/com.pockly.daemon"
 }
 
 // reloadDaemonProcessPlatform performs the auto-reload. macOS path
@@ -26,10 +26,22 @@ func reloadCommandPlatform() string {
 // replaced).
 func reloadDaemonProcessPlatform() error {
 	uid := os.Getuid()
+	if err := enableLaunchAgent(fmt.Sprint(uid)); err != nil {
+		return err
+	}
 	cmd := exec.Command("launchctl", "kickstart", "-k", fmt.Sprintf("gui/%d/com.pockly.daemon", uid))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("launchctl kickstart: %w (output: %s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func enableLaunchAgent(uid string) error {
+	cmd := exec.Command("launchctl", "enable", "gui/"+uid+"/com.pockly.daemon")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("launchctl enable com.pockly.daemon: %w (output: %s)", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

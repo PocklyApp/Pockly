@@ -2005,6 +2005,9 @@ func installLaunchAgent(exe, nexusURL, identityFile, relayStateFile string, star
 	if start {
 		uid := fmt.Sprint(os.Getuid())
 		_ = exec.Command("launchctl", "bootout", "gui/"+uid, plistPath).Run()
+		if err := enableLaunchAgent(uid); err != nil {
+			return err
+		}
 		if err := exec.Command("launchctl", "bootstrap", "gui/"+uid, plistPath).Run(); err != nil {
 			return fmt.Errorf("start launch agent: %w", err)
 		}
