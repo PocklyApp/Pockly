@@ -4,6 +4,8 @@
 package index
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"log"
 	"os"
@@ -245,6 +247,32 @@ func (i *Index) RefreshIfStale(maxAge time.Duration) error {
 	return i.refreshLocked()
 }
 
+// RefreshForNexusSync keeps the Nexus sync loop from forcing a full disk scan
+// every heartbeat. The background indexer already refreshes on fsnotify events
+// and on its own low-frequency fallback ticker; sync ticks should read that
+// warm snapshot rather than reparsing large live JSONL files every few seconds.
+func (i *Index) RefreshForNexusSync(maxAge time.Duration) error {
+	if maxAge <= 0 {
+		return nil
+	}
+	if !i.FirstScanComplete() {
+		return nil
+	}
+	return i.RefreshIfStale(maxAge)
+}
+
+// FirstScanComplete reports whether the initial background scan has finished.
+// Callers that publish authoritative catalog state must not reconcile an empty
+// boot-time snapshot before this becomes true.
+func (i *Index) FirstScanComplete() bool {
+	select {
+	case <-i.firstScanDone:
+		return true
+	default:
+		return false
+	}
+}
+
 func (i *Index) refreshLocked() error {
 	projects, sessions, err := buildSnapshot(i.cfg)
 	if err == nil {
@@ -337,12 +365,26 @@ func (i *Index) countSessionBlocksCached(sessionID string, ref SessionRef) int {
 	}
 	if cached, ok := i.turnCounts[sessionID]; ok &&
 		cached.path == ref.Path &&
-		cached.agent == ref.Agent &&
-		cached.size == info.Size() &&
-		cached.modTime.Equal(info.ModTime()) {
-		return cached.count
+		cached.agent == ref.Agent {
+		if cached.size == info.Size() && cached.modTime.Equal(info.ModTime()) {
+			return cached.count
+		}
+		if info.Size() > cached.size && canCountAppendedTail(ref.Path, cached.size) {
+			delta, ok := estimateSessionBlockCountRange(ref, cached.size)
+			if ok {
+				next := turnCountCacheEntry{
+					path:    ref.Path,
+					agent:   ref.Agent,
+					modTime: info.ModTime(),
+					size:    info.Size(),
+					count:   cached.count + delta,
+				}
+				i.turnCounts[sessionID] = next
+				return next.count
+			}
+		}
 	}
-	count := countSessionBlocks(ref)
+	count := estimateSessionBlockCount(ref)
 	i.turnCounts[sessionID] = turnCountCacheEntry{
 		path:    ref.Path,
 		agent:   ref.Agent,
@@ -354,11 +396,80 @@ func (i *Index) countSessionBlocksCached(sessionID string, ref SessionRef) int {
 }
 
 func countSessionBlocks(ref SessionRef) int {
-	blocks, err := extractBlocks(ref)
+	return estimateSessionBlockCount(ref)
+}
+
+func estimateSessionBlockCount(ref SessionRef) int {
+	count, _ := estimateSessionBlockCountRange(ref, 0)
+	return count
+}
+
+func estimateSessionBlockCountRange(ref SessionRef, offset int64) (int, bool) {
+	f, err := os.Open(ref.Path)
 	if err != nil {
-		return 0
+		return 0, false
 	}
-	return len(blocks.Blocks)
+	defer f.Close()
+	if offset > 0 {
+		if _, err := f.Seek(offset, 0); err != nil {
+			return 0, false
+		}
+	}
+
+	count := 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		if isLikelyCatalogBlockLine(ref.Agent, line) {
+			count++
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, false
+	}
+	return count, true
+}
+
+func canCountAppendedTail(path string, offset int64) bool {
+	if offset <= 0 {
+		return true
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset-1, 0); err != nil {
+		return false
+	}
+	var b [1]byte
+	if _, err := f.Read(b[:]); err != nil {
+		return false
+	}
+	return b[0] == '\n'
+}
+
+func isLikelyCatalogBlockLine(agentName string, line []byte) bool {
+	switch agentName {
+	case agentClaude:
+		return containsJSONType(line, "user") ||
+			containsJSONType(line, "assistant") ||
+			containsJSONType(line, "attachment")
+	case agentCodex:
+		return containsJSONType(line, "response_item")
+	default:
+		return true
+	}
+}
+
+func containsJSONType(line []byte, value string) bool {
+	compact := []byte(`"type":"` + value + `"`)
+	spaced := []byte(`"type": "` + value + `"`)
+	return bytes.Contains(line, compact) || bytes.Contains(line, spaced)
 }
 
 // extractRawFirstMessage runs the per-agent first-user-message extractor.

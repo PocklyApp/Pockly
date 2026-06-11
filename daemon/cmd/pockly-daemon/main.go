@@ -56,7 +56,11 @@ import (
 	"golang.org/x/term"
 )
 
-const defaultPocklyNexusURL = "http://127.0.0.1:8787"
+const (
+	defaultPocklyNexusURL       = "http://127.0.0.1:8787"
+	defaultIndexRefreshInterval = 30 * time.Second
+	defaultNexusSyncInterval    = 15 * time.Second
+)
 
 func defaultNexusURL() string {
 	if v := envNexusURL(); v != "" {
@@ -806,7 +810,7 @@ func runServe(args []string) (err error) {
 
 	claudeHome := pathFlag(fs, "claude-home", defaultClaudeHome, "Claude Code session home")
 	codexHome := pathFlag(fs, "codex-home", defaultCodexHome, "Codex session home")
-	refreshInterval := fs.Duration("refresh-interval", 2*time.Second, "session index refresh interval")
+	refreshInterval := fs.Duration("refresh-interval", defaultIndexRefreshInterval, "session index fallback refresh interval")
 	var connectNexus bool
 	fs.BoolVar(&connectNexus, "connect-nexus", false, "sync indexed history to the paired Nexus")
 	fs.BoolVar(&connectNexus, "connect-relay", false, "legacy alias for --connect-nexus")
@@ -822,7 +826,7 @@ func runServe(args []string) (err error) {
 		return err
 	}
 	relayStateFile := nexusStateFileFlag(fs, defaultRelayStatePath, "Nexus pairing state file path")
-	syncInterval := fs.Duration("sync-interval", 2*time.Second, "full history sync interval when Nexus sync is enabled")
+	syncInterval := fs.Duration("sync-interval", defaultNexusSyncInterval, "Nexus sync heartbeat interval")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -2261,8 +2265,11 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 	lastCatalogMembership := ""
 	lastWindowPushAt := map[string]time.Time{}
 	runSync := func() {
-		if err := idx.Refresh(); err != nil {
-			log.Printf("Nexus sync refresh index: %v", err)
+		if !idx.FirstScanComplete() {
+			return
+		}
+		if err := idx.RefreshForNexusSync(10 * time.Minute); err != nil {
+			log.Printf("Nexus sync refresh stale index: %v", err)
 			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "index_refresh_failed"})
 			return
 		}
@@ -2274,9 +2281,9 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 			return
 		}
 		// When the catalog fits the sync body budget, it is the complete,
-		// authoritative list of sessions this daemon knows about. By the time this
-		// loop runs, idx has completed at least one Refresh()
-		// (StartBackgroundRefresh blocks on it). FullReconcile lets Nexus GC
+		// authoritative list of sessions this daemon knows about. This loop skips
+		// until the first background index scan is complete, so FullReconcile never
+		// publishes the boot-time empty snapshot. FullReconcile lets Nexus GC
 		// sessions the user has deleted on disk.
 		//
 		// If the catalog is byte-capped, it is only the newest subset. Do not set

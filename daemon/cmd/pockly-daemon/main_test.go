@@ -428,6 +428,19 @@ func TestWindowSyncMinIntervalDefaultsToLowCostCadence(t *testing.T) {
 	}
 }
 
+func TestServePollingDefaultsUseLowCostCadence(t *testing.T) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	refreshInterval := fs.Duration("refresh-interval", defaultIndexRefreshInterval, "session index fallback refresh interval")
+	syncInterval := fs.Duration("sync-interval", defaultNexusSyncInterval, "Nexus sync heartbeat interval")
+
+	if *refreshInterval != 30*time.Second {
+		t.Fatalf("refresh interval default = %v, want 30s", *refreshInterval)
+	}
+	if *syncInterval != 15*time.Second {
+		t.Fatalf("sync interval default = %v, want 15s", *syncInterval)
+	}
+}
+
 func TestRecentNexusSessionsSkipsPassiveHistoryByDefault(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	sessions := []pair.SyncSession{

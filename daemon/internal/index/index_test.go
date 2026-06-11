@@ -207,6 +207,63 @@ func TestRefreshUpdatesTurnCountWhenSessionFileChanges(t *testing.T) {
 	}
 }
 
+func TestTurnCountCacheUsesAppendTailFastPath(t *testing.T) {
+	claudeHome := filepath.Join(t.TempDir(), ".claude", "projects")
+	projectDir := filepath.Join(claudeHome, "-tmp-claude-project")
+	mustMkdirAll(t, projectDir)
+
+	sessionID := "66666666-6666-6666-6666-666666666666"
+	sessionPath := filepath.Join(projectDir, sessionID+".jsonl")
+	mustWriteFile(t, sessionPath, `{"sessionId":"`+sessionID+`","cwd":"/tmp/claude/project","timestamp":"2026-05-18T10:00:00Z","type":"user","message":{"role":"user","content":"hello"}}
+`)
+	idx := New(Config{ClaudeHome: claudeHome})
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	initial := idx.Projects()[0].Sessions[0].TurnCount
+	if initial != 1 {
+		t.Fatalf("initial TurnCount = %d, want 1", initial)
+	}
+
+	f, err := os.OpenFile(sessionPath, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"sessionId":"` + sessionID + `","cwd":"/tmp/claude/project","timestamp":"2026-05-18T10:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+`); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if got := idx.Projects()[0].Sessions[0].TurnCount; got != 2 {
+		t.Fatalf("appended TurnCount = %d, want 2", got)
+	}
+}
+
+func TestRefreshForNexusSyncDoesNotRunBeforeInitialScan(t *testing.T) {
+	idx := New(Config{})
+	if idx.FirstScanComplete() {
+		t.Fatal("first scan unexpectedly complete before Refresh")
+	}
+	if err := idx.RefreshForNexusSync(time.Nanosecond); err != nil {
+		t.Fatalf("RefreshForNexusSync before first scan: %v", err)
+	}
+	if idx.FirstScanComplete() {
+		t.Fatal("RefreshForNexusSync should not complete first scan")
+	}
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if !idx.FirstScanComplete() {
+		t.Fatal("first scan should be complete after Refresh")
+	}
+}
+
 func mustMkdirAll(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {
