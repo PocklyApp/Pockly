@@ -365,6 +365,25 @@ export class InMemoryNexusStore {
       .sort((left, right) => Number(left.seq) - Number(right.seq));
   }
 
+  async getSessionTurnStats(userID, deviceID, sessionID) {
+    const turns = await this.listTurns(userID, deviceID, sessionID);
+    if (!turns.length) return { count: 0, min_seq: 0, max_seq: 0, latest_contiguous_min_seq: 0 };
+    let expected = Number(turns[turns.length - 1].seq ?? 0) || 0;
+    let latestContiguousMinSeq = expected;
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const seq = Number(turns[i].seq ?? 0) || 0;
+      if (seq !== expected) break;
+      latestContiguousMinSeq = seq;
+      expected -= 1;
+    }
+    return {
+      count: turns.length,
+      min_seq: Number(turns[0].seq ?? 0) || 0,
+      max_seq: Number(turns[turns.length - 1].seq ?? 0) || 0,
+      latest_contiguous_min_seq: latestContiguousMinSeq,
+    };
+  }
+
   async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
     const after = Number(afterSeq) || 0;
     return (await this.listTurns(userID, deviceID, sessionID))
@@ -1172,6 +1191,35 @@ export class SQLNexusStore {
       ORDER BY seq ASC
     `).bind(userID, deviceID, sessionID).all();
     return result.results ?? [];
+  }
+
+  async getSessionTurnStats(userID, deviceID, sessionID) {
+    const row = await this.db.prepare(`
+      SELECT COUNT(*) AS count, MIN(seq) AS min_seq, MAX(seq) AS max_seq
+      FROM session_turns
+      WHERE user_id = ? AND device_id = ? AND session_id = ?
+    `).bind(userID, deviceID, sessionID).first();
+    const maxSeq = Number(row?.max_seq ?? 0) || 0;
+    let latestContiguousMinSeq = 0;
+    if (maxSeq > 0) {
+      const contiguous = await this.db.prepare(`
+        WITH ordered AS (
+          SELECT seq, ROW_NUMBER() OVER (ORDER BY seq DESC) AS rn
+          FROM session_turns
+          WHERE user_id = ? AND device_id = ? AND session_id = ?
+        )
+        SELECT MIN(seq) AS latest_contiguous_min_seq
+        FROM ordered
+        WHERE seq + rn = ?
+      `).bind(userID, deviceID, sessionID, maxSeq + 1).first();
+      latestContiguousMinSeq = Number(contiguous?.latest_contiguous_min_seq ?? 0) || 0;
+    }
+    return {
+      count: Number(row?.count ?? 0) || 0,
+      min_seq: Number(row?.min_seq ?? 0) || 0,
+      max_seq: maxSeq,
+      latest_contiguous_min_seq: latestContiguousMinSeq,
+    };
   }
 
   async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {

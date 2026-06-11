@@ -390,10 +390,10 @@ func TestDefaultNexusSyncPolicyAllowsNeutralOverrides(t *testing.T) {
 	}
 }
 
-func TestSyncHintsPollIntervalDefaultsDisabled(t *testing.T) {
+func TestSyncHintsPollIntervalDefaultsToLowFrequencyFallback(t *testing.T) {
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "")
-	if got := syncHintsPollInterval(); got != 0 {
-		t.Fatalf("syncHintsPollInterval() = %v, want disabled", got)
+	if got := syncHintsPollInterval(); got != 10*time.Minute {
+		t.Fatalf("syncHintsPollInterval() = %v, want low-frequency fallback", got)
 	}
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "10m")
 	if got := syncHintsPollInterval(); got != 10*time.Minute {
@@ -402,6 +402,10 @@ func TestSyncHintsPollIntervalDefaultsDisabled(t *testing.T) {
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "600")
 	if got := syncHintsPollInterval(); got != 10*time.Minute {
 		t.Fatalf("numeric syncHintsPollInterval() = %v, want 10m", got)
+	}
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	if got := syncHintsPollInterval(); got != 0 {
+		t.Fatalf("explicit zero syncHintsPollInterval() = %v, want disabled", got)
 	}
 }
 
@@ -811,8 +815,8 @@ func writeClaudeJSONLForCatalogTest(t *testing.T, dir, sessionID, cwd string, ts
 func TestPushedHintStoreAddSnapshotAndTTL(t *testing.T) {
 	store := newPushedHintStore()
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
-	store.Add("sess-a", "recently_opened", 100, now)
-	store.Add("", "recently_opened", 100, now) // ignored
+	store.Add("sess-a", syncHint{Reason: "recently_opened", PreferredMin: 100}, now)
+	store.Add("", syncHint{Reason: "recently_opened", PreferredMin: 100}, now) // ignored
 
 	hints := store.Snapshot(now)
 	if len(hints) != 1 {
@@ -836,9 +840,9 @@ func TestPushedHintStoreEvictsOldestAtCapacity(t *testing.T) {
 	store := newPushedHintStore()
 	base := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	for i := 0; i < pushedHintMaxEntries; i++ {
-		store.Add(fmt.Sprintf("sess-%03d", i), "recently_opened", 100, base.Add(time.Duration(i)*time.Second))
+		store.Add(fmt.Sprintf("sess-%03d", i), syncHint{Reason: "recently_opened", PreferredMin: 100}, base.Add(time.Duration(i)*time.Second))
 	}
-	store.Add("sess-new", "recently_opened", 100, base.Add(time.Hour))
+	store.Add("sess-new", syncHint{Reason: "recently_opened", PreferredMin: 100}, base.Add(time.Hour))
 	hints := store.Snapshot(base.Add(time.Hour))
 	if len(hints) != pushedHintMaxEntries {
 		t.Fatalf("snapshot len = %d, want %d", len(hints), pushedHintMaxEntries)
@@ -848,6 +852,80 @@ func TestPushedHintStoreEvictsOldestAtCapacity(t *testing.T) {
 	}
 	if _, ok := hints["sess-new"]; !ok {
 		t.Fatal("newest entry must be present")
+	}
+}
+
+func TestPushedHintStoreTracksBackfillCursor(t *testing.T) {
+	store := newPushedHintStore()
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	store.Add("sess-large", syncHint{
+		Reason:          "recently_opened",
+		PreferredMin:    100,
+		SyncedTurnCount: 100,
+		SyncedMinSeq:    141,
+		SyncedMaxSeq:    240,
+		NextBeforeSeq:   141,
+		TotalTurnCount:  240,
+		HasOlderTurns:   true,
+	}, now)
+
+	hint := store.Snapshot(now)["sess-large"]
+	if before := beforeSeqForHint(hint); before != 141 {
+		t.Fatalf("beforeSeqForHint = %d, want 141", before)
+	}
+
+	store.UpdateAfterSync("sess-large", pair.SyncSession{
+		SessionID: "sess-large",
+		MinSeq:    41,
+		MaxSeq:    140,
+		TurnCount: 240,
+		HasOlder:  true,
+	}, now.Add(time.Second))
+
+	hint = store.Snapshot(now.Add(time.Second))["sess-large"]
+	if hint.SyncedMinSeq != 41 || hint.SyncedMaxSeq != 240 || hint.SyncedTurnCount != 200 || hint.NextBeforeSeq != 41 || !hint.HasOlderTurns {
+		t.Fatalf("hint after middle window = %+v, want 41..240/200/before=41/older", hint)
+	}
+	if before := beforeSeqForHint(hint); before != 41 {
+		t.Fatalf("second beforeSeqForHint = %d, want 41", before)
+	}
+
+	store.UpdateAfterSync("sess-large", pair.SyncSession{
+		SessionID: "sess-large",
+		MinSeq:    1,
+		MaxSeq:    40,
+		TurnCount: 240,
+		HasOlder:  false,
+	}, now.Add(2*time.Second))
+	if hints := store.Snapshot(now.Add(2 * time.Second)); len(hints) != 0 {
+		t.Fatalf("completed hint should be removed, got %+v", hints)
+	}
+}
+
+func TestPushedHintStoreDoesNotTreatNonContiguousMinMaxAsComplete(t *testing.T) {
+	store := newPushedHintStore()
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	store.Add("sess-gap", syncHint{
+		Reason:          "recently_opened",
+		PreferredMin:    100,
+		SyncedTurnCount: 140,
+		SyncedMinSeq:    1,
+		SyncedMaxSeq:    240,
+		NextBeforeSeq:   141,
+		TotalTurnCount:  240,
+		HasOlderTurns:   true,
+	}, now)
+
+	store.UpdateAfterSync("sess-gap", pair.SyncSession{
+		SessionID: "sess-gap",
+		MinSeq:    41,
+		MaxSeq:    140,
+		TurnCount: 240,
+		HasOlder:  true,
+	}, now.Add(time.Second))
+
+	if hints := store.Snapshot(now.Add(time.Second)); len(hints) != 0 {
+		t.Fatalf("non-contiguous hint should complete after filling the middle gap, got %+v", hints)
 	}
 }
 

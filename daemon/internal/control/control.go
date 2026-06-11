@@ -414,9 +414,15 @@ type PermissionDecider interface {
 // managed runtime, so pushed hints replace hint polling as the default
 // transport.
 type SyncHintPush struct {
-	SessionID    string `json:"session_id"`
-	Reason       string `json:"reason,omitempty"`
-	PreferredMin int    `json:"preferred_min,omitempty"`
+	SessionID       string `json:"session_id"`
+	Reason          string `json:"reason,omitempty"`
+	PreferredMin    int    `json:"preferred_min,omitempty"`
+	SyncedTurnCount int    `json:"synced_turn_count,omitempty"`
+	SyncedMinSeq    int    `json:"synced_min_seq,omitempty"`
+	SyncedMaxSeq    int    `json:"synced_max_seq,omitempty"`
+	NextBeforeSeq   int    `json:"next_before_seq,omitempty"`
+	TotalTurnCount  int    `json:"total_turn_count,omitempty"`
+	HasOlderTurns   bool   `json:"has_older_turns,omitempty"`
 }
 
 // SyncHintHandler receives Nexus-pushed sync hints. Implementations must be

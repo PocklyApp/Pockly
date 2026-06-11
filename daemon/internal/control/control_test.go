@@ -1050,7 +1050,7 @@ func TestControlDataKeepaliveCanBeEnabled(t *testing.T) {
 }
 
 func TestSyncHintEnvelopeDecodesAndRoutes(t *testing.T) {
-	raw := `{"type":"SYNC_HINT","sync_hint":{"session_id":"sess-1","reason":"recently_opened","preferred_min":100}}`
+	raw := `{"type":"SYNC_HINT","sync_hint":{"session_id":"sess-1","reason":"recently_opened","preferred_min":100,"synced_turn_count":100,"synced_min_seq":141,"synced_max_seq":240,"next_before_seq":141,"total_turn_count":240,"has_older_turns":true}}`
 	var msg envelope
 	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
 		t.Fatal(err)
@@ -1058,7 +1058,7 @@ func TestSyncHintEnvelopeDecodesAndRoutes(t *testing.T) {
 	if msg.SyncHint == nil {
 		t.Fatal("sync_hint must decode")
 	}
-	if msg.SyncHint.SessionID != "sess-1" || msg.SyncHint.Reason != "recently_opened" || msg.SyncHint.PreferredMin != 100 {
+	if msg.SyncHint.SessionID != "sess-1" || msg.SyncHint.Reason != "recently_opened" || msg.SyncHint.PreferredMin != 100 || msg.SyncHint.NextBeforeSeq != 141 || !msg.SyncHint.HasOlderTurns {
 		t.Fatalf("sync_hint = %+v", msg.SyncHint)
 	}
 
@@ -1067,7 +1067,7 @@ func TestSyncHintEnvelopeDecodesAndRoutes(t *testing.T) {
 	if msg.SyncHint != nil && cfg.SyncHint != nil {
 		cfg.SyncHint(*msg.SyncHint)
 	}
-	if len(received) != 1 || received[0].SessionID != "sess-1" {
+	if len(received) != 1 || received[0].SessionID != "sess-1" || received[0].NextBeforeSeq != 141 {
 		t.Fatalf("handler received = %+v", received)
 	}
 }

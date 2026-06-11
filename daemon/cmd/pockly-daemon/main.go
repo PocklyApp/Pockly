@@ -1144,7 +1144,16 @@ func runServe(args []string) (err error) {
 						AgentDefaults:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						GitDiff:           agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						SyncHint: func(hint control.SyncHintPush) {
-							pushedHints.Add(hint.SessionID, hint.Reason, hint.PreferredMin, time.Now())
+							pushedHints.Add(hint.SessionID, syncHint{
+								Reason:          hint.Reason,
+								PreferredMin:    hint.PreferredMin,
+								SyncedTurnCount: hint.SyncedTurnCount,
+								SyncedMinSeq:    hint.SyncedMinSeq,
+								SyncedMaxSeq:    hint.SyncedMaxSeq,
+								NextBeforeSeq:   hint.NextBeforeSeq,
+								TotalTurnCount:  hint.TotalTurnCount,
+								HasOlderTurns:   hint.HasOlderTurns,
+							}, time.Now())
 						},
 						SessionDelete: agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						Reveal:        agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
@@ -2367,8 +2376,14 @@ func defaultNexusSyncPolicy() nexusSyncPolicy {
 }
 
 type syncHint struct {
-	Reason       string
-	PreferredMin int
+	Reason          string
+	PreferredMin    int
+	SyncedTurnCount int
+	SyncedMinSeq    int
+	SyncedMaxSeq    int
+	NextBeforeSeq   int
+	TotalTurnCount  int
+	HasOlderTurns   bool
 }
 
 type syncHintCache struct {
@@ -2406,7 +2421,7 @@ func newPushedHintStore() *pushedHintStore {
 	return &pushedHintStore{entries: map[string]pushedHintEntry{}}
 }
 
-func (s *pushedHintStore) Add(sessionID, reason string, preferredMin int, now time.Time) {
+func (s *pushedHintStore) Add(sessionID string, hint syncHint, now time.Time) {
 	if s == nil {
 		return
 	}
@@ -2429,9 +2444,32 @@ func (s *pushedHintStore) Add(sessionID, reason string, preferredMin int, now ti
 		delete(s.entries, oldestID)
 	}
 	s.entries[sessionID] = pushedHintEntry{
-		hint:     syncHint{Reason: reason, PreferredMin: preferredMin},
+		hint:     hint,
 		pushedAt: now,
 	}
+}
+
+func (s *pushedHintStore) UpdateAfterSync(sessionID string, meta pair.SyncSession, now time.Time) {
+	if s == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[sessionID]
+	if !ok {
+		return
+	}
+	entry.hint = mergeSyncHintAfterWindow(entry.hint, meta)
+	if syncHintBackfillComplete(entry.hint) {
+		delete(s.entries, sessionID)
+		return
+	}
+	entry.pushedAt = now
+	s.entries[sessionID] = entry
 }
 
 func (s *pushedHintStore) Snapshot(now time.Time) map[string]syncHint {
@@ -2528,12 +2566,14 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 			continue
 		}
 		limit := policy.InitialTurnLimit
+		beforeSeq := 0
 		if hint, ok := hints[session.SessionID]; ok {
 			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
+			beforeSeq = beforeSeqForHint(hint)
 		} else if sessionActiveWithin(session, now, activeSessionWindow) {
 			limit = maxInt(limit, policy.PriorityTurnLimit)
 		}
-		req, err := relay.BuildSingleSessionWindowSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, relay.SessionWindow{Limit: limit}, nil)
+		req, err := relay.BuildSingleSessionWindowSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, relay.SessionWindow{Limit: limit, BeforeSeq: beforeSeq}, nil)
 		if err != nil {
 			log.Printf("Nexus history sync snapshot session=%s: %v", session.SessionID, err)
 			continue
@@ -2555,10 +2595,72 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		}
 		lastHistorySync[session.SessionID] = signature
 		lastWindowPushAt[session.SessionID] = now
+		if len(req.Sessions) > 0 {
+			pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
+		}
 		syncedSessions += res.SessionCount
 		syncedTurns += res.TurnCount
 	}
 	return syncedSessions, syncedTurns
+}
+
+func beforeSeqForHint(hint syncHint) int {
+	if hint.NextBeforeSeq > 1 && (hint.HasOlderTurns || hint.TotalTurnCount <= 0 || hint.SyncedTurnCount < hint.TotalTurnCount) {
+		return hint.NextBeforeSeq
+	}
+	if hint.SyncedMinSeq > 1 && (hint.HasOlderTurns || hint.TotalTurnCount <= 0 || hint.SyncedTurnCount < hint.TotalTurnCount) {
+		return hint.SyncedMinSeq
+	}
+	return 0
+}
+
+func syncHintBackfillComplete(hint syncHint) bool {
+	return hint.TotalTurnCount > 0 &&
+		hint.SyncedTurnCount >= hint.TotalTurnCount &&
+		hint.SyncedMaxSeq >= hint.TotalTurnCount &&
+		hint.NextBeforeSeq <= 1 &&
+		!hint.HasOlderTurns
+}
+
+func mergeSyncHintAfterWindow(hint syncHint, meta pair.SyncSession) syncHint {
+	if meta.SessionID == "" {
+		return hint
+	}
+	if hint.TotalTurnCount <= 0 {
+		hint.TotalTurnCount = meta.TurnCount
+	} else if meta.TurnCount > hint.TotalTurnCount {
+		hint.TotalTurnCount = meta.TurnCount
+	}
+	if meta.MinSeq > 0 {
+		if hint.SyncedMinSeq <= 0 || meta.MinSeq < hint.SyncedMinSeq {
+			hint.SyncedMinSeq = meta.MinSeq
+		}
+	}
+	if meta.MaxSeq > hint.SyncedMaxSeq {
+		hint.SyncedMaxSeq = meta.MaxSeq
+	}
+	if meta.MinSeq > 0 && meta.MaxSeq >= meta.MinSeq {
+		hint.SyncedTurnCount += meta.MaxSeq - meta.MinSeq + 1
+		if hint.TotalTurnCount > 0 && hint.SyncedTurnCount > hint.TotalTurnCount {
+			hint.SyncedTurnCount = hint.TotalTurnCount
+		}
+	}
+	if hint.TotalTurnCount > 0 && hint.SyncedTurnCount >= hint.TotalTurnCount && hint.SyncedMinSeq <= 1 && hint.SyncedMaxSeq >= hint.TotalTurnCount {
+		hint.NextBeforeSeq = 0
+		hint.HasOlderTurns = false
+		return hint
+	}
+	if meta.MinSeq > 1 && (meta.HasOlder || hint.TotalTurnCount <= 0 || hint.SyncedTurnCount < hint.TotalTurnCount) {
+		hint.NextBeforeSeq = meta.MinSeq
+	} else {
+		hint.NextBeforeSeq = 0
+	}
+	if hint.TotalTurnCount > 0 && hint.SyncedTurnCount >= hint.TotalTurnCount && hint.SyncedMaxSeq >= hint.TotalTurnCount && hint.NextBeforeSeq <= 1 {
+		hint.HasOlderTurns = false
+	} else {
+		hint.HasOlderTurns = meta.HasOlder || hint.SyncedMinSeq > 1 || (hint.TotalTurnCount > 0 && hint.SyncedTurnCount < hint.TotalTurnCount)
+	}
+	return hint
 }
 
 func nexusSyncHints(ctx context.Context, client *pair.Client, id device.Identity, cache *syncHintCache, pushed *pushedHintStore) map[string]syncHint {
@@ -2605,8 +2707,14 @@ func polledNexusSyncHints(ctx context.Context, client *pair.Client, id device.Id
 			continue
 		}
 		hints[sessionID] = syncHint{
-			Reason:       entry.Reason,
-			PreferredMin: entry.PreferredMin,
+			Reason:          entry.Reason,
+			PreferredMin:    entry.PreferredMin,
+			SyncedTurnCount: entry.SyncedTurnCount,
+			SyncedMinSeq:    entry.SyncedMinSeq,
+			SyncedMaxSeq:    entry.SyncedMaxSeq,
+			NextBeforeSeq:   entry.NextBeforeSeq,
+			TotalTurnCount:  entry.TotalTurnCount,
+			HasOlderTurns:   entry.HasOlderTurns,
 		}
 	}
 	if cache != nil {
@@ -2617,7 +2725,7 @@ func polledNexusSyncHints(ctx context.Context, client *pair.Client, id device.Id
 }
 
 func syncHintsPollInterval() time.Duration {
-	return envDuration("POCKLY_SYNC_HINTS_POLL_INTERVAL", 0, 0, 24*time.Hour)
+	return envDuration("POCKLY_SYNC_HINTS_POLL_INTERVAL", 10*time.Minute, 0, 24*time.Hour)
 }
 
 func recentNexusSessions(sessions []pair.SyncSession, max int, policy nexusSyncPolicy, hints map[string]syncHint, now time.Time) []pair.SyncSession {

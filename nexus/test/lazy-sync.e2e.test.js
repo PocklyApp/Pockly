@@ -106,7 +106,18 @@ test("lazy session sync E2E keeps old catalog visible and backfills on demand", 
 
   const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
   assert.deepEqual(await hints.json(), {
-    sessions: [{ session_id: "sess_old", reason: "recently_opened", preferred_min: 100 }],
+    sessions: [{
+      session_id: "sess_old",
+      reason: "recently_opened",
+      preferred_min: 100,
+      synced_turn_count: 0,
+      synced_min_seq: 0,
+      synced_max_seq: 0,
+      latest_contiguous_min_seq: 0,
+      next_before_seq: 0,
+      total_turn_count: 240,
+      has_older_turns: false,
+    }],
   });
 
   const oldBackfillSync = await call(env, "POST", "/api/daemon/sync", {
@@ -252,4 +263,3 @@ async function generateSigningKeyPair() {
     },
   };
 }
-

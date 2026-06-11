@@ -439,6 +439,101 @@ describe("worker-native Nexus api", () => {
     assert.equal(session.has_older_turns, false);
   });
 
+  it("repairs stale catalog-only metadata when turns already exist", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const turns = [];
+    for (let seq = 81; seq <= 100; seq += 1) {
+      turns.push({
+        session_id: "sess_repair",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T05:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      });
+    }
+    const initial = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_repair",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "repair",
+        last_seq: 100,
+        last_timestamp: "2026-06-06T05:59:00.000Z",
+        sync_state: "partial",
+        turn_count: 100,
+        min_seq: 81,
+        max_seq: 100,
+        has_older: true,
+      }],
+      turns,
+    }, daemonAuth);
+    assert.equal(initial.status, 200);
+
+    await env.POCKLY_NEXUS_STORE.upsertSession({
+      user_id: "usr_test",
+      computer_id: "dc_test",
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_repair",
+      agent: "claude-code",
+      runner_alias: "",
+      cwd: "/work/app",
+      snippet: "repair",
+      first_message: "",
+      title: "repair",
+      last_seq: 100,
+      last_timestamp: "2026-06-06T06:00:00.000Z",
+      channel_last_seen_at: "2026-06-06T06:00:00.000Z",
+      sync_state: "catalog_only",
+      turn_count: 100,
+      last_sync_error: "",
+      synced_turn_count: 0,
+      synced_min_seq: 0,
+      synced_max_seq: 0,
+      has_older_turns: 0,
+      updated_at: "2026-06-06T06:00:00.000Z",
+    });
+
+    const catalogOnly = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_repair",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "repair",
+        last_seq: 100,
+        last_timestamp: "2026-06-06T06:01:00.000Z",
+        sync_state: "catalog_only",
+        turn_count: 100,
+      }],
+      turns: [],
+    }, daemonAuth);
+    assert.equal(catalogOnly.status, 200);
+
+    const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
+    const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_repair");
+    assert.equal(session.synced_turn_count, 20);
+    assert.equal(session.synced_min_seq, 81);
+    assert.equal(session.synced_max_seq, 100);
+    assert.equal(session.sync_state, "partial");
+    assert.equal(session.has_older_turns, true);
+
+    const turnsRes = await call(env, "GET", `/api/sessions/sess_repair/turns?device_id=${daemon.daemon_device_id}`, null, browserAuth);
+    const body = await turnsRes.json();
+    assert.equal(body.synced_turn_count, 20);
+    assert.equal(body.synced_min_seq, 81);
+    assert.equal(body.synced_max_seq, 100);
+    assert.equal(body.has_older_turns, true);
+  });
+
   it("uses one batch presence lookup for large session catalogs", async () => {
     const env = testEnv();
     const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
@@ -1824,10 +1919,165 @@ describe("worker-native Nexus api", () => {
     assert.equal(hints.status, 200);
     assert.deepEqual(await hints.json(), {
       sessions: [
-        { session_id: "sess_pinned_old", reason: "pinned", preferred_min: 100 },
-        { session_id: "sess_recent_open", reason: "recently_opened", preferred_min: 100 },
+        {
+          session_id: "sess_pinned_old",
+          reason: "pinned",
+          preferred_min: 100,
+          synced_turn_count: 0,
+          synced_min_seq: 0,
+          synced_max_seq: 0,
+          latest_contiguous_min_seq: 0,
+          next_before_seq: 0,
+          total_turn_count: 200,
+          has_older_turns: false,
+        },
+        {
+          session_id: "sess_recent_open",
+          reason: "recently_opened",
+          preferred_min: 100,
+          synced_turn_count: 0,
+          synced_min_seq: 0,
+          synced_max_seq: 0,
+          latest_contiguous_min_seq: 0,
+          next_before_seq: 0,
+          total_turn_count: 200,
+          has_older_turns: false,
+        },
       ],
     });
+  });
+
+  it("returns sync hint range metadata so daemon can backfill older windows", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const turns = [];
+    for (let seq = 141; seq <= 240; seq += 1) {
+      turns.push({
+        session_id: "sess_gap",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T03:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      });
+    }
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_gap",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "gap",
+        last_seq: 240,
+        last_timestamp: "2026-06-06T03:59:00.000Z",
+        sync_state: "partial",
+        turn_count: 240,
+        min_seq: 141,
+        max_seq: 240,
+        has_older: true,
+      }],
+      turns,
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    const opened = await call(env, "POST", "/api/sessions/sess_gap/opened", {
+      device_id: daemon.daemon_device_id,
+      opened_at: new Date().toISOString(),
+    }, auth);
+    assert.equal(opened.status, 200);
+
+    const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
+    assert.equal(hints.status, 200);
+    assert.deepEqual(await hints.json(), {
+      sessions: [{
+        session_id: "sess_gap",
+        reason: "recently_opened",
+        preferred_min: 100,
+        synced_turn_count: 100,
+        synced_min_seq: 141,
+        synced_max_seq: 240,
+        latest_contiguous_min_seq: 141,
+        next_before_seq: 141,
+        total_turn_count: 240,
+        has_older_turns: true,
+      }],
+    });
+  });
+
+  it("returns sync hint cursor for the newest contiguous range when older rows are non-contiguous", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const syncWindow = async (min, max, hasOlder) => {
+      const turns = [];
+      for (let seq = min; seq <= max; seq += 1) {
+        turns.push({
+          session_id: "sess_noncontiguous",
+          seq,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: `2026-06-06T07:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+          payload: { text: `turn ${seq}` },
+        });
+      }
+      const res = await call(env, "POST", "/api/daemon/sync", {
+        hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+        sessions: [{
+          session_id: "sess_noncontiguous",
+          agent: "claude-code",
+          cwd: "/work/app",
+          snippet: "gap",
+          last_seq: 240,
+          last_timestamp: "2026-06-06T07:59:00.000Z",
+          sync_state: "partial",
+          turn_count: 240,
+          min_seq: min,
+          max_seq: max,
+          has_older: hasOlder,
+        }],
+        turns,
+      }, daemonAuth);
+      assert.equal(res.status, 200);
+    };
+
+    await syncWindow(141, 240, true);
+    await syncWindow(1, 40, true);
+    const opened = await call(env, "POST", "/api/sessions/sess_noncontiguous/opened", {
+      device_id: daemon.daemon_device_id,
+    }, auth);
+    assert.equal(opened.status, 200);
+
+    const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
+    assert.equal(hints.status, 200);
+    assert.deepEqual(await hints.json(), {
+      sessions: [{
+        session_id: "sess_noncontiguous",
+        reason: "recently_opened",
+        preferred_min: 100,
+        synced_turn_count: 140,
+        synced_min_seq: 1,
+        synced_max_seq: 240,
+        latest_contiguous_min_seq: 141,
+        next_before_seq: 141,
+        total_turn_count: 240,
+        has_older_turns: true,
+      }],
+    });
+
+    const listed = await call(env, "GET", "/api/sessions", null, auth);
+    const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_noncontiguous");
+    assert.equal(session.has_older_turns, true);
+    assert.equal(session.sync_state, "partial");
   });
 
   it("pushes a SYNC_HINT over the control WS when a session is opened", async () => {
@@ -1836,14 +2086,46 @@ describe("worker-native Nexus api", () => {
     const keys = await generateSigningKeyPair();
     const browser = await registerBrowser(env, cookie, keys.publicKey);
     const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
 
     const envelopes = [];
-    env.POCKLY_CONTROL_HUB.attachDaemonForTest("dd_hint_push", "usr_test", async (envelope) => {
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope) => {
       envelopes.push(envelope);
     });
 
+    const turns = [];
+    for (let seq = 41; seq <= 60; seq += 1) {
+      turns.push({
+        session_id: "sess_hint_push",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T08:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      });
+    }
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_hint_push",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "push",
+        last_seq: 60,
+        last_timestamp: "2026-06-06T08:59:00.000Z",
+        sync_state: "partial",
+        turn_count: 60,
+        min_seq: 41,
+        max_seq: 60,
+        has_older: true,
+      }],
+      turns,
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
     const opened = await call(env, "POST", "/api/sessions/sess_hint_push/opened", {
-      device_id: "dd_hint_push",
+      device_id: daemon.daemon_device_id,
     }, auth);
     assert.equal(opened.status, 200);
 
@@ -1853,6 +2135,13 @@ describe("worker-native Nexus api", () => {
       session_id: "sess_hint_push",
       reason: "recently_opened",
       preferred_min: 100,
+      synced_turn_count: 20,
+      synced_min_seq: 41,
+      synced_max_seq: 60,
+      latest_contiguous_min_seq: 41,
+      next_before_seq: 41,
+      total_turn_count: 60,
+      has_older_turns: true,
     });
 
     // An offline daemon must not break the opened endpoint — the hint is

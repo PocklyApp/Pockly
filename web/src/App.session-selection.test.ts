@@ -14,6 +14,7 @@ import {
   findCreatedSessionForDraft,
   groupSessions,
   mergeHostPresenceIntoSessions,
+  nextLazyBackfillBeforeSeq,
   offlineLazyBackfillMessage,
   pickSelection,
   PRESENCE_REFRESH_BACKGROUND_MS,
@@ -556,4 +557,54 @@ test("opening already hydrated or fully synced sessions does not re-sync", () =>
     turn_count: 20,
     synced_turn_count: 20,
   }), []), false);
+});
+
+test("load-earlier cursor prefers Nexus next_before_seq for non-contiguous history", () => {
+  const selected = session("sess_gap", "dd_a", {
+    sync_state: "partial",
+    turn_count: 240,
+    synced_turn_count: 140,
+    synced_min_seq: 1,
+    synced_max_seq: 240,
+    has_older_turns: true,
+  });
+
+  assert.equal(nextLazyBackfillBeforeSeq({
+    session_id: "sess_gap",
+    turns: [],
+    oldest_seq: 1,
+    latest_seq: 240,
+    synced_turn_count: 140,
+    synced_min_seq: 1,
+    synced_max_seq: 240,
+    latest_contiguous_min_seq: 141,
+    next_before_seq: 141,
+    total_turn_count: 240,
+    has_older_turns: true,
+  }, [], selected), 141);
+});
+
+test("load-earlier cursor falls back to oldest loaded seq for contiguous partial history", () => {
+  const selected = session("sess_partial", "dd_a", {
+    sync_state: "partial",
+    turn_count: 240,
+    synced_turn_count: 100,
+    synced_min_seq: 141,
+    synced_max_seq: 240,
+    has_older_turns: true,
+  });
+
+  assert.equal(nextLazyBackfillBeforeSeq({
+    session_id: "sess_partial",
+    turns: [],
+    oldest_seq: 141,
+    latest_seq: 240,
+    synced_turn_count: 100,
+    synced_min_seq: 141,
+    synced_max_seq: 240,
+    latest_contiguous_min_seq: 141,
+    next_before_seq: 0,
+    total_turn_count: 240,
+    has_older_turns: true,
+  }, [], selected), 141);
 });

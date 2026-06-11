@@ -1062,13 +1062,18 @@ async function daemonSyncHints(request, store) {
       .filter((session) => session.device_id === device.device_id)
       .map((session) => String(session.session_id)),
   );
+  const sessionsByID = new Map(
+    sessions
+      .filter((session) => session.device_id === device.device_id)
+      .map((session) => [String(session.session_id), session]),
+  );
   const cutoff = Date.now() - recentlyOpenedSyncHintMs;
   const hintsBySessionID = new Map();
   for (const pref of prefs) {
     if (pref.device_id !== device.device_id || !sessionIDs.has(String(pref.session_id))) continue;
     if (!pref.pinned) continue;
     hintsBySessionID.set(String(pref.session_id), {
-      session_id: pref.session_id,
+      ...sessionSyncHintPayload(sessionsByID.get(String(pref.session_id)), String(pref.session_id)),
       reason: "pinned",
       preferred_min: prioritySyncHintTurnLimit,
     });
@@ -1078,12 +1083,26 @@ async function daemonSyncHints(request, store) {
     const opened = Date.parse(hint.last_opened_at || "");
     if (!Number.isFinite(opened) || opened < cutoff) continue;
     hintsBySessionID.set(String(hint.session_id), {
-      session_id: hint.session_id,
+      ...sessionSyncHintPayload(sessionsByID.get(String(hint.session_id)), String(hint.session_id)),
       reason: "recently_opened",
       preferred_min: prioritySyncHintTurnLimit,
     });
   }
-  const hints = [...hintsBySessionID.values()];
+  const hints = [];
+  for (const hint of hintsBySessionID.values()) {
+    const session = sessionsByID.get(String(hint.session_id));
+    if (!session) {
+      hints.push(hint);
+      continue;
+    }
+    const sessionWithStats = await sessionWithTurnStats(store, user.user_id, device.device_id, String(hint.session_id));
+    hints.push({
+      ...hint,
+      ...sessionSyncHintPayload(sessionWithStats, String(hint.session_id)),
+      reason: hint.reason,
+      preferred_min: hint.preferred_min,
+    });
+  }
   hints.sort((left, right) => {
     if (left.reason !== right.reason) return left.reason === "pinned" ? -1 : 1;
     return String(left.session_id).localeCompare(String(right.session_id));
@@ -1189,7 +1208,8 @@ async function markSessionOpened(request, store, env, sessionID) {
     last_opened_at: openedAt,
     updated_at: new Date().toISOString(),
   });
-  await pushSyncHintToDaemon(env, user.user_id, deviceID, sessionID);
+  const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID);
+  await pushSyncHintToDaemon(env, user.user_id, deviceID, sessionID, session);
   return jsonResponse({
     device_id: hint.device_id,
     session_id: hint.session_id,
@@ -1202,13 +1222,13 @@ async function markSessionOpened(request, store, env, sessionID) {
 // so pushing replaces the daemon-side hint polling loop as the default
 // transport. Best-effort: an offline daemon falls back to the persisted open
 // hint (consumed by the optional poll) and the regular sync flow.
-async function pushSyncHintToDaemon(env, userID, daemonDeviceID, sessionID) {
+async function pushSyncHintToDaemon(env, userID, daemonDeviceID, sessionID, session) {
   try {
     const control = createControlHubForUser(env, userID);
     await control.dispatch(daemonDeviceID, {
       type: "SYNC_HINT",
       sync_hint: {
-        session_id: sessionID,
+        ...sessionSyncHintPayload(session, sessionID),
         reason: "recently_opened",
         preferred_min: prioritySyncHintTurnLimit,
       },
@@ -1254,14 +1274,33 @@ async function listSessionTurns(request, store, sessionID, url) {
   const session = await store.getSession(user.user_id, deviceID, sessionID);
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
   const parsedTurns = (await store.listTurns(user.user_id, deviceID, sessionID)).map(publicTurn);
+  const stats = await sessionTurnStats(store, user.user_id, deviceID, sessionID);
+  const syncedTurnCount = stats.count;
+  const syncedMinSeq = mergeSyncedMinSeq(session.synced_min_seq, stats.min_seq);
+  const syncedMaxSeq = Math.max(Number(session.synced_max_seq ?? 0) || 0, stats.max_seq);
+  const totalTurnCount = Number(session.turn_count ?? parsedTurns.length);
+  const latestContiguousMinSeq = Number(stats.latest_contiguous_min_seq ?? 0) || syncedMinSeq;
+  const nextBeforeSeq = nextBackfillBeforeSeq({
+    total_turn_count: totalTurnCount,
+    synced_turn_count: syncedTurnCount,
+    actual_turn_count: stats.count,
+    synced_min_seq: syncedMinSeq,
+    synced_max_seq: syncedMaxSeq,
+    latest_contiguous_min_seq: latestContiguousMinSeq,
+    has_older_turns: session.has_older_turns,
+  });
   return jsonResponse({
     session_id: sessionID,
     turns: parsedTurns,
     oldest_seq: parsedTurns[0]?.seq,
     latest_seq: parsedTurns[parsedTurns.length - 1]?.seq,
-    synced_turn_count: session.synced_turn_count ?? parsedTurns.length,
-    total_turn_count: session.turn_count ?? parsedTurns.length,
-    has_older_turns: Boolean(session.has_older_turns),
+    synced_turn_count: syncedTurnCount,
+    synced_min_seq: syncedMinSeq,
+    synced_max_seq: syncedMaxSeq,
+    latest_contiguous_min_seq: latestContiguousMinSeq,
+    next_before_seq: nextBeforeSeq,
+    total_turn_count: totalTurnCount,
+    has_older_turns: Boolean(session.has_older_turns || (totalTurnCount > 0 && syncedMinSeq > 1)),
     needs_sync: parsedTurns.length === 0 && (session.turn_count ?? 0) > 0,
   });
 }
@@ -2508,17 +2547,18 @@ async function assertDaemonAssignable(store, daemonDeviceID, userID, publicKey) 
 
 async function syncSessionRecord(store, user, device, session, now, uploadedTurnCount) {
   const existing = await store.getSession(user.user_id, device.device_id, requiredString(session.session_id, "session_id"));
-  const persistedTurnCount = uploadedTurnCount > 0
-    ? (await store.listTurns(user.user_id, device.device_id, String(session.session_id))).length
+  const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnCount);
+  const persistedTurnCount = stats
+    ? stats.count
     : Number(existing?.synced_turn_count ?? 0);
   const minSeq = Number(session.min_seq ?? 0);
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
   const syncedMinSeq = uploadedTurnCount > 0
     ? mergeSyncedMinSeq(existing?.synced_min_seq, minSeq)
-    : Number(existing?.synced_min_seq ?? 0);
+    : mergeSyncedMinSeq(existing?.synced_min_seq, stats?.min_seq ?? 0);
   const syncedMaxSeq = uploadedTurnCount > 0
     ? Math.max(Number(existing?.synced_max_seq ?? 0), maxSeq)
-    : Number(existing?.synced_max_seq ?? 0);
+    : Math.max(Number(existing?.synced_max_seq ?? 0), stats?.max_seq ?? 0);
   return {
     user_id: user.user_id,
     computer_id: device.computer_id ?? null,
@@ -2543,9 +2583,111 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
     synced_turn_count: persistedTurnCount,
     synced_min_seq: syncedMinSeq,
     synced_max_seq: syncedMaxSeq,
-    has_older_turns: mergedHasOlderTurns(existing, session, uploadedTurnCount, { syncedMinSeq, syncedMaxSeq }),
+    has_older_turns: mergedHasOlderTurns(existing, session, uploadedTurnCount, {
+      persistedTurnCount,
+      syncedMinSeq,
+      syncedMaxSeq,
+    }),
     updated_at: session.last_timestamp || now,
   };
+}
+
+async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnCount) {
+  if (uploadedTurnCount > 0) {
+    return await sessionTurnStats(store, userID, deviceID, sessionID);
+  }
+  // Repair older rows whose session metadata was left at catalog_only/0 even
+  // though session_turns already contains lazy-synced content.
+  if (
+    existing &&
+    Number(existing.synced_turn_count ?? 0) <= 0 &&
+    Number(session.turn_count ?? existing.turn_count ?? 0) > 0
+  ) {
+    const stats = await sessionTurnStats(store, userID, deviceID, sessionID);
+    if (stats.count > 0) return stats;
+  }
+  return null;
+}
+
+async function sessionTurnStats(store, userID, deviceID, sessionID) {
+  if (typeof store.getSessionTurnStats === "function") {
+    return await store.getSessionTurnStats(userID, deviceID, sessionID);
+  }
+  const turns = await store.listTurns(userID, deviceID, sessionID);
+  if (!turns.length) return { count: 0, min_seq: 0, max_seq: 0, latest_contiguous_min_seq: 0 };
+  let expected = Number(turns[turns.length - 1].seq ?? 0) || 0;
+  let latestContiguousMinSeq = expected;
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const seq = Number(turns[i].seq ?? 0) || 0;
+    if (seq !== expected) break;
+    latestContiguousMinSeq = seq;
+    expected -= 1;
+  }
+  return {
+    count: turns.length,
+    min_seq: Number(turns[0].seq ?? 0) || 0,
+    max_seq: Number(turns[turns.length - 1].seq ?? 0) || 0,
+    latest_contiguous_min_seq: latestContiguousMinSeq,
+  };
+}
+
+async function sessionWithTurnStats(store, userID, deviceID, sessionID) {
+  const session = await store.getSession(userID, deviceID, sessionID);
+  if (!session) return null;
+  const stats = await sessionTurnStats(store, userID, deviceID, sessionID);
+  return {
+    ...session,
+    synced_turn_count: stats.count,
+    actual_turn_count: stats.count,
+    synced_min_seq: mergeSyncedMinSeq(session.synced_min_seq, stats.min_seq),
+    synced_max_seq: Math.max(Number(session.synced_max_seq ?? 0) || 0, stats.max_seq),
+    latest_contiguous_min_seq: Number(stats.latest_contiguous_min_seq ?? 0) || Number(session.synced_min_seq ?? 0) || 0,
+  };
+}
+
+function sessionSyncHintPayload(session, fallbackSessionID = "") {
+  const totalTurnCount = Number(session?.turn_count ?? 0) || 0;
+  const syncedTurnCount = Number(session?.synced_turn_count ?? 0) || 0;
+  const actualTurnCount = Number(session?.actual_turn_count ?? syncedTurnCount) || 0;
+  const syncedMinSeq = Number(session?.synced_min_seq ?? 0) || 0;
+  const syncedMaxSeq = Number(session?.synced_max_seq ?? 0) || 0;
+  const latestContiguousMinSeq = Number(session?.latest_contiguous_min_seq ?? 0) || syncedMinSeq;
+  return {
+    session_id: String(session?.session_id ?? fallbackSessionID),
+    synced_turn_count: syncedTurnCount,
+    synced_min_seq: syncedMinSeq,
+    synced_max_seq: syncedMaxSeq,
+    latest_contiguous_min_seq: latestContiguousMinSeq,
+    next_before_seq: nextBackfillBeforeSeq({
+      total_turn_count: totalTurnCount,
+      synced_turn_count: syncedTurnCount,
+      actual_turn_count: actualTurnCount,
+      synced_min_seq: syncedMinSeq,
+      synced_max_seq: syncedMaxSeq,
+      latest_contiguous_min_seq: latestContiguousMinSeq,
+      has_older_turns: session?.has_older_turns,
+    }),
+    total_turn_count: totalTurnCount,
+    has_older_turns: Boolean(session?.has_older_turns),
+  };
+}
+
+function nextBackfillBeforeSeq(session) {
+  const total = Number(session?.total_turn_count ?? 0) || 0;
+  const syncedCount = Number(session?.actual_turn_count ?? session?.synced_turn_count ?? 0) || 0;
+  const syncedMinSeq = Number(session?.synced_min_seq ?? 0) || 0;
+  const syncedMaxSeq = Number(session?.synced_max_seq ?? 0) || 0;
+  const latestContiguousMinSeq = Number(session?.latest_contiguous_min_seq ?? 0) || syncedMinSeq;
+  if (latestContiguousMinSeq > 1 && (Boolean(session?.has_older_turns) || total <= 0 || syncedCount < total)) {
+    return latestContiguousMinSeq;
+  }
+  if (syncedMinSeq > 1 && (Boolean(session?.has_older_turns) || total <= 0 || syncedCount < total)) {
+    return syncedMinSeq;
+  }
+  if (total > 0 && syncedMaxSeq > 0 && syncedMaxSeq < total) {
+    return total + 1;
+  }
+  return 0;
 }
 
 function mergeSyncedMinSeq(existing, incoming) {
@@ -2560,7 +2702,7 @@ function mergedSyncState(existing, session, uploadedTurnCount, synced = {}) {
   const incoming = session.sync_state || (uploadedTurnCount > 0 ? "ready" : "catalog_only");
   if (incoming === "failed" || incoming === "syncing") return incoming;
   if (incoming === "partial" || session.has_older) return "partial";
-  if (uploadedTurnCount > 0) {
+  if (uploadedTurnCount > 0 || Number(synced.persistedTurnCount ?? 0) > 0) {
     const total = Number(session.turn_count ?? 0);
     if (
       total > 0 &&
@@ -2578,15 +2720,26 @@ function mergedSyncState(existing, session, uploadedTurnCount, synced = {}) {
 }
 
 function mergedHasOlderTurns(existing, session, uploadedTurnCount, synced = {}) {
-  if (uploadedTurnCount > 0) {
+  if (uploadedTurnCount > 0 || Number(synced.persistedTurnCount ?? 0) > 0) {
     const total = Number(session.turn_count ?? 0);
     if (
       !session.has_older &&
       total > 0 &&
+      Number(synced.persistedTurnCount ?? 0) >= total &&
       Number(synced.syncedMinSeq ?? 0) <= 1 &&
       Number(synced.syncedMaxSeq ?? 0) >= total
     ) {
       return false;
+    }
+    if (
+      total > 0 &&
+      (
+        Number(synced.syncedMinSeq ?? 0) > 1 ||
+        Number(synced.syncedMaxSeq ?? 0) < total ||
+        Number(synced.persistedTurnCount ?? 0) < total
+      )
+    ) {
+      return true;
     }
   }
   return Boolean(session.has_older || existing?.has_older_turns);

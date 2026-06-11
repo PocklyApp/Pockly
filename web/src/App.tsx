@@ -2154,12 +2154,12 @@ export function App() {
   async function loadEarlierTurns() {
     if (!selected || !selectedSession || loadingEarlierRef.current) return;
     if (!turnsHydration?.has_older_turns && !selectedSession.has_older_turns) return;
-    const oldestSeq = turnsHydration?.oldest_seq || turns[0]?.seq || selectedSession.synced_min_seq || 0;
-    if (oldestSeq <= 1) return;
+    const beforeSeq = nextLazyBackfillBeforeSeq(turnsHydration, turns, selectedSession);
+    if (beforeSeq <= 1) return;
     loadingEarlierRef.current = true;
     const requestID = loadRequestRef.current;
     try {
-      await syncSelectedSession(selected, requestID, oldestSeq);
+      await syncSelectedSession(selected, requestID, beforeSeq);
     } finally {
       loadingEarlierRef.current = false;
     }
@@ -12985,6 +12985,20 @@ export function shouldSyncSessionOnOpen(session: SessionListItem, turns: Session
   const state = sessionSyncState(session);
   if (state === "ready" || state === "fully_synced") return false;
   return shouldLazySyncSession(session);
+}
+
+export function nextLazyBackfillBeforeSeq(
+  hydration: SessionTurnsResponse | null,
+  turns: SessionTurn[],
+  session: SessionListItem | null,
+) {
+  // Non-contiguous lazy history can have rows 1..40 and 141..240. In that case
+  // oldest_seq is already 1, so the only valid cursor is Nexus' next gap hint.
+  const hinted = Number(hydration?.next_before_seq ?? 0) || 0;
+  if (hinted > 1) return hinted;
+  const contiguous = Number(hydration?.latest_contiguous_min_seq ?? 0) || 0;
+  if (contiguous > 1) return contiguous;
+  return Number(hydration?.oldest_seq ?? 0) || Number(turns[0]?.seq ?? 0) || Number(session?.synced_min_seq ?? 0) || 0;
 }
 
 export function offlineLazyBackfillMessage(session: SessionListItem) {

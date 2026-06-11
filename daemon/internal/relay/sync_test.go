@@ -398,6 +398,24 @@ func TestBuildSingleSessionWindowSyncRequestAllowsPriorityHundred(t *testing.T) 
 	}
 }
 
+func TestBuildSingleSessionWindowSyncRequestUsesBeforeSeqForOlderBackfill(t *testing.T) {
+	idx, sessionID := fixtureIndexWithTurns(t, 240)
+	req, err := BuildSingleSessionWindowSyncRequestContext(context.Background(), idx, "dd_test", sessionID, claudeProfile, SessionWindow{Limit: 100, BeforeSeq: 141}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Turns) != 100 {
+		t.Fatalf("len(turns) = %d, want older priority window 100", len(req.Turns))
+	}
+	if req.Turns[0].Seq != 41 || req.Turns[len(req.Turns)-1].Seq != 140 {
+		t.Fatalf("window seq = %d..%d, want 41..140", req.Turns[0].Seq, req.Turns[len(req.Turns)-1].Seq)
+	}
+	meta := req.Sessions[0]
+	if meta.SyncState != "partial" || meta.TurnCount != 240 || meta.MinSeq != 41 || meta.MaxSeq != 140 || !meta.HasOlder {
+		t.Fatalf("unexpected older window metadata: %+v", meta)
+	}
+}
+
 func TestPayloadForBlockCarriesRichRendererFields(t *testing.T) {
 	payload, err := payloadForBlock(agent.Block{
 		Kind:                agent.BlockImage,

@@ -251,6 +251,10 @@ export type SessionTurnsResponse = {
   oldest_seq?: number;
   latest_seq?: number;
   synced_turn_count?: number;
+  synced_min_seq?: number;
+  synced_max_seq?: number;
+  latest_contiguous_min_seq?: number;
+  next_before_seq?: number;
   total_turn_count?: number;
   has_older_turns?: boolean;
   needs_sync?: boolean;
