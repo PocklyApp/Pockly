@@ -43,10 +43,13 @@ import {
   resendRegistrationCode,
   revokeDevice,
   cancelInject,
+  CONTROL_EVENT_POLL_RELAXED_MS,
   getAgentSettings,
   getSessionDiff,
+  getRuntimeCapabilities,
   getAgentDefaults,
   getPrefs,
+  markSessionOpened,
   setAgentSettings,
   setSessionPref,
   setProjectPref,
@@ -76,6 +79,7 @@ import {
   type InjectEvent,
   type ListDirResult,
   type HostSummary,
+  type NexusRuntimeCapabilities,
   type SessionListItem,
   type SessionPref,
   type ProjectPref,
@@ -318,8 +322,13 @@ const SSE_RECONNECT_MAX_BACKOFF_MS = 30000;
 // After this many attempts we soften the UI copy to "still reconnecting"
 // so the user knows we haven't silently spun forever, but we keep trying.
 const SSE_RECONNECT_PERSISTENT_AFTER = 12;
-const PRESENCE_REFRESH_FOREGROUND_MS = 5000;
-const PRESENCE_REFRESH_BACKGROUND_MS = 30000;
+export const PRESENCE_REFRESH_FOREGROUND_MS = 10000;
+export const PRESENCE_REFRESH_BACKGROUND_MS = 60000;
+// While the realtime socket is live, HOST_STATUS pushes carry presence and
+// the poll drops to a slow safety net.
+export const PRESENCE_REFRESH_REALTIME_MS = 60000;
+export const SESSION_CATALOG_REFRESH_MS = 60000;
+const MANUAL_LAZY_BACKFILL_TURN_LIMIT = 100;
 
 // isDaemonOutdated returns true if currentVer < recommendedVer, parsing
 // "vX.Y.Z" semver labels. Returns false on parse failure — we'd rather
@@ -520,6 +529,7 @@ export function App() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [hosts, setHosts] = useState<HostSummary[]>([]);
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
+  const [runtimeCapabilities, setRuntimeCapabilities] = useState<NexusRuntimeCapabilities | null>(null);
   const [draftConversation, setDraftConversation] = useState<DraftConversation | null>(null);
   const [selected, setSelected] = useState<ReaderSelection | null>(null);
   // 'active' = a live terminal_session matches selectedSession; 'dead' =
@@ -613,6 +623,10 @@ export function App() {
   const [cliStatus, setCliStatus] = useState("");
   const injectRefreshRef = useRef<number | null>(null);
   const subscriptionRef = useRef<SessionSubscription | null>(null);
+  // True while the realtime browser socket is live. Presence pushes and TURN
+  // pushes then cover what polling otherwise does, so the presence loop drops
+  // to a slow safety cadence and inject polls relax to lifecycle-only.
+  const realtimeLiveRef = useRef(false);
   const injectAbortRef = useRef<AbortController | null>(null);
   const syncAbortRef = useRef<AbortController | null>(null);
   const liveSessionBridgesRef = useRef<Map<string, LiveSessionBridge>>(new Map());
@@ -773,6 +787,20 @@ export function App() {
     setTurnsStatus(status);
     setSyncProgress(null);
   }
+
+  useEffect(() => {
+    let stopped = false;
+    void getRuntimeCapabilities()
+      .then((capabilities) => {
+        if (!stopped) setRuntimeCapabilities(capabilities);
+      })
+      .catch(() => {
+        if (!stopped) setRuntimeCapabilities(null);
+      });
+    return () => {
+      stopped = true;
+    };
+  }, []);
 
   useEffect(() => {
     void refreshApp(parseRoute());
@@ -1037,7 +1065,13 @@ export function App() {
   useEffect(() => {
     subscriptionRef.current?.close();
     subscriptionRef.current = null;
-    if (!isReaderRoute(route) || !selected || turnsStatus === "loading" || auth.status !== "authenticated") {
+    if (
+      !shouldUseBrowserRealtime(runtimeCapabilities) ||
+      !isReaderRoute(route) ||
+      !selected ||
+      turnsStatus === "loading" ||
+      auth.status !== "authenticated"
+    ) {
       return;
     }
     const lastSeq = turns.at(-1)?.seq ?? 0;
@@ -1058,13 +1092,32 @@ export function App() {
         // no-op on a still-streaming reply the confirmed set hasn't reached).
         setTurns((current) => reconcileHydratedTurns(current, [hydratedTurn]));
       },
-      onStatus: () => {
-        // Live status indicator not currently surfaced in any visible UI.
+      onStatus: (status) => {
+        realtimeLiveRef.current = status === "live";
+      },
+      onHostStatus: (status) => {
+        // Presence pushed over the socket replaces most foreground polling.
+        setHosts((current) => {
+          const next = current.map((host) => host.device_id === status.device_id
+            ? {
+                ...host,
+                ...(status.presence_status ? { presence_status: status.presence_status as NonNullable<HostSummary["presence_status"]> } : {}),
+                ...(status.presence_reason ? { presence_reason: status.presence_reason } : {}),
+                ...(status.control_connected === undefined ? {} : { control_connected: status.control_connected }),
+                ...(status.app_version ? { app_version: status.app_version } : {}),
+              }
+            : host);
+          queueMicrotask(() => setSessions((sessions) => mergeHostPresenceIntoSessions(sessions, next)));
+          return next;
+        });
       },
     });
     subscriptionRef.current = subscription;
-    return () => subscription.close();
-  }, [auth.status, route.view, selected?.deviceId, selected?.sessionId, turnsStatus]);
+    return () => {
+      realtimeLiveRef.current = false;
+      subscription.close();
+    };
+  }, [auth.status, route.view, runtimeCapabilities?.browser_realtime, selected?.deviceId, selected?.sessionId, turnsStatus]);
 
   // Derive a session title from the loaded turns once they land. This keeps
   // opened sessions labeled consistently with catalog snippets.
@@ -1310,12 +1363,13 @@ export function App() {
     }
   }
 
-  async function refreshWorkspacePresence() {
+  async function refreshWorkspacePresence(options: { includeSessions?: boolean } = {}) {
     const startedAt = Date.now();
     const browserDeviceID = loadBrowserDeviceState()?.deviceId;
+    const includeSessions = options.includeSessions === true;
     const [hostResult, sessionResult] = await Promise.allSettled([
       listOnlineHosts(browserDeviceID),
-      listSessions(),
+      includeSessions ? listSessions() : Promise.resolve(null),
     ]);
     for (const result of [hostResult, sessionResult]) {
       if (result.status === "rejected" && result.reason instanceof AuthExpiredError) {
@@ -1336,13 +1390,18 @@ export function App() {
     }
     return {
       hosts: hostResult.status === "fulfilled" ? hostResult.value.hosts ?? [] : null,
-      sessions: sessionResult.status === "fulfilled" ? sessionResult.value.sessions ?? [] : null,
+      sessions: includeSessions && sessionResult.status === "fulfilled" && sessionResult.value ? sessionResult.value.sessions ?? [] : null,
     };
   }
 
   function applyWorkspacePresence(snapshot: Awaited<ReturnType<typeof refreshWorkspacePresence>>) {
     workspaceMetadataGenerationRef.current += 1;
-    if (snapshot.hosts) setHosts(snapshot.hosts);
+    if (snapshot.hosts) {
+      setHosts(snapshot.hosts);
+      if (!snapshot.sessions) {
+        setSessions((current) => mergeHostPresenceIntoSessions(current, snapshot.hosts ?? []));
+      }
+    }
     if (!snapshot.sessions) return;
     const listedSessions = snapshot.sessions;
     setSessions(listedSessions);
@@ -1357,9 +1416,9 @@ export function App() {
       for (const host of connectableHosts) {
         if (autoConnectGeneration !== autoConnectGenerationRef.current) return;
         const connected = await connectHost(host.device_id, {
-          ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
-          browser_device_pubkey: browserState.devicePublicKey,
-          device_name: browserDeviceName(),
+	        ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
+	        browser_device_pubkey: browserState.devicePublicKey,
+	        device_name: browserDeviceName(),
           user_agent: navigator.userAgent,
         });
         persistBrowserTokens({ browserDeviceId: connected.browser_device_id });
@@ -1406,10 +1465,29 @@ export function App() {
     let stopped = false;
     let refreshTimer: number | null = null;
     let inFlight = false;
-    const run = () => {
+    let lastSessionRefreshAt = 0;
+    let lastPresenceRunAt = 0;
+    const run = (options: { forceSessions?: boolean } = {}) => {
       if (stopped || inFlight) return;
+      // With a live realtime socket, presence arrives as HOST_STATUS pushes;
+      // keep only a slow safety poll (and never skip an explicit force).
+      if (
+        realtimeLiveRef.current &&
+        options.forceSessions !== true &&
+        Date.now() - lastPresenceRunAt < PRESENCE_REFRESH_REALTIME_MS
+      ) {
+        return;
+      }
+      lastPresenceRunAt = Date.now();
+      const includeSessions = shouldRefreshSessionCatalog({
+        now: Date.now(),
+        lastSessionRefreshAt,
+        visible: document.visibilityState === "visible",
+        force: options.forceSessions === true,
+      });
+      if (includeSessions) lastSessionRefreshAt = Date.now();
       inFlight = true;
-      void refreshWorkspacePresence()
+      void refreshWorkspacePresence({ includeSessions })
         .then((snapshot) => {
           if (!stopped) applyWorkspacePresence(snapshot);
         })
@@ -1427,10 +1505,10 @@ export function App() {
     };
     const onVisibilityChange = () => {
       schedule();
-      if (document.visibilityState === "visible") run();
+      if (document.visibilityState === "visible") run({ forceSessions: true });
     };
     schedule();
-    if (document.visibilityState === "visible") run();
+    if (document.visibilityState === "visible") run({ forceSessions: true });
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       stopped = true;
@@ -1698,6 +1776,10 @@ export function App() {
     if (push) {
       pushRoute({ view: "workspaceSession", sessionId: next.sessionId, deviceId: next.deviceId });
     }
+    markSessionOpened({ sessionId: next.sessionId, deviceId: next.deviceId, openedAt: new Date().toISOString() })
+      .catch(() => {
+        // This hint only helps the daemon prioritize future lazy windows.
+      });
     try {
       setTurnsStatus("loading");
       const data = await getSessionTurns(next.sessionId, next.deviceId);
@@ -1989,7 +2071,7 @@ export function App() {
       await streamSessionSync({
         sessionId: next.sessionId,
         deviceId: next.deviceId,
-        limit: 20,
+        ...(beforeSeq > 0 ? { limit: MANUAL_LAZY_BACKFILL_TURN_LIMIT } : {}),
         beforeSeq,
         signal: controller.signal,
         onEvent: (event) => {
@@ -2263,10 +2345,10 @@ export function App() {
 	        const browserState = await ensureBrowserDeviceState();
 	        const response = await claimDaemonLocal({
 	          daemon_setup: grant,
-	          browser_nonce: nonce,
-	          ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
-	          browser_device_pubkey: browserState.devicePublicKey,
-	          device_name: browserDeviceName(),
+		          browser_nonce: nonce,
+		          ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
+		          browser_device_pubkey: browserState.devicePublicKey,
+		          device_name: browserDeviceName(),
 	          user_agent: navigator.userAgent,
 	        });
 	        return { browserState, response };
@@ -2339,10 +2421,10 @@ export function App() {
 	      const claimWithBrowserState = async () => {
 	        const browserState = await ensureBrowserDeviceState();
 	        const response = await claimMobileJoinQRGrant({
-	          grant_token: grant,
-	          ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
-	          browser_device_pubkey: browserState.devicePublicKey,
-	          device_name: browserDeviceName(),
+		          grant_token: grant,
+		          ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
+		          browser_device_pubkey: browserState.devicePublicKey,
+		          device_name: browserDeviceName(),
 	          user_agent: navigator.userAgent,
 	        });
 	        return { browserState, response };
@@ -2377,9 +2459,9 @@ export function App() {
     setPairStatus(tx("workspace.connectComputer"));
     const browserState = await ensureBrowserDeviceState();
     const connected = await connectHost(hostDeviceId, {
-      ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
-      browser_device_pubkey: browserState.devicePublicKey,
-      device_name: browserDeviceName(),
+	      ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
+	      browser_device_pubkey: browserState.devicePublicKey,
+	      device_name: browserDeviceName(),
       user_agent: navigator.userAgent,
     });
     persistBrowserTokens({
@@ -2409,9 +2491,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     try {
       const browserState = await ensureBrowserDeviceState();
       await authorizeDaemonDevice(cliAuthorization.device_code, {
-        ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
-        browser_device_pubkey: browserState.devicePublicKey,
-        device_name: browserDeviceName(),
+	        ...(browserState.deviceId ? { browser_device_id: browserState.deviceId } : {}),
+	        browser_device_pubkey: browserState.devicePublicKey,
+	        device_name: browserDeviceName(),
         user_agent: navigator.userAgent,
       });
       // Nexus now holds the claim in awaiting_daemon_confirm until the
@@ -3406,11 +3488,22 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           scheduleDraftResolution(session);
         }
       } else {
+        // Polling fallback delivers only turns newer than what the reader
+        // already shows. Optimistic placeholders live at seq >= 1e9 and are
+        // not durable rows, so they must not advance the cursor.
+        const lastRealSeq = turns.reduce(
+          (max, turn) => (turn.session_id === session.session_id && turn.seq < 1_000_000_000 && turn.seq > max ? turn.seq : max),
+          0,
+        );
         await streamSessionInject({
           sessionId: session.session_id,
           deviceId: session.device_id,
           text,
           ...(files.length > 0 ? { files } : {}),
+          afterSeq: lastRealSeq,
+          // With the realtime socket live, TURN pushes carry the content and
+          // this poll only tracks lifecycle — relax it.
+          ...(realtimeLiveRef.current ? { pollIntervalMs: CONTROL_EVENT_POLL_RELAXED_MS } : {}),
 	          signal: ctrl.signal,
 	          onEvent: (event) => {
 	            if (event.type === "stream_event" || event.type === "inject_completed") {
@@ -7253,9 +7346,9 @@ function DuplexTestPage() {
           setStatus("Binding this browser to the local daemon...");
           const browserID = browserState.deviceId;
           const connected = await connectHost(firstHost.device_id, {
-            ...(browserID ? { browser_device_id: browserID } : {}),
-            browser_device_pubkey: browserState.devicePublicKey,
-            device_name: browserDeviceName(),
+	            ...(browserID ? { browser_device_id: browserID } : {}),
+	            browser_device_pubkey: browserState.devicePublicKey,
+	            device_name: browserDeviceName(),
             user_agent: navigator.userAgent,
           });
           persistBrowserTokens({ browserDeviceId: connected.browser_device_id });
@@ -12189,12 +12282,13 @@ function ReaderEdgeState({
     );
   }
   if (sessionConnectionMode(session) === "read_only") {
+    const lazyOffline = offlineLazyBackfillMessage(session);
     return (
       <WsEmpty
         icon={<MonitorOff size={24} aria-hidden="true" />}
         tone="danger"
-        head={tx("workspace.bridgeOfflineTitle")}
-        sub={tx("workspace.bridgeOfflineBody")}
+        head={lazyOffline?.title ?? tx("workspace.bridgeOfflineTitle")}
+        sub={lazyOffline?.body ?? tx("workspace.bridgeOfflineBody")}
       />
     );
   }
@@ -12886,11 +12980,25 @@ function shouldLazySyncSession(session: SessionListItem) {
   return state === "catalog_only" || state === "failed" || state === "syncing" || state === "partial";
 }
 
-function shouldSyncSessionOnOpen(session: SessionListItem, turns: SessionTurn[]) {
+export function shouldSyncSessionOnOpen(session: SessionListItem, turns: SessionTurn[]) {
   if (turns.length > 0) return false;
   const state = sessionSyncState(session);
   if (state === "ready" || state === "fully_synced") return false;
   return shouldLazySyncSession(session);
+}
+
+export function offlineLazyBackfillMessage(session: SessionListItem) {
+  if (sessionConnectionMode(session) !== "read_only") return null;
+  const state = sessionSyncState(session);
+  const total = session.turn_count || session.last_seq || 0;
+  const loaded = session.synced_turn_count ?? 0;
+  if ((state === "catalog_only" || state === "partial" || state === "failed") && total > loaded) {
+    return {
+      title: tx("workspace.lazyBackfillOfflineTitle"),
+      body: tx("workspace.lazyBackfillOfflineBody", { loaded, total }),
+    };
+  }
+  return null;
 }
 
 function sessionSyncLabel(session: SessionListItem) {
@@ -12936,6 +13044,58 @@ export function canControlSession(session: SessionListItem | null) {
   // Writability follows Nexus's `writable` field, not a specific mode.
   // PTY mirror and SDK headless are both writable when daemon is online.
   return session?.writable === true;
+}
+
+export function shouldUseBrowserRealtime(capabilities: NexusRuntimeCapabilities | null | undefined) {
+  return capabilities?.browser_realtime === true;
+}
+
+export function shouldRefreshSessionCatalog({
+  now,
+  lastSessionRefreshAt,
+  visible,
+  force = false,
+  intervalMs = SESSION_CATALOG_REFRESH_MS,
+}: {
+  now: number;
+  lastSessionRefreshAt: number;
+  visible: boolean;
+  force?: boolean;
+  intervalMs?: number;
+}) {
+  return force || (visible && now - lastSessionRefreshAt >= intervalMs);
+}
+
+export function mergeHostPresenceIntoSessions(sessions: SessionListItem[], hosts: HostSummary[]) {
+  const hostsByDeviceID = new Map(hosts.map((host) => [host.device_id, host]));
+  let changed = false;
+  const next = sessions.map((session) => {
+    const host = hostsByDeviceID.get(session.device_id);
+    if (!host) return session;
+    const online = host.presence_status === "online" || (host.presence_status === undefined && host.connected === true);
+    const writable = Boolean(online && host.remote_access_enabled && host.status === "active");
+    const connectionMode = writable
+      ? (sessionConnectionMode(session) === "read_only" ? "sdk_headless" : sessionConnectionMode(session))
+      : "read_only";
+    const channelLastSeenAt = writable
+      ? (host.last_channel_seen_at || host.last_seen_at || session.channel_last_seen_at)
+      : session.channel_last_seen_at;
+    if (
+      session.writable === writable &&
+      session.connection_mode === connectionMode &&
+      session.channel_last_seen_at === channelLastSeenAt
+    ) {
+      return session;
+    }
+    changed = true;
+    return {
+      ...session,
+      writable,
+      connection_mode: connectionMode,
+      ...(channelLastSeenAt ? { channel_last_seen_at: channelLastSeenAt } : {}),
+    };
+  });
+  return changed ? next : sessions;
 }
 
 export function devicePresenceStatus(device: Device | null, host: HostSummary | null): DevicePresenceStatus {

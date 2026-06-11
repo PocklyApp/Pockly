@@ -144,6 +144,7 @@ type SyncSession struct {
 	Agent             string `json:"agent"`
 	RunnerAlias       string `json:"runner_alias,omitempty"`
 	Cwd               string `json:"cwd"`
+	Title             string `json:"title,omitempty"`
 	Snippet           string `json:"snippet,omitempty"`
 	FirstMessage      string `json:"first_message,omitempty"`
 	LastSeq           int    `json:"last_seq"`
@@ -162,18 +163,22 @@ type SyncTurn struct {
 	Agent     string          `json:"agent"`
 	Kind      string          `json:"kind"`
 	Timestamp string          `json:"timestamp,omitempty"`
-	Payload   json.RawMessage `json:"payload"`
+	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
 type SyncRequest struct {
 	Hello    HelloMessage  `json:"hello"`
 	Sessions []SyncSession `json:"sessions"`
 	Turns    []SyncTurn    `json:"turns,omitempty"`
+	// CatalogComplete is daemon-local metadata. When false, Sessions was
+	// byte-capped and must not be treated as an authoritative deletion list.
+	CatalogComplete bool `json:"-"`
 	// FullReconcile signals that Sessions is an authoritative full snapshot of
 	// the daemon's catalog for this device. Nexus deletes any sessions it
 	// has for this device that are NOT in this snapshot (and cascades to their
 	// turns). Set ONLY on catalog syncs — never on single-session pushes that
-	// carry Turns, since those are intentionally partial.
+	// carry Turns, since those are intentionally partial. Also leave it false
+	// when CatalogComplete is false.
 	FullReconcile bool `json:"full_reconcile,omitempty"`
 }
 
@@ -188,6 +193,16 @@ type SyncResponse struct {
 	TurnCount     int    `json:"turn_count"`
 	DaemonDevice  string `json:"daemon_device"`
 	DaemonVersion string `json:"daemon_version"`
+}
+
+type SyncHintsResponse struct {
+	Sessions []SyncSessionHint `json:"sessions"`
+}
+
+type SyncSessionHint struct {
+	SessionID    string `json:"session_id"`
+	Reason       string `json:"reason,omitempty"`
+	PreferredMin int    `json:"preferred_min,omitempty"`
 }
 
 type DaemonLoginResponse struct {
@@ -441,6 +456,27 @@ func (c *Client) ConfirmPairing(id device.Identity, grantID string, allow bool) 
 
 func (c *Client) SyncHistory(id device.Identity, req SyncRequest) (SyncResponse, error) {
 	return c.SyncHistoryContext(context.Background(), id, req)
+}
+
+func (c *Client) SyncHintsContext(ctx context.Context, id device.Identity) (SyncHintsResponse, error) {
+	token, err := c.AuthenticateIdentityContext(ctx, id, audienceDaemonWS)
+	if err != nil {
+		return SyncHintsResponse{}, err
+	}
+	var out SyncHintsResponse
+	err = c.doJSONContext(ctx, http.MethodGet, "/api/daemon/sync-hints", nil, &out, withBearer(token))
+	if isAuthFailure(err) {
+		invalidateDeviceToken(id.DeviceID, audienceDaemonWS)
+		if token, err = c.AuthenticateIdentityContext(ctx, id, audienceDaemonWS); err != nil {
+			return SyncHintsResponse{}, err
+		}
+		out = SyncHintsResponse{}
+		err = c.doJSONContext(ctx, http.MethodGet, "/api/daemon/sync-hints", nil, &out, withBearer(token))
+	}
+	if err != nil {
+		return SyncHintsResponse{}, err
+	}
+	return out, nil
 }
 
 func (c *Client) CreateMobileJoinGrant(id device.Identity) (MobileJoinGrantResponse, error) {

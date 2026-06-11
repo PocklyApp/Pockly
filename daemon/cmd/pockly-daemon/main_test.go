@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,8 +17,10 @@ import (
 	"time"
 
 	"github.com/PocklyApp/Pockly/daemon/internal/device"
+	"github.com/PocklyApp/Pockly/daemon/internal/index"
 	"github.com/PocklyApp/Pockly/daemon/internal/pair"
 	relay "github.com/PocklyApp/Pockly/daemon/internal/relay"
+	"github.com/PocklyApp/Pockly/daemon/internal/runner"
 )
 
 func TestTerminalQRMode(t *testing.T) {
@@ -309,6 +312,221 @@ func TestHistorySyncSignatureTracksTurnsWhenCatalogSignatureIsStable(t *testing.
 	}
 }
 
+func TestCatalogSyncSignatureIgnoresHelloButTracksCatalogChanges(t *testing.T) {
+	req := pair.SyncRequest{
+		Hello:         pair.HelloMessage{DeviceID: "dd_test", Version: "v1"},
+		FullReconcile: true,
+		Sessions: []pair.SyncSession{{
+			SessionID:         "sid_catalog",
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               "/work/app",
+			Title:             "hello",
+			Snippet:           "hello",
+			FirstMessage:      "hello",
+			LastSeq:           1,
+			LastTimestamp:     "2026-06-03T09:11:34Z",
+			ChannelLastSeenAt: "2026-06-03T09:11:34Z",
+			SyncState:         "catalog_only",
+			TurnCount:         3,
+		}},
+	}
+	changedHello := req
+	changedHello.Hello.Version = "v2"
+	if catalogSyncSignature(req) != catalogSyncSignature(changedHello) {
+		t.Fatal("catalog signature should ignore hello/version liveness fields")
+	}
+	changedCatalog := req
+	changedCatalog.Sessions = append([]pair.SyncSession{}, req.Sessions...)
+	changedCatalog.Sessions[0].LastSeq = 2
+	if catalogSyncSignature(req) == catalogSyncSignature(changedCatalog) {
+		t.Fatal("catalog signature must change when session metadata changes")
+	}
+	changedTitle := req
+	changedTitle.Sessions = append([]pair.SyncSession{}, req.Sessions...)
+	changedTitle.Sessions[0].Title = "renamed"
+	if catalogSyncSignature(req) == catalogSyncSignature(changedTitle) {
+		t.Fatal("catalog signature must change when session title changes")
+	}
+}
+
+func TestCatalogSyncFullReconcileRequiresCompleteCatalog(t *testing.T) {
+	complete := pair.SyncRequest{CatalogComplete: true}
+	complete.FullReconcile = complete.CatalogComplete
+	if !complete.FullReconcile {
+		t.Fatal("complete catalog should enable full reconcile")
+	}
+
+	capped := pair.SyncRequest{CatalogComplete: false}
+	capped.FullReconcile = capped.CatalogComplete
+	if capped.FullReconcile {
+		t.Fatal("capped catalog must not enable full reconcile")
+	}
+}
+
+func TestDefaultNexusSyncPolicyUsesLowCostLazyDefaults(t *testing.T) {
+	t.Setenv("POCKLY_SYNC_WINDOW_DAYS", "")
+	t.Setenv("POCKLY_INITIAL_TURN_LIMIT", "")
+
+	policy := defaultNexusSyncPolicy()
+	if policy.SyncWindowDays != 7 {
+		t.Fatalf("SyncWindowDays = %d, want 7", policy.SyncWindowDays)
+	}
+	if policy.InitialTurnLimit != 20 {
+		t.Fatalf("InitialTurnLimit = %d, want 20", policy.InitialTurnLimit)
+	}
+}
+
+func TestDefaultNexusSyncPolicyAllowsNeutralOverrides(t *testing.T) {
+	t.Setenv("POCKLY_SYNC_WINDOW_DAYS", "14")
+	t.Setenv("POCKLY_INITIAL_TURN_LIMIT", "40")
+
+	policy := defaultNexusSyncPolicy()
+	if policy.SyncWindowDays != 14 {
+		t.Fatalf("SyncWindowDays = %d, want 14", policy.SyncWindowDays)
+	}
+	if policy.InitialTurnLimit != 40 {
+		t.Fatalf("InitialTurnLimit = %d, want 40", policy.InitialTurnLimit)
+	}
+}
+
+func TestSyncHintsPollIntervalDefaultsDisabled(t *testing.T) {
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "")
+	if got := syncHintsPollInterval(); got != 0 {
+		t.Fatalf("syncHintsPollInterval() = %v, want disabled", got)
+	}
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "10m")
+	if got := syncHintsPollInterval(); got != 10*time.Minute {
+		t.Fatalf("syncHintsPollInterval() = %v, want 10m", got)
+	}
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "600")
+	if got := syncHintsPollInterval(); got != 10*time.Minute {
+		t.Fatalf("numeric syncHintsPollInterval() = %v, want 10m", got)
+	}
+}
+
+func TestRecentNexusSessionsFiltersOutsideSyncWindow(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := []pair.SyncSession{
+		{SessionID: "recent", LastTimestamp: now.Add(-2 * 24 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "boundary", LastTimestamp: now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "old", LastTimestamp: now.Add(-8 * 24 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "channel_recent", LastTimestamp: now.Add(-30 * 24 * time.Hour).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "", LastTimestamp: now.Format(time.RFC3339)},
+		{SessionID: "missing_time"},
+	}
+
+	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	ids := make([]string, 0, len(got))
+	for _, session := range got {
+		ids = append(ids, session.SessionID)
+	}
+	want := []string{"recent", "boundary", "channel_recent"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("recentNexusSessions ids = %v, want %v", ids, want)
+	}
+}
+
+func TestRecentNexusSessionsCanDisableWindowForSelfHostedBackfill(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := []pair.SyncSession{
+		{SessionID: "old", LastTimestamp: now.Add(-30 * 24 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "recent", LastTimestamp: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+	}
+	got := recentNexusSessions(sessions, 1, nexusSyncPolicy{SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	if len(got) != 1 || got[0].SessionID != "recent" {
+		t.Fatalf("recentNexusSessions max/sort = %+v, want only recent", got)
+	}
+}
+
+func TestRecentNexusSessionsIncludesPriorityHintsOutsideWindow(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := []pair.SyncSession{
+		{SessionID: "recent", LastTimestamp: now.Add(-1 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "pinned_old", LastTimestamp: now.Add(-30 * 24 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "old", LastTimestamp: now.Add(-20 * 24 * time.Hour).Format(time.RFC3339)},
+	}
+	hints := map[string]syncHint{
+		"pinned_old": {Reason: "pinned", PreferredMin: 100},
+	}
+
+	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, hints, now)
+	ids := make([]string, 0, len(got))
+	for _, session := range got {
+		ids = append(ids, session.SessionID)
+	}
+	want := []string{"pinned_old", "recent"}
+	if strings.Join(ids, ",") != strings.Join(want, ",") {
+		t.Fatalf("recentNexusSessions ids = %v, want %v", ids, want)
+	}
+}
+
+func TestHistorySyncCatalogSessionsUsesFullIndexWhenCatalogIsCapped(t *testing.T) {
+	root := t.TempDir()
+	claudeHome := filepath.Join(root, ".claude", "projects")
+	projectDir := filepath.Join(claudeHome, "-work-app")
+	if err := os.MkdirAll(projectDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	writeClaudeJSONLForCatalogTest(t, projectDir, "recent-session", "/work/app", now.Add(-1*time.Hour), "recent")
+	writeClaudeJSONLForCatalogTest(t, projectDir, "old-session", "/work/app", now.Add(-30*24*time.Hour), "old")
+
+	idx := index.New(index.Config{ClaudeHome: claudeHome, RefreshInterval: time.Minute})
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	fullReq, err := relay.BuildCatalogSyncRequest(idx, "dd_test", runner.Profile{ClaudeAlias: runner.AliasClaude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullReq.Sessions) != 2 {
+		t.Fatalf("fixture sessions = %d, want 2", len(fullReq.Sessions))
+	}
+
+	cappedReq := fullReq
+	cappedReq.CatalogComplete = false
+	cappedReq.Sessions = fullReq.Sessions[:1]
+	got := historySyncCatalogSessions(idx, runner.Profile{ClaudeAlias: runner.AliasClaude}, cappedReq)
+	ids := make([]string, 0, len(got))
+	for _, session := range got {
+		ids = append(ids, session.SessionID)
+	}
+	if strings.Join(ids, ",") != "recent-session,old-session" {
+		t.Fatalf("historySyncCatalogSessions capped ids = %v, want full recency-sorted index", ids)
+	}
+
+	completeReq := fullReq
+	completeReq.CatalogComplete = true
+	completeReq.Sessions = fullReq.Sessions[:1]
+	got = historySyncCatalogSessions(idx, runner.Profile{ClaudeAlias: runner.AliasClaude}, completeReq)
+	if len(got) != 1 || got[0].SessionID != "recent-session" {
+		t.Fatalf("historySyncCatalogSessions complete should reuse request sessions, got %+v", got)
+	}
+}
+
+func TestSessionActiveWithinUsesRecentChannelActivity(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	if !sessionActiveWithin(pair.SyncSession{LastTimestamp: now.Add(-30 * time.Minute).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-2 * time.Minute).Format(time.RFC3339)}, now, 10*time.Minute) {
+		t.Fatal("recent channel activity should count as active")
+	}
+	if sessionActiveWithin(pair.SyncSession{LastTimestamp: now.Add(-30 * time.Minute).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-20 * time.Minute).Format(time.RFC3339)}, now, 10*time.Minute) {
+		t.Fatal("old channel activity should not count as active")
+	}
+}
+
+func TestRecentNexusSessionsPrioritizesActiveSessionsUnderTickLimit(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := []pair.SyncSession{
+		{SessionID: "recent_newer", LastTimestamp: now.Add(-1 * time.Minute).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-30 * time.Minute).Format(time.RFC3339)},
+		{SessionID: "active_older", LastTimestamp: now.Add(-2 * time.Minute).Format(time.RFC3339), ChannelLastSeenAt: now.Add(-2 * time.Minute).Format(time.RFC3339)},
+	}
+	got := recentNexusSessions(sessions, 1, nexusSyncPolicy{SyncWindowDays: 7, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
+	if len(got) != 1 || got[0].SessionID != "active_older" {
+		t.Fatalf("recentNexusSessions = %+v, want active_older first under max limit", got)
+	}
+}
+
 func TestFormatClaudeCommandStatusAvoidsStableIdentifiers(t *testing.T) {
 	status := claudeStatus{
 		Linked:             true,
@@ -576,4 +794,105 @@ func compactJSONForTest(t *testing.T, raw json.RawMessage) string {
 		t.Fatal(err)
 	}
 	return buf.String()
+}
+
+func writeClaudeJSONLForCatalogTest(t *testing.T, dir, sessionID, cwd string, ts time.Time, text string) {
+	t.Helper()
+	line := `{"sessionId":"` + sessionID + `","cwd":"` + cwd + `","timestamp":"` + ts.UTC().Format(time.RFC3339Nano) + `","type":"user","message":{"role":"user","content":"` + text + `"}}` + "\n"
+	path := filepath.Join(dir, sessionID+".jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, ts, ts); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushedHintStoreAddSnapshotAndTTL(t *testing.T) {
+	store := newPushedHintStore()
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	store.Add("sess-a", "recently_opened", 100, now)
+	store.Add("", "recently_opened", 100, now) // ignored
+
+	hints := store.Snapshot(now)
+	if len(hints) != 1 {
+		t.Fatalf("snapshot len = %d, want 1", len(hints))
+	}
+	if hint := hints["sess-a"]; hint.Reason != "recently_opened" || hint.PreferredMin != 100 {
+		t.Fatalf("hint = %+v, want recently_opened/100", hint)
+	}
+	if !store.PushedWithin("sess-a", now.Add(time.Minute), pushedHintFreshFor) {
+		t.Fatal("hint pushed 1m ago should still count as fresh")
+	}
+	if store.PushedWithin("sess-a", now.Add(10*time.Minute), pushedHintFreshFor) {
+		t.Fatal("hint pushed 10m ago must not count as fresh")
+	}
+	if got := store.Snapshot(now.Add(pushedHintTTL + time.Minute)); len(got) != 0 {
+		t.Fatalf("expired snapshot len = %d, want 0", len(got))
+	}
+}
+
+func TestPushedHintStoreEvictsOldestAtCapacity(t *testing.T) {
+	store := newPushedHintStore()
+	base := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	for i := 0; i < pushedHintMaxEntries; i++ {
+		store.Add(fmt.Sprintf("sess-%03d", i), "recently_opened", 100, base.Add(time.Duration(i)*time.Second))
+	}
+	store.Add("sess-new", "recently_opened", 100, base.Add(time.Hour))
+	hints := store.Snapshot(base.Add(time.Hour))
+	if len(hints) != pushedHintMaxEntries {
+		t.Fatalf("snapshot len = %d, want %d", len(hints), pushedHintMaxEntries)
+	}
+	if _, ok := hints["sess-000"]; ok {
+		t.Fatal("oldest entry should be evicted at capacity")
+	}
+	if _, ok := hints["sess-new"]; !ok {
+		t.Fatal("newest entry must be present")
+	}
+}
+
+func TestShouldPushCatalogFloors(t *testing.T) {
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	if !shouldPushCatalog(now, time.Time{}, time.Minute, false) {
+		t.Fatal("first push must always be allowed")
+	}
+	if !shouldPushCatalog(now, now.Add(-10*time.Second), time.Minute, true) {
+		t.Fatal("membership change must bypass the floor")
+	}
+	if shouldPushCatalog(now, now.Add(-10*time.Second), time.Minute, false) {
+		t.Fatal("soft change inside the floor must be throttled")
+	}
+	if !shouldPushCatalog(now, now.Add(-2*time.Minute), time.Minute, false) {
+		t.Fatal("soft change past the floor must push")
+	}
+	if !shouldPushCatalog(now, now.Add(-time.Second), 0, false) {
+		t.Fatal("zero interval disables the floor")
+	}
+}
+
+func TestShouldPushWindowFloors(t *testing.T) {
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	if !shouldPushWindow(now, time.Time{}, 15*time.Second, false) {
+		t.Fatal("first window push must always be allowed")
+	}
+	if shouldPushWindow(now, now.Add(-5*time.Second), 15*time.Second, false) {
+		t.Fatal("window push inside the floor must be throttled")
+	}
+	if !shouldPushWindow(now, now.Add(-5*time.Second), 15*time.Second, true) {
+		t.Fatal("a fresh hint must bypass the floor")
+	}
+	if !shouldPushWindow(now, now.Add(-20*time.Second), 15*time.Second, false) {
+		t.Fatal("window push past the floor must be allowed")
+	}
+}
+
+func TestCatalogMembershipSignatureIsOrderInsensitive(t *testing.T) {
+	left := catalogMembershipSignature([]pair.SyncSession{{SessionID: "b"}, {SessionID: "a"}})
+	right := catalogMembershipSignature([]pair.SyncSession{{SessionID: "a"}, {SessionID: "b"}})
+	if left != right {
+		t.Fatalf("membership signature must be order-insensitive: %q vs %q", left, right)
+	}
+	if left == catalogMembershipSignature([]pair.SyncSession{{SessionID: "a"}}) {
+		t.Fatal("membership signature must change when a session is added/removed")
+	}
 }

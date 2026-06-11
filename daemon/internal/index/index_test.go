@@ -174,6 +174,39 @@ func TestRefreshEmitsChangesOnlyWhenSnapshotChanges(t *testing.T) {
 	expectChange(t, idx.Changes())
 }
 
+func TestRefreshUpdatesTurnCountWhenSessionFileChanges(t *testing.T) {
+	claudeHome := filepath.Join(t.TempDir(), ".claude", "projects")
+	projectDir := filepath.Join(claudeHome, "-tmp-claude-project")
+	mustMkdirAll(t, projectDir)
+
+	sessionID := "55555555-5555-5555-5555-555555555555"
+	sessionPath := filepath.Join(projectDir, sessionID+".jsonl")
+	mustWriteFile(t, sessionPath, `
+{"sessionId":"`+sessionID+`","cwd":"/tmp/claude/project","timestamp":"2026-05-18T10:00:00Z","type":"user","message":{"role":"user","content":"hello"}}
+`)
+	idx := New(Config{ClaudeHome: claudeHome})
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	projects := idx.Projects()
+	if got := projects[0].Sessions[0].TurnCount; got != 1 {
+		t.Fatalf("initial TurnCount = %d, want 1", got)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	mustWriteFile(t, sessionPath, `
+{"sessionId":"`+sessionID+`","cwd":"/tmp/claude/project","timestamp":"2026-05-18T10:00:00Z","type":"user","message":{"role":"user","content":"hello"}}
+{"sessionId":"`+sessionID+`","cwd":"/tmp/claude/project","timestamp":"2026-05-18T10:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+`)
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	projects = idx.Projects()
+	if got := projects[0].Sessions[0].TurnCount; got != 2 {
+		t.Fatalf("updated TurnCount = %d, want 2", got)
+	}
+}
+
 func mustMkdirAll(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(path, 0o755); err != nil {

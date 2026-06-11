@@ -35,7 +35,10 @@ export function nexusRuntimeCapabilities(env = {}, defaults = {}) {
   return {
     runtime,
     realtime: hasControlRuntime && envFlag(env.REALTIME_ENABLED),
+    browser_realtime: hasControlRuntime && envFlag(env.BROWSER_REALTIME_ENABLED ?? env.REALTIME_ENABLED),
+    control_streaming: envFlag(env.CONTROL_STREAMING_ENABLED ?? "1"),
     terminal: hasControlRuntime && envFlag(env.TERMINAL_ENABLED),
+    terminal_streaming: hasControlRuntime && envFlag(env.TERMINAL_STREAMING_ENABLED ?? env.TERMINAL_ENABLED),
     web_push: hasWebPushKey && envFlag(env.WEB_PUSH_ENABLED),
     stt: hasSTTProvider && envFlag(env.STT_ENABLED),
     release_update: hasReleaseSource && envFlag(env.RELEASE_UPDATE_ENABLED),

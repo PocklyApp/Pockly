@@ -10,15 +10,15 @@ const injectTimeoutMs = 35 * 60_000;
 const syncTimeoutMs = 35 * 60_000;
 
 export function createControlHub(env = {}) {
-  if (env.POCKLY_CONTROL_HUB) return env.POCKLY_CONTROL_HUB;
-  if (env.POCKLY_CONTROL_HUB_FACTORY) return controlHubFromFactory(env.POCKLY_CONTROL_HUB_FACTORY, env.POCKLY_CONTROL_USER_ID || "");
+  if (env.POCKLY_CONTROL_HUB) return withEventSink(env.POCKLY_CONTROL_HUB, env);
+  if (env.POCKLY_CONTROL_HUB_FACTORY) return withEventSink(controlHubFromFactory(env.POCKLY_CONTROL_HUB_FACTORY, env.POCKLY_CONTROL_USER_ID || ""), env);
   globalThis.__POCKLY_CONTROL_HUB ??= new InMemoryControlHub();
-  return globalThis.__POCKLY_CONTROL_HUB;
+  return withEventSink(globalThis.__POCKLY_CONTROL_HUB, env);
 }
 
 export function createControlHubForUser(env = {}, userID = "") {
-  if (env.POCKLY_CONTROL_HUB) return env.POCKLY_CONTROL_HUB;
-  if (env.POCKLY_CONTROL_HUB_FACTORY) return controlHubFromFactory(env.POCKLY_CONTROL_HUB_FACTORY, userID);
+  if (env.POCKLY_CONTROL_HUB) return withEventSink(env.POCKLY_CONTROL_HUB, env);
+  if (env.POCKLY_CONTROL_HUB_FACTORY) return withEventSink(controlHubFromFactory(env.POCKLY_CONTROL_HUB_FACTORY, userID), env);
   return createControlHub(env);
 }
 
@@ -28,10 +28,19 @@ function controlHubFromFactory(factory, userID) {
   throw new Error("invalid control hub factory");
 }
 
+function withEventSink(hub, env = {}) {
+  if (hub && env.POCKLY_CONTROL_EVENT_SINK && !hub.eventSink) {
+    if (typeof hub.setEventSink === "function") hub.setEventSink(env.POCKLY_CONTROL_EVENT_SINK);
+    else hub.eventSink = env.POCKLY_CONTROL_EVENT_SINK;
+  }
+  return hub;
+}
+
 export class InMemoryControlHub {
   constructor(options = {}) {
     this.terminalStorage = options.terminalStorage || null;
     this.notificationSink = options.notificationSink || null;
+    this.eventSink = options.eventSink || null;
     this.distributedSink = options.distributedSink || null;
     this.presenceResolver = options.presenceResolver || null;
     this.terminalPersistChain = Promise.resolve();
@@ -44,6 +53,7 @@ export class InMemoryControlHub {
     this.terminalSessions = new Map();
     this.terminalStreams = new Map();
     this.terminalHistory = new Map();
+    this.terminalEventCounter = 1;
   }
 
   async hydrateTerminalState() {
@@ -61,6 +71,14 @@ export class InMemoryControlHub {
 
   isDaemonOnline(deviceID) {
     return this.daemons.has(deviceID);
+  }
+
+  async onlineDevices(deviceIDs = []) {
+    const online = {};
+    for (const deviceID of uniqueStrings(deviceIDs)) {
+      online[deviceID] = this.isDaemonOnline(deviceID);
+    }
+    return online;
   }
 
   attachDaemonForTest(deviceID, userID, handler) {
@@ -195,52 +213,75 @@ export class InMemoryControlHub {
   }
 
   attachBrowserWebSocketConnection({ userID, deviceID, socket }) {
-    const browserSocket = { userID, deviceID, ws: socket, subscriptions: new Set() };
-    this.browserSockets.set(socket, browserSocket);
+    const browserSocket = this.registerBrowserSocket({ userID, deviceID, socket });
     socketAddListener(socket, "message", (event) => {
-      try {
-        const msg = JSON.parse(String(socketMessageData(event)));
-        if (msg.type !== "SUBSCRIBE") return;
-        const sessionID = String(msg.session_id || "");
-        const daemonDeviceID = String(msg.device_id || "");
-        if (!sessionID || !daemonDeviceID) {
-          socketSend(socket, JSON.stringify({ type: "ERROR", message: "session_id and device_id are required" }));
-          return;
-        }
-        browserSocket.subscriptions.add(subscriptionKey(browserSocket.userID, daemonDeviceID, sessionID));
-        socketSend(socket, JSON.stringify({ type: "SESSION_STATUS", message: "subscribed" }));
-        const localOnline = this.isDaemonOnline(daemonDeviceID);
-        socketSend(socket, JSON.stringify({
-          type: "HOST_STATUS",
-          device_id: daemonDeviceID,
-          presence_status: localOnline ? "online" : "offline",
-          presence_reason: localOnline ? "control_connected" : "control_disconnected",
-          control_connected: localOnline,
-        }));
-        if (this.presenceResolver) {
-          Promise.resolve(this.presenceResolver(daemonDeviceID))
-            .then((status) => {
-              if (!status || this.browserSockets.get(socket) !== browserSocket) return;
-              socketSend(socket, JSON.stringify({
-                type: "HOST_STATUS",
-                device_id: daemonDeviceID,
-                presence_status: status.presence_status || (status.online ? "online" : "offline"),
-                presence_reason: status.presence_reason || (status.online ? "control_connected" : "control_disconnected"),
-                control_connected: Boolean(status.control_connected ?? status.online),
-              }));
-            })
-            .catch(() => undefined);
-        }
-      } catch {
-        socketSend(socket, JSON.stringify({ type: "ERROR", message: "invalid websocket message" }));
-      }
+      this.handleBrowserSocketMessage(browserSocket, socketMessageData(event));
     });
     const cleanup = once(() => {
-      this.browserSockets.delete(socket);
+      this.unregisterBrowserSocket(socket);
     });
     socketAddListener(socket, "close", cleanup);
     socketAddListener(socket, "error", cleanup);
     return browserSocket;
+  }
+
+  // registerBrowserSocket creates the registry entry without wiring any socket
+  // listeners — runtimes that deliver events out-of-band (the Cloudflare DO
+  // Hibernation API routes them through webSocketMessage/webSocketClose
+  // callbacks) register recovered sockets through this seam.
+  registerBrowserSocket({ userID, deviceID, socket, subscriptions }) {
+    const browserSocket = {
+      userID,
+      deviceID,
+      ws: socket,
+      subscriptions: subscriptions instanceof Set ? subscriptions : new Set(subscriptions ?? []),
+    };
+    this.browserSockets.set(socket, browserSocket);
+    return browserSocket;
+  }
+
+  unregisterBrowserSocket(socket) {
+    this.browserSockets.delete(socket);
+  }
+
+  handleBrowserSocketMessage(browserSocket, raw) {
+    const socket = browserSocket.ws;
+    try {
+      const msg = JSON.parse(String(raw));
+      if (msg.type !== "SUBSCRIBE") return;
+      const sessionID = String(msg.session_id || "");
+      const daemonDeviceID = String(msg.device_id || "");
+      if (!sessionID || !daemonDeviceID) {
+        socketSend(socket, JSON.stringify({ type: "ERROR", message: "session_id and device_id are required" }));
+        return;
+      }
+      browserSocket.subscriptions.add(subscriptionKey(browserSocket.userID, daemonDeviceID, sessionID));
+      socketSend(socket, JSON.stringify({ type: "SESSION_STATUS", message: "subscribed" }));
+      const localOnline = this.isDaemonOnline(daemonDeviceID);
+      socketSend(socket, JSON.stringify({
+        type: "HOST_STATUS",
+        device_id: daemonDeviceID,
+        presence_status: localOnline ? "online" : "offline",
+        presence_reason: localOnline ? "control_connected" : "control_disconnected",
+        control_connected: localOnline,
+      }));
+      if (this.presenceResolver) {
+        Promise.resolve(this.presenceResolver(daemonDeviceID))
+          .then((status) => {
+            if (!status || this.browserSockets.get(socket) !== browserSocket) return;
+            socketSend(socket, JSON.stringify({
+              type: "HOST_STATUS",
+              device_id: daemonDeviceID,
+              presence_status: status.presence_status || (status.online ? "online" : "offline"),
+              presence_reason: status.presence_reason || (status.online ? "control_connected" : "control_disconnected"),
+              control_connected: Boolean(status.control_connected ?? status.online),
+            }));
+          })
+          .catch(() => undefined);
+      }
+    } catch {
+      socketSend(socket, JSON.stringify({ type: "ERROR", message: "invalid websocket message" }));
+    }
   }
 
   async requestResponse(daemonDeviceID, envelope, responseType, requestID, timeoutMs = defaultRequestTimeoutMs) {
@@ -330,9 +371,9 @@ export class InMemoryControlHub {
       case "DAEMON_STATUS":
         return this.deliverDaemonStatus(deviceID, envelope.daemon_status || envelope.DaemonStatus || envelope.status || {});
       case "INJECT_EVENT":
-        return this.deliverInjectEvent(envelope.event || envelope.Event, options.userID ?? this.daemons.get(deviceID)?.userID ?? "");
+        return this.deliverInjectEvent(envelope.event || envelope.Event, options.userID ?? this.daemons.get(deviceID)?.userID ?? "", deviceID);
       case "SYNC_SESSION_EVENT":
-        return this.deliverStream(envelope.sync_event || envelope.SyncEvent);
+        return this.deliverStream(envelope.sync_event || envelope.SyncEvent, { persistEvent: true, userID: options.userID ?? this.daemons.get(deviceID)?.userID ?? "", daemonDeviceID: deviceID });
       case "LIST_DIR_RESPONSE":
         return this.deliverPending(type, envelope.list_dir_response || envelope.ListDirResponse);
       case "PERMISSION_DECIDE_EVENT":
@@ -348,7 +389,11 @@ export class InMemoryControlHub {
       case "REVEAL_RESULT":
         return this.deliverPending(type, envelope.reveal_result || envelope.RevealResult);
       case "TERMINAL_EVENT":
-        return this.publishTerminalEvent(envelope.terminal_event || envelope.TerminalEvent, options);
+        return this.publishTerminalEvent(envelope.terminal_event || envelope.TerminalEvent, {
+          ...options,
+          userID: options.userID ?? this.daemons.get(deviceID)?.userID ?? "",
+          daemonDeviceID: deviceID,
+        });
       default:
         return;
     }
@@ -440,6 +485,15 @@ export class InMemoryControlHub {
     const session = this.requireTerminalSession(userID, terminalSessionID);
     const encoder = new TextEncoder();
     let currentEntry;
+    let unsubscribed = false;
+    const unsubscribe = () => {
+      if (unsubscribed) return;
+      unsubscribed = true;
+      const streams = this.terminalStreams.get(terminalSessionID);
+      if (streams && currentEntry) streams.delete(currentEntry);
+      if (streams?.size === 0) this.terminalStreams.delete(terminalSessionID);
+      void this.sendTerminalSubscription(session, false);
+    };
     const stream = new ReadableStream({
       start: (controller) => {
         const entry = { controller, encoder };
@@ -447,17 +501,13 @@ export class InMemoryControlHub {
         const streams = this.terminalStreams.get(terminalSessionID) ?? new Set();
         streams.add(entry);
         this.terminalStreams.set(terminalSessionID, streams);
+        void this.sendTerminalSubscription(session, true);
         writeSSE(controller, "terminal_session", { terminal_session_id: terminalSessionID, kind: "terminal_session", session_status: session.session_status, turn_status: session.turn_status, timestamp: session.updated_at });
         for (const event of this.terminalHistory.get(terminalSessionID) ?? []) {
           writeSSE(controller, event.kind || "terminal_event", event);
         }
       },
-      cancel: () => {
-        const streams = this.terminalStreams.get(terminalSessionID);
-        if (!streams) return;
-        if (currentEntry) streams.delete(currentEntry);
-        if (streams.size === 0) this.terminalStreams.delete(terminalSessionID);
-      },
+      cancel: unsubscribe,
     });
     return new Response(stream, {
       headers: {
@@ -467,8 +517,61 @@ export class InMemoryControlHub {
     });
   }
 
+  async subscribeTerminalSession(userID, terminalSessionID) {
+    const session = this.requireTerminalSession(userID, terminalSessionID);
+    await this.sendTerminalSubscription(session, true);
+    return { status: "subscribed", terminal_session_id: terminalSessionID };
+  }
+
+  async unsubscribeTerminalSession(userID, terminalSessionID) {
+    const session = this.requireTerminalSession(userID, terminalSessionID);
+    await this.sendTerminalSubscription(session, false);
+    return { status: "unsubscribed", terminal_session_id: terminalSessionID };
+  }
+
+  listTerminalEvents(userID, terminalSessionID, options = {}) {
+    this.requireTerminalSession(userID, terminalSessionID);
+    const after = String(options.after || "");
+    const limit = clampLimit(options.limit, 100);
+    const history = this.terminalHistory.get(terminalSessionID) ?? [];
+    const events = history
+      .filter((event) => !after || String(event.event_id || "") > after)
+      .slice(-limit)
+      .map(publicTerminalEvent);
+    return {
+      events,
+      next_cursor: events.at(-1)?.cursor || after,
+    };
+  }
+
+  async sendTerminalSubscription(session, subscribed) {
+    const daemon = this.daemons.get(session.daemon_device_id);
+    if (!daemon) return;
+    try {
+      await daemon.sendEnvelope({
+        type: subscribed ? "TERMINAL_SUBSCRIBE" : "TERMINAL_UNSUBSCRIBE",
+        terminal_request: {
+          request_id: randomID("term"),
+          terminal_session_id: session.terminal_session_id,
+          daemon_device_id: session.daemon_device_id,
+          browser_device_id: session.browser_device_id || "",
+          session_id: session.session_id || "",
+        },
+      });
+    } catch {
+      // Subscription hints only gate high-volume text output. They must not
+      // break opening the stream or terminal state recovery.
+    }
+  }
+
   publishTerminalEvent(event, options = {}) {
     if (!event?.terminal_session_id) return;
+    event.event_id ||= this.nextTerminalEventID();
+    if (!options.skipDistributedSink) this.eventSink?.onTerminalEvent?.(event, {
+      userID: options.userID || "",
+      daemonDeviceID: options.daemonDeviceID || event.daemon_device_id || event.device_id || "",
+      sessionID: event.session_id || "",
+    });
     if (!options.skipDistributedSink) this.distributedSink?.onTerminalEvent?.(event);
     const existing = this.terminalSessions.get(event.terminal_session_id);
     const now = new Date().toISOString();
@@ -501,6 +604,12 @@ export class InMemoryControlHub {
         streams.delete(entry);
       }
     }
+  }
+
+  nextTerminalEventID() {
+    const millis = String(Date.now()).padStart(13, "0");
+    this.terminalEventCounter = (this.terminalEventCounter + 1) % 1_000_000;
+    return `ev_${millis}_${String(this.terminalEventCounter).padStart(6, "0")}_term`;
   }
 
   requireTerminalSession(userID, terminalSessionID) {
@@ -537,15 +646,17 @@ export class InMemoryControlHub {
     pending.resolve(payload);
   }
 
-  deliverInjectEvent(payload, userID) {
+  deliverInjectEvent(payload, userID, daemonDeviceID = "") {
     if (!payload) return;
+    this.eventSink?.onControlEvent?.(payload, { userID, daemonDeviceID, kind: "inject" });
     this.deliverStream(payload);
     if (payload.turn) this.broadcastTurn(payload.turn, userID);
     this.emitNotificationForInjectEvent(payload, userID);
   }
 
-  deliverStream(payload) {
+  deliverStream(payload, options = {}) {
     if (!payload?.request_id) return;
+    if (options.persistEvent) this.eventSink?.onControlEvent?.(payload, { userID: options.userID || "", daemonDeviceID: options.daemonDeviceID || "", kind: "sync" });
     const entry = this.streams.get(payload.request_id);
     if (!entry) return;
     this.writeSSE(entry.controller, entry.eventName, payload);
@@ -689,6 +800,12 @@ export function handleControlHubRequest(hub, request) {
   if (request.method === "GET" && path === "/control/online") {
     return jsonControl(async () => ({ online: await hub.isDaemonOnline(url.searchParams.get("device_id") || "") }));
   }
+  if (request.method === "POST" && path === "/control/online-batch") {
+    return jsonControl(async () => {
+      const body = await request.json().catch(() => ({}));
+      return { online: await hub.onlineDevices(Array.isArray(body.device_ids) ? body.device_ids : []) };
+    });
+  }
   if (path === "/control/daemon-ws") {
     return hub.acceptDaemonWebSocket(request, {
       userID: requiredQuery(url, "user_id"),
@@ -749,7 +866,7 @@ export function handleControlHubRequest(hub, request) {
       return { terminal_session: await hub.createTerminalSession(body) };
     });
   }
-  const terminalAction = path.match(/^\/control\/terminal-sessions\/([^/]+)\/(input|stop|open-terminal|stream)$/);
+  const terminalAction = path.match(/^\/control\/terminal-sessions\/([^/]+)\/(input|stop|open-terminal|stream|subscribe|unsubscribe|events)$/);
   if (terminalAction) {
     return handleTerminalControlRequest(hub, request, url, decodeURIComponent(terminalAction[1]), terminalAction[2]);
   }
@@ -759,6 +876,12 @@ export function handleControlHubRequest(hub, request) {
 async function handleTerminalControlRequest(hub, request, url, terminalSessionID, action) {
   const userID = url.searchParams.get("user_id") || (request.method === "POST" ? (await request.clone().json()).user_id : "");
   if (action === "stream") return hub.streamTerminalSession(requiredValue(userID, "user_id"), terminalSessionID);
+  if (action === "events") {
+    return jsonResponse(hub.listTerminalEvents(requiredValue(userID, "user_id"), terminalSessionID, {
+      after: url.searchParams.get("after") || "",
+      limit: url.searchParams.get("limit") || "",
+    }));
+  }
   if (request.method !== "POST") return errorResponse("method not allowed", ErrorCode.MethodNotAllowed, { status: 405, headers: { allow: "POST" } });
   const body = await request.json();
   switch (action) {
@@ -771,6 +894,10 @@ async function handleTerminalControlRequest(hub, request, url, terminalSessionID
     case "open-terminal":
       await hub.openTerminalSession(requiredValue(body.user_id, "user_id"), terminalSessionID);
       return jsonResponse({ status: "queued" });
+    case "subscribe":
+      return jsonResponse(await hub.subscribeTerminalSession(requiredValue(body.user_id, "user_id"), terminalSessionID));
+    case "unsubscribe":
+      return jsonResponse(await hub.unsubscribeTerminalSession(requiredValue(body.user_id, "user_id"), terminalSessionID));
     default:
       return errorResponse("not found", ErrorCode.NotFound, { status: 404 });
   }
@@ -888,6 +1015,34 @@ async function responseErrorText(response) {
 
 function requiredQuery(url, name) {
   return requiredValue(url.searchParams.get(name), name);
+}
+
+function uniqueStrings(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const next = String(value || "");
+    if (!next || seen.has(next)) continue;
+    seen.add(next);
+    out.push(next);
+  }
+  return out;
+}
+
+function publicTerminalEvent(event) {
+  return {
+    cursor: String(event.event_id || ""),
+    event_id: String(event.event_id || ""),
+    type: event.kind || "terminal_event",
+    created_at: event.timestamp || "",
+    payload: event,
+  };
+}
+
+function clampLimit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(500, Math.max(1, Math.floor(parsed)));
 }
 
 function requiredValue(value, name) {

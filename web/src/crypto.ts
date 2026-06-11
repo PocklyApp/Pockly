@@ -8,9 +8,6 @@ import { ed25519 } from "@noble/curves/ed25519";
 const browserStateKey = "pockly.browser_device";
 const nobleEd25519Prefix = "noble-ed25519:";
 
-// Browser state now stores only an Ed25519 signing key. It authenticates this
-// login endpoint to Nexus via the device-challenge/verify handshake; it is not
-// used to transform session history.
 export type BrowserDeviceState = {
   deviceId?: string;
   devicePublicKey: string;
@@ -51,13 +48,12 @@ export async function clearBrowserDeviceState() {
 export async function ensureBrowserDeviceState(): Promise<BrowserDeviceState> {
   const existing = loadBrowserDeviceState();
   if (existing?.devicePublicKey && existing?.devicePrivateKeyPkcs8) {
-    // Existing device, including older localStorage blobs that may carry unused
-    // legacy key fields. Keep the Ed25519 signing key so the browser stays
-    // authorized; no re-registration needed.
     return existing;
   }
 
-  const keyPair = await generateBrowserSigningKey();
+  const keyPair = existing?.devicePublicKey && existing?.devicePrivateKeyPkcs8
+    ? { publicKey: existing.devicePublicKey, privateKey: existing.devicePrivateKeyPkcs8 }
+    : await generateBrowserSigningKey();
   const state: BrowserDeviceState = {
     ...existing,
     devicePublicKey: keyPair.publicKey,

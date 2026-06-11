@@ -142,6 +142,122 @@ describe("in-process Nexus control hub", () => {
     assert.equal(events[1].text, "hello from terminal");
   });
 
+  it("subscribes terminal output only while a stream is open", async () => {
+    const envelopes = [];
+    const hub = new InMemoryControlHub();
+    hub.attachDaemonForTest("dd_control", "usr_control", async (envelope) => {
+      envelopes.push(envelope);
+    });
+
+    await hub.createTerminalSession({
+      request_id: "term_req",
+      terminal_session_id: "ts_subscribe",
+      user_id: "usr_control",
+      daemon_device_id: "dd_control",
+      browser_device_id: "bd_control",
+      session_id: "sess_control",
+      agent: "claude-code",
+      cwd: "/work/app",
+    });
+    envelopes.length = 0;
+
+    const stream = hub.streamTerminalSession("usr_control", "ts_subscribe");
+    const { reader } = await readFirstSSEEvent(stream);
+    await eventually(() => {
+      assert.equal(envelopes.at(-1)?.type, "TERMINAL_SUBSCRIBE");
+    });
+    assert.equal(envelopes.at(-1).terminal_request.terminal_session_id, "ts_subscribe");
+
+    await reader.cancel();
+    await eventually(() => {
+      assert.equal(envelopes.at(-1)?.type, "TERMINAL_UNSUBSCRIBE");
+    });
+    assert.equal(envelopes.at(-1).terminal_request.terminal_session_id, "ts_subscribe");
+  });
+
+  it("supports terminal subscribe and cursor polling without a long stream", async () => {
+    const envelopes = [];
+    const hub = new InMemoryControlHub();
+    hub.attachDaemonForTest("dd_control", "usr_control", async (envelope) => {
+      envelopes.push(envelope);
+    });
+
+    await hub.createTerminalSession({
+      request_id: "term_req",
+      terminal_session_id: "ts_poll",
+      user_id: "usr_control",
+      daemon_device_id: "dd_control",
+      browser_device_id: "bd_control",
+      session_id: "sess_control",
+      agent: "claude-code",
+      cwd: "/work/app",
+    });
+    envelopes.length = 0;
+
+    const subscribe = await handleControlHubRequest(hub, new Request("https://control.test/control/terminal-sessions/ts_poll/subscribe", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_id: "usr_control" }),
+    }));
+    assert.equal(subscribe.status, 200);
+    assert.equal(envelopes.at(-1)?.type, "TERMINAL_SUBSCRIBE");
+
+    hub.receiveDaemonEnvelope("dd_control", {
+      type: "TERMINAL_EVENT",
+      terminal_event: {
+        terminal_session_id: "ts_poll",
+        kind: "text_delta",
+        payload: "batched output",
+        session_status: "live",
+        turn_status: "idle",
+        timestamp: "2026-06-06T01:00:00Z",
+      },
+    });
+    const events = await handleControlHubRequest(hub, new Request("https://control.test/control/terminal-sessions/ts_poll/events?user_id=usr_control"));
+    const body = await events.json();
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].payload.payload, "batched output");
+    assert.match(body.next_cursor, /^ev_/);
+
+    const after = await handleControlHubRequest(hub, new Request(`https://control.test/control/terminal-sessions/ts_poll/events?user_id=usr_control&after=${encodeURIComponent(body.next_cursor)}`));
+    assert.deepEqual(await after.json(), { events: [], next_cursor: body.next_cursor });
+
+    const unsubscribe = await handleControlHubRequest(hub, new Request("https://control.test/control/terminal-sessions/ts_poll/unsubscribe", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_id: "usr_control" }),
+    }));
+    assert.equal(unsubscribe.status, 200);
+    assert.equal(envelopes.at(-1)?.type, "TERMINAL_UNSUBSCRIBE");
+  });
+
+  it("forwards terminal batches to the recent-event sink", async () => {
+    const terminalEvents = [];
+    const hub = new InMemoryControlHub({
+      eventSink: {
+        onTerminalEvent: async (event, meta) => terminalEvents.push({ event, meta }),
+      },
+    });
+    hub.attachDaemonForTest("dd_control", "usr_control", async () => {});
+
+    hub.receiveDaemonEnvelope("dd_control", {
+      type: "TERMINAL_EVENT",
+      terminal_event: {
+        terminal_session_id: "ts_sink",
+        kind: "text_delta",
+        payload: "batched output",
+        session_id: "sess_control",
+        timestamp: "2026-06-06T01:00:00Z",
+      },
+    });
+
+    assert.equal(terminalEvents.length, 1);
+    assert.equal(terminalEvents[0].event.payload, "batched output");
+    assert.equal(terminalEvents[0].meta.userID, "usr_control");
+    assert.equal(terminalEvents[0].meta.daemonDeviceID, "dd_control");
+    assert.equal(terminalEvents[0].meta.sessionID, "sess_control");
+  });
+
   it("emits deduplicated notifications for inject outcomes and permission requests", async () => {
     const notifications = [];
     const hub = new InMemoryControlHub({
@@ -242,4 +358,30 @@ function readSSEText(text) {
     .map((chunk) => chunk.split("\n").find((line) => line.startsWith("data: ")))
     .filter(Boolean)
     .map((line) => JSON.parse(line.slice("data: ".length)));
+}
+
+async function readFirstSSEEvent(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  while (readSSEText(text).length < 1) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+  }
+  return { event: readSSEText(text)[0], reader };
+}
+
+async function eventually(fn, timeoutMs = 1000) {
+  const started = Date.now();
+  let lastError;
+  while (Date.now() - started < timeoutMs) {
+    try {
+      return fn();
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  throw lastError;
 }

@@ -11,6 +11,8 @@ export function createStore(env = {}) {
   return globalThis.__POCKLY_NEXUS_STORE;
 }
 
+let nextEventCounter = 1;
+
 export class InMemoryNexusStore {
   constructor() {
     this.usersById = new Map();
@@ -30,7 +32,9 @@ export class InMemoryNexusStore {
     this.feedback = new Map();
     this.sessions = new Map();
     this.turns = new Map();
+    this.sessionEvents = [];
     this.sessionPrefs = new Map();
+    this.sessionOpenHints = new Map();
     this.projectPrefs = new Map();
   }
 
@@ -309,6 +313,17 @@ export class InMemoryNexusStore {
     this.sessionPrefs.delete(sessionKey(userID, deviceID, sessionID));
   }
 
+  async listSessionOpenHintsForUser(userID) {
+    return [...this.sessionOpenHints.values()].filter((hint) => hint.user_id === userID);
+  }
+
+  async upsertSessionOpenHint(hint) {
+    const key = sessionKey(hint.user_id, hint.device_id, hint.session_id);
+    const next = { ...(this.sessionOpenHints.get(key) ?? {}), ...withoutUndefined(hint) };
+    this.sessionOpenHints.set(key, next);
+    return next;
+  }
+
   async listProjectPrefsForUser(userID) {
     return [...this.projectPrefs.values()].filter((pref) => pref.user_id === userID);
   }
@@ -324,6 +339,7 @@ export class InMemoryNexusStore {
   async deleteSessionData(userID, deviceID, sessionID) {
     this.sessions.delete(sessionKey(userID, deviceID, sessionID));
     this.sessionPrefs.delete(sessionKey(userID, deviceID, sessionID));
+    this.sessionOpenHints.delete(sessionKey(userID, deviceID, sessionID));
     for (const [key, turn] of this.turns) {
       if (turn.user_id === userID && turn.device_id === deviceID && turn.session_id === sessionID) {
         this.turns.delete(key);
@@ -347,6 +363,41 @@ export class InMemoryNexusStore {
     return [...this.turns.values()]
       .filter((turn) => turn.user_id === userID && turn.device_id === deviceID && turn.session_id === sessionID)
       .sort((left, right) => Number(left.seq) - Number(right.seq));
+  }
+
+  async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
+    const after = Number(afterSeq) || 0;
+    return (await this.listTurns(userID, deviceID, sessionID))
+      .filter((turn) => Number(turn.seq) > after)
+      .slice(0, clampLimit(limit, 100));
+  }
+
+  async appendSessionEvent(event) {
+    const next = {
+      ...event,
+      event_id: event.event_id || eventID(),
+      payload: typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload ?? {}),
+    };
+    this.sessionEvents.push(next);
+    if (this.sessionEvents.length > 5000) {
+      this.sessionEvents.splice(0, this.sessionEvents.length - 5000);
+    }
+    return next;
+  }
+
+  async listSessionEvents(userID, deviceID, sessionID, options = {}) {
+    const after = String(options.after ?? "");
+    const requestID = String(options.request_id ?? "");
+    const limit = clampLimit(options.limit, 100);
+    return this.sessionEvents
+      .filter((event) => {
+        if (event.user_id !== userID) return false;
+        if (after && String(event.event_id) <= after) return false;
+        if (requestID) return event.request_id === requestID;
+        return event.device_id === deviceID && event.session_id === sessionID;
+      })
+      .sort((left, right) => String(left.event_id).localeCompare(String(right.event_id)))
+      .slice(0, limit);
   }
 
   async upsertPushSubscription(subscription) {
@@ -391,6 +442,7 @@ export class InMemoryNexusStore {
 export class SQLNexusStore {
   constructor(db) {
     this.db = db;
+    this.sessionEventPruneByUser = new Map();
   }
 
   async upsertUser(user) {
@@ -845,6 +897,24 @@ export class SQLNexusStore {
         synced_max_seq = excluded.synced_max_seq,
         has_older_turns = excluded.has_older_turns,
         updated_at = excluded.updated_at
+      WHERE
+        sessions.computer_id IS DISTINCT FROM excluded.computer_id OR
+        sessions.agent IS DISTINCT FROM excluded.agent OR
+        sessions.runner_alias IS DISTINCT FROM excluded.runner_alias OR
+        sessions.cwd IS DISTINCT FROM excluded.cwd OR
+        sessions.snippet IS DISTINCT FROM excluded.snippet OR
+        sessions.first_message IS DISTINCT FROM excluded.first_message OR
+        sessions.title IS DISTINCT FROM excluded.title OR
+        sessions.last_seq IS DISTINCT FROM excluded.last_seq OR
+        sessions.last_timestamp IS DISTINCT FROM excluded.last_timestamp OR
+        sessions.channel_last_seen_at IS DISTINCT FROM excluded.channel_last_seen_at OR
+        sessions.sync_state IS DISTINCT FROM excluded.sync_state OR
+        sessions.turn_count IS DISTINCT FROM excluded.turn_count OR
+        sessions.last_sync_error IS DISTINCT FROM excluded.last_sync_error OR
+        sessions.synced_turn_count IS DISTINCT FROM excluded.synced_turn_count OR
+        sessions.synced_min_seq IS DISTINCT FROM excluded.synced_min_seq OR
+        sessions.synced_max_seq IS DISTINCT FROM excluded.synced_max_seq OR
+        sessions.has_older_turns IS DISTINCT FROM excluded.has_older_turns
     `).bind(
       session.user_id,
       session.computer_id ?? null,
@@ -896,8 +966,7 @@ export class SQLNexusStore {
     // Compute the stale sessions (present for this device but not in the new
     // catalog) and delete them in small batches. A single
     // `NOT IN (...all kept ids...)` binds one parameter per kept session, which
-    // overflows D1's bound-variable limit on large catalogs ("too many SQL
-    // variables"); self-hosted SQLite tolerates ~32k variables, D1 does not.
+    // can overflow database parameter limits on large catalogs.
     const keep = new Set(keepSessionIDs.map((id) => String(id)));
     const existing = await this.db.prepare(`
       SELECT session_id FROM sessions WHERE user_id = ? AND device_id = ?
@@ -979,6 +1048,32 @@ export class SQLNexusStore {
     `).bind(userID, deviceID, sessionID).run();
   }
 
+  async listSessionOpenHintsForUser(userID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM session_open_hints WHERE user_id = ?
+    `).bind(userID).all();
+    return result.results ?? [];
+  }
+
+  async upsertSessionOpenHint(hint) {
+    await this.db.prepare(`
+      INSERT INTO session_open_hints (user_id, device_id, session_id, last_opened_at, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, device_id, session_id) DO UPDATE SET
+        last_opened_at = excluded.last_opened_at,
+        updated_at = excluded.updated_at
+    `).bind(
+      hint.user_id,
+      hint.device_id,
+      hint.session_id,
+      hint.last_opened_at,
+      hint.updated_at,
+    ).run();
+    return await this.db.prepare(`
+      SELECT * FROM session_open_hints WHERE user_id = ? AND device_id = ? AND session_id = ?
+    `).bind(hint.user_id, hint.device_id, hint.session_id).first();
+  }
+
   async listProjectPrefsForUser(userID) {
     const result = await this.db.prepare(`
       SELECT * FROM project_prefs WHERE user_id = ?
@@ -1021,6 +1116,7 @@ export class SQLNexusStore {
       this.db.prepare(`DELETE FROM session_turns WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
       this.db.prepare(`DELETE FROM sessions WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
       this.db.prepare(`DELETE FROM session_prefs WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
+      this.db.prepare(`DELETE FROM session_open_hints WHERE user_id = ? AND device_id = ? AND session_id = ?`).bind(userID, deviceID, sessionID),
     ]);
   }
 
@@ -1034,6 +1130,11 @@ export class SQLNexusStore {
         timestamp = excluded.timestamp,
         payload = excluded.payload,
         updated_at = excluded.updated_at
+      WHERE
+        session_turns.agent IS DISTINCT FROM excluded.agent OR
+        session_turns.kind IS DISTINCT FROM excluded.kind OR
+        session_turns.timestamp IS DISTINCT FROM excluded.timestamp OR
+        session_turns.payload IS DISTINCT FROM excluded.payload
     `).bind(
       turn.user_id,
       turn.device_id,
@@ -1071,6 +1172,76 @@ export class SQLNexusStore {
       ORDER BY seq ASC
     `).bind(userID, deviceID, sessionID).all();
     return result.results ?? [];
+  }
+
+  async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
+    const result = await this.db.prepare(`
+      SELECT * FROM session_turns
+      WHERE user_id = ? AND device_id = ? AND session_id = ? AND seq > ?
+      ORDER BY seq ASC
+      LIMIT ?
+    `).bind(userID, deviceID, sessionID, Number(afterSeq) || 0, clampLimit(limit, 100)).all();
+    return result.results ?? [];
+  }
+
+  async appendSessionEvent(event) {
+    const payload = typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload ?? {});
+    const eventIDValue = event.event_id || eventID();
+    await this.db.prepare(`
+      INSERT INTO session_events (event_id, user_id, device_id, session_id, request_id, event_type, payload, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      eventIDValue,
+      event.user_id,
+      event.device_id,
+      event.session_id,
+      event.request_id ?? null,
+      event.event_type,
+      payload,
+      event.created_at,
+    ).run();
+    await this.pruneSessionEventsIfDue(event.user_id);
+    return { ...event, event_id: eventIDValue, payload };
+  }
+
+  async listSessionEvents(userID, deviceID, sessionID, options = {}) {
+    const after = String(options.after ?? "");
+    const requestID = String(options.request_id ?? "");
+    const limit = clampLimit(options.limit, 100);
+    const result = requestID
+      ? await this.db.prepare(`
+          SELECT * FROM session_events
+          WHERE user_id = ? AND request_id = ? AND event_id > ?
+          ORDER BY event_id ASC
+          LIMIT ?
+        `).bind(userID, requestID, after, limit).all()
+      : await this.db.prepare(`
+          SELECT * FROM session_events
+          WHERE user_id = ? AND device_id = ? AND session_id = ? AND event_id > ?
+          ORDER BY event_id ASC
+          LIMIT ?
+        `).bind(userID, deviceID, sessionID, after, limit).all();
+    return result.results ?? [];
+  }
+
+  async pruneSessionEvents(userID) {
+    await this.db.prepare(`
+      DELETE FROM session_events
+      WHERE user_id = ?
+        AND event_id NOT IN (
+          SELECT event_id FROM session_events
+          WHERE user_id = ?
+          ORDER BY event_id DESC
+          LIMIT 5000
+        )
+    `).bind(userID, userID).run();
+  }
+
+  async pruneSessionEventsIfDue(userID, now = Date.now()) {
+    const last = this.sessionEventPruneByUser.get(userID) ?? 0;
+    if (now - last < 60_000) return;
+    this.sessionEventPruneByUser.set(userID, now);
+    await this.pruneSessionEvents(userID);
   }
 
   async upsertPushSubscription(subscription) {
@@ -1180,6 +1351,20 @@ function bindingKey(daemonDeviceID, browserDeviceID) {
 
 function turnKey(userID, deviceID, sessionID, seq) {
   return `${sessionKey(userID, deviceID, sessionID)}\x00${seq}`;
+}
+
+function eventID() {
+	const millis = String(Date.now()).padStart(13, "0");
+	nextEventCounter = (nextEventCounter + 1) % 1_000_000;
+	const suffix = String(nextEventCounter).padStart(6, "0");
+	const random = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+	return `ev_${millis}_${suffix}_${random}`;
+}
+
+function clampLimit(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(500, Math.max(1, Math.floor(parsed)));
 }
 
 function normalizeDeviceRow(row) {

@@ -117,6 +117,10 @@ type Session struct {
 	// Timestamp is best-effort: claude jsonl filenames are pure UUIDs,
 	// but the indexer upgrades it to the latest seen block timestamp.
 	Timestamp string `json:"timestamp,omitempty"`
+	// TurnCount is the number of renderer blocks currently present in the
+	// local session file. Catalog sync uses this as metadata only; turn
+	// payloads stay on disk until a window sync uploads them.
+	TurnCount int `json:"turn_count,omitempty"`
 	// Snippet is a short preview string for the list view, usually the
 	// first user message in the session.
 	Snippet string `json:"snippet,omitempty"`

@@ -1037,7 +1037,8 @@ func runServe(args []string) (err error) {
 						log.Printf("remote access heartbeat failed: %v", err)
 					}
 				}
-				go startNexusSyncLoop(ctx, pair.NewClient(baseURL), id, idx, *syncInterval, profile)
+				pushedHints := newPushedHintStore()
+				go startNexusSyncLoop(ctx, pair.NewClient(baseURL), id, idx, *syncInterval, profile, pushedHints)
 				// updateHandler bridges incoming control-WS update_request
 				// messages from Nexus to the local PerformUpdate
 				// function. We define it here so main has cmd-package
@@ -1142,9 +1143,12 @@ func runServe(args []string) (err error) {
 						AgentSettings:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						AgentDefaults:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						GitDiff:           agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
-						SessionDelete:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
-						Reveal:            agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
-						SDKDriver:         sdkDriverAdapter{manager: sdkManager, settings: agentSettingsStore},
+						SyncHint: func(hint control.SyncHintPush) {
+							pushedHints.Add(hint.SessionID, hint.Reason, hint.PreferredMin, time.Now())
+						},
+						SessionDelete: agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
+						Reveal:        agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
+						SDKDriver:     sdkDriverAdapter{manager: sdkManager, settings: agentSettingsStore},
 					}); err != nil {
 						log.Printf("Nexus control stopped: %v", err)
 					}
@@ -2232,11 +2236,18 @@ func terminalQRMode() string {
 	}
 }
 
-func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, syncInterval time.Duration, profile runner.Profile) {
+func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, syncInterval time.Duration, profile runner.Profile, pushedHints *pushedHintStore) {
 	var lastSyncSuccessTelemetry time.Time
 	var lastLoggedAt time.Time
 	lastLoggedSessions := -1 // sentinel: first sync always logs
-	lastPlaintextSync := map[string]string{}
+	lastCatalogSyncSignature := ""
+	lastHistorySync := map[string]string{}
+	hintCache := &syncHintCache{}
+	catalogMinInterval := catalogSyncMinInterval()
+	windowMinInterval := windowSyncMinInterval()
+	var lastCatalogPushAt time.Time
+	lastCatalogMembership := ""
+	lastWindowPushAt := map[string]time.Time{}
 	runSync := func() {
 		if err := idx.Refresh(); err != nil {
 			log.Printf("Nexus sync refresh index: %v", err)
@@ -2250,39 +2261,55 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "snapshot_failed"})
 			return
 		}
-		// Every catalog sync is the complete, authoritative list of sessions
-		// this daemon knows about. By the time this loop runs, idx has
-		// completed at least one Refresh() (StartBackgroundRefresh blocks on
-		// it). Setting FullReconcile=true lets Nexus GC sessions the user
-		// has deleted on disk — without this, the Nexus session list grows
-		// monotonically and a deleted .jsonl shows as a ghost forever.
+		// When the catalog fits the sync body budget, it is the complete,
+		// authoritative list of sessions this daemon knows about. By the time this
+		// loop runs, idx has completed at least one Refresh()
+		// (StartBackgroundRefresh blocks on it). FullReconcile lets Nexus GC
+		// sessions the user has deleted on disk.
 		//
-		// Per-session syncs (syncChangedPlaintextNexusSessions below) MUST
+		// If the catalog is byte-capped, it is only the newest subset. Do not set
+		// FullReconcile in that case or Nexus would delete the older sessions from
+		// the web catalog instead of keeping their metadata-only entries.
+		//
+		// Per-session syncs (syncChangedNexusSessions below) MUST
 		// NOT set this flag — they intentionally carry one session + its
 		// turns, not the catalog.
-		req.FullReconcile = true
-		res, err := client.SyncHistory(id, req)
-		if err != nil {
-			log.Printf("Nexus sync push: %v", err)
-			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "push_failed"})
-			return
+		req.FullReconcile = req.CatalogComplete
+		signature := catalogSyncSignature(req)
+		membership := catalogMembershipSignature(req.Sessions)
+		now := time.Now()
+		if (signature == "" || signature != lastCatalogSyncSignature) &&
+			shouldPushCatalog(now, lastCatalogPushAt, catalogMinInterval, membership != lastCatalogMembership) {
+			res, err := client.SyncHistory(id, req)
+			if err != nil {
+				log.Printf("Nexus sync push: %v", err)
+				telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_failed", Command: "serve", Status: "error", ErrorCode: "push_failed"})
+				return
+			}
+			lastCatalogSyncSignature = signature
+			lastCatalogMembership = membership
+			lastCatalogPushAt = now
+			// Dedup the success line. The heartbeat ticker fires constantly;
+			// logging every tick buries real signal. Only log when something
+			// changed (new turns pushed or session count differs from the
+			// previous push), or once every 5 minutes as a still-alive line.
+			if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || time.Since(lastLoggedAt) > 5*time.Minute {
+				log.Printf("Nexus sync ok: sessions=%d turns=%d device=%s", res.SessionCount, res.TurnCount, res.DaemonDevice)
+				lastLoggedSessions = res.SessionCount
+				lastLoggedAt = time.Now()
+			}
 		}
-		// Dedup the success line. The heartbeat ticker fires constantly;
-		// logging every tick buries real signal. Only log when something
-		// changed (new turns pushed or session count differs from the
-		// previous push), or once every 5 minutes as a still-alive line.
-		if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || time.Since(lastLoggedAt) > 5*time.Minute {
-			log.Printf("Nexus sync ok: sessions=%d turns=%d device=%s", res.SessionCount, res.TurnCount, res.DaemonDevice)
-			lastLoggedSessions = res.SessionCount
-			lastLoggedAt = time.Now()
-		}
-		// Push full plaintext history for changed sessions. The catalog
-		// above only carries metadata + snippets; this fills in the turns
-		// the web reader needs.
-		if syncedSessions, syncedTurns := syncChangedPlaintextNexusSessions(ctx, client, id, idx, req.Sessions, lastPlaintextSync, profile); syncedSessions > 0 || syncedTurns > 0 {
+		// Push the default lazy window for changed recent sessions. The
+		// catalog above carries metadata + snippets for every session; this
+		// only uploads the bounded turn window the web reader needs by
+		// default. Older windows are pulled through explicit lazy backfill.
+		historyCandidates := historySyncCatalogSessions(idx, profile, req)
+		if syncedSessions, syncedTurns := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, profile, hintCache, pushedHints, lastWindowPushAt, windowMinInterval); syncedSessions > 0 || syncedTurns > 0 {
 			log.Printf("Nexus history sync ok: sessions=%d turns=%d device=%s", syncedSessions, syncedTurns, id.DeviceID)
 		}
-		if time.Since(lastSyncSuccessTelemetry) > 10*time.Minute {
+		// Success telemetry is a liveness signal, not metrics: every 30 minutes
+		// keeps a day of fleet data at 48 events/daemon instead of 144.
+		if time.Since(lastSyncSuccessTelemetry) > 30*time.Minute {
 			lastSyncSuccessTelemetry = time.Now()
 			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_completed", Command: "serve", Status: "ok"})
 		}
@@ -2307,10 +2334,183 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 	}
 }
 
-const maxNexusHistorySessionsPerTick = 8
+func historySyncCatalogSessions(idx *index.Index, profile runner.Profile, catalogReq pair.SyncRequest) []pair.SyncSession {
+	if catalogReq.CatalogComplete {
+		return catalogReq.Sessions
+	}
+	return relay.BuildCatalogSyncSessions(idx, profile)
+}
 
-func syncChangedPlaintextNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastPlaintextSync map[string]string, profile runner.Profile) (int, int) {
-	candidates := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick)
+const (
+	defaultSyncWindowDays          = 7
+	defaultInitialTurnLimit        = 20
+	defaultPriorityTurnLimit       = 100
+	activeSessionWindow            = 10 * time.Minute
+	maxNexusHistorySessionsPerTick = 8
+)
+
+type nexusSyncPolicy struct {
+	SyncWindowDays    int
+	InitialTurnLimit  int
+	PriorityTurnLimit int
+}
+
+func defaultNexusSyncPolicy() nexusSyncPolicy {
+	return nexusSyncPolicy{
+		SyncWindowDays:    envInt("POCKLY_SYNC_WINDOW_DAYS", defaultSyncWindowDays, 0, 3650),
+		InitialTurnLimit:  envInt("POCKLY_INITIAL_TURN_LIMIT", defaultInitialTurnLimit, 1, 100),
+		PriorityTurnLimit: envInt("POCKLY_PRIORITY_TURN_LIMIT", defaultPriorityTurnLimit, 1, 100),
+	}
+}
+
+type syncHint struct {
+	Reason       string
+	PreferredMin int
+}
+
+type syncHintCache struct {
+	updatedAt time.Time
+	hints     map[string]syncHint
+}
+
+const (
+	// pushedHintTTL mirrors the server's recently-opened window: a pushed
+	// hint keeps its session in the priority set for as long as the server
+	// would have reported it via the (optional) hint poll.
+	pushedHintTTL = 24 * time.Hour
+	// pushedHintFreshFor is how long after a push the hinted session may
+	// bypass the window-sync floor, so an opened session backfills
+	// immediately instead of waiting out the rate limit.
+	pushedHintFreshFor   = 2 * time.Minute
+	pushedHintMaxEntries = 50
+)
+
+// pushedHintStore holds Nexus-pushed SYNC_HINT notices delivered over the
+// control WS. Pushing replaces hint polling as the default transport: the
+// hint arrives the moment the web opens a session, at zero request cost.
+// Written from the control read loop, read from the sync loop.
+type pushedHintStore struct {
+	mu      sync.Mutex
+	entries map[string]pushedHintEntry
+}
+
+type pushedHintEntry struct {
+	hint     syncHint
+	pushedAt time.Time
+}
+
+func newPushedHintStore() *pushedHintStore {
+	return &pushedHintStore{entries: map[string]pushedHintEntry{}}
+}
+
+func (s *pushedHintStore) Add(sessionID, reason string, preferredMin int, now time.Time) {
+	if s == nil {
+		return
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now)
+	if _, exists := s.entries[sessionID]; !exists && len(s.entries) >= pushedHintMaxEntries {
+		oldestID := ""
+		var oldestAt time.Time
+		for id, entry := range s.entries {
+			if oldestID == "" || entry.pushedAt.Before(oldestAt) {
+				oldestID = id
+				oldestAt = entry.pushedAt
+			}
+		}
+		delete(s.entries, oldestID)
+	}
+	s.entries[sessionID] = pushedHintEntry{
+		hint:     syncHint{Reason: reason, PreferredMin: preferredMin},
+		pushedAt: now,
+	}
+}
+
+func (s *pushedHintStore) Snapshot(now time.Time) map[string]syncHint {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now)
+	if len(s.entries) == 0 {
+		return nil
+	}
+	out := make(map[string]syncHint, len(s.entries))
+	for id, entry := range s.entries {
+		out[id] = entry.hint
+	}
+	return out
+}
+
+func (s *pushedHintStore) PushedWithin(sessionID string, now time.Time, window time.Duration) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[sessionID]
+	return ok && now.Sub(entry.pushedAt) <= window
+}
+
+func (s *pushedHintStore) pruneLocked(now time.Time) {
+	for id, entry := range s.entries {
+		if now.Sub(entry.pushedAt) > pushedHintTTL {
+			delete(s.entries, id)
+		}
+	}
+}
+
+// shouldPushCatalog rate-limits catalog pushes. During an active turn the
+// catalog signature changes on every new agent block, but the web only
+// refreshes its catalog every ~60s — pushing more often is pure request
+// spend. Membership changes (session added/deleted) push immediately so the
+// sidebar and Nexus GC stay correct.
+func shouldPushCatalog(now, lastPush time.Time, minInterval time.Duration, membershipChanged bool) bool {
+	if membershipChanged || lastPush.IsZero() || minInterval <= 0 {
+		return true
+	}
+	return now.Sub(lastPush) >= minInterval
+}
+
+// shouldPushWindow rate-limits per-session window builds and pushes. A fresh
+// Nexus hint (the user just opened the session) bypasses the floor so the
+// backfill lands immediately; live-reader updates flow through the control
+// event stream, not this durable path.
+func shouldPushWindow(now, lastPush time.Time, minInterval time.Duration, freshlyHinted bool) bool {
+	if freshlyHinted || lastPush.IsZero() || minInterval <= 0 {
+		return true
+	}
+	return now.Sub(lastPush) >= minInterval
+}
+
+func catalogMembershipSignature(sessions []pair.SyncSession) string {
+	ids := make([]string, 0, len(sessions))
+	for _, session := range sessions {
+		ids = append(ids, session.SessionID)
+	}
+	sort.Strings(ids)
+	return strings.Join(ids, "\x00")
+}
+
+func catalogSyncMinInterval() time.Duration {
+	return envDuration("POCKLY_CATALOG_SYNC_MIN_INTERVAL", 60*time.Second, 0, 24*time.Hour)
+}
+
+func windowSyncMinInterval() time.Duration {
+	return envDuration("POCKLY_WINDOW_SYNC_MIN_INTERVAL", 15*time.Second, 0, time.Hour)
+}
+
+func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hintCache *syncHintCache, pushedHints *pushedHintStore, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) (int, int) {
+	policy := defaultNexusSyncPolicy()
+	hints := nexusSyncHints(ctx, client, id, hintCache, pushedHints)
+	now := time.Now()
+	candidates := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now)
 	if len(candidates) == 0 {
 		return 0, 0
 	}
@@ -2321,17 +2521,28 @@ func syncChangedPlaintextNexusSessions(ctx context.Context, client *pair.Client,
 		if err := ctx.Err(); err != nil {
 			return syncedSessions, syncedTurns
 		}
-		req, err := relay.BuildSingleSessionSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, nil)
+		if !shouldPushWindow(now, lastWindowPushAt[session.SessionID], windowMinInterval, pushedHints.PushedWithin(session.SessionID, now, pushedHintFreshFor)) {
+			continue
+		}
+		limit := policy.InitialTurnLimit
+		if hint, ok := hints[session.SessionID]; ok {
+			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
+		} else if sessionActiveWithin(session, now, activeSessionWindow) {
+			limit = maxInt(limit, policy.PriorityTurnLimit)
+		}
+		req, err := relay.BuildSingleSessionWindowSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, relay.SessionWindow{Limit: limit}, nil)
 		if err != nil {
 			log.Printf("Nexus history sync snapshot session=%s: %v", session.SessionID, err)
 			continue
 		}
 		if len(req.Turns) == 0 {
-			lastPlaintextSync[session.SessionID] = historySyncSignature(req)
+			lastHistorySync[session.SessionID] = historySyncSignature(req)
+			lastWindowPushAt[session.SessionID] = now
 			continue
 		}
 		signature := historySyncSignature(req)
-		if signature == "" || lastPlaintextSync[session.SessionID] == signature {
+		if signature == "" || lastHistorySync[session.SessionID] == signature {
+			lastWindowPushAt[session.SessionID] = now
 			continue
 		}
 		res, err := client.SyncHistoryContext(ctx, id, req)
@@ -2339,22 +2550,92 @@ func syncChangedPlaintextNexusSessions(ctx context.Context, client *pair.Client,
 			log.Printf("Nexus history sync push session=%s: %v", session.SessionID, err)
 			continue
 		}
-		lastPlaintextSync[session.SessionID] = signature
+		lastHistorySync[session.SessionID] = signature
+		lastWindowPushAt[session.SessionID] = now
 		syncedSessions += res.SessionCount
 		syncedTurns += res.TurnCount
 	}
 	return syncedSessions, syncedTurns
 }
 
-func recentNexusSessions(sessions []pair.SyncSession, max int) []pair.SyncSession {
+func nexusSyncHints(ctx context.Context, client *pair.Client, id device.Identity, cache *syncHintCache, pushed *pushedHintStore) map[string]syncHint {
+	pushedHints := pushed.Snapshot(time.Now())
+	polled := polledNexusSyncHints(ctx, client, id, cache)
+	if len(pushedHints) == 0 {
+		return polled
+	}
+	merged := make(map[string]syncHint, len(polled)+len(pushedHints))
+	for sessionID, hint := range polled {
+		merged[sessionID] = hint
+	}
+	// Pushed hints win: they are fresher than any poll snapshot.
+	for sessionID, hint := range pushedHints {
+		merged[sessionID] = hint
+	}
+	return merged
+}
+
+func polledNexusSyncHints(ctx context.Context, client *pair.Client, id device.Identity, cache *syncHintCache) map[string]syncHint {
+	interval := syncHintsPollInterval()
+	if interval <= 0 {
+		return nil
+	}
+	if cache != nil && cache.hints != nil && time.Since(cache.updatedAt) < interval {
+		return cache.hints
+	}
+	res, err := client.SyncHintsContext(ctx, id)
+	if err != nil {
+		log.Printf("Nexus sync hints skipped: %v", err)
+		if cache != nil && cache.hints != nil {
+			return cache.hints
+		}
+		if cache != nil {
+			cache.updatedAt = time.Now()
+			cache.hints = map[string]syncHint{}
+		}
+		return nil
+	}
+	hints := make(map[string]syncHint, len(res.Sessions))
+	for _, entry := range res.Sessions {
+		sessionID := strings.TrimSpace(entry.SessionID)
+		if sessionID == "" {
+			continue
+		}
+		hints[sessionID] = syncHint{
+			Reason:       entry.Reason,
+			PreferredMin: entry.PreferredMin,
+		}
+	}
+	if cache != nil {
+		cache.updatedAt = time.Now()
+		cache.hints = hints
+	}
+	return hints
+}
+
+func syncHintsPollInterval() time.Duration {
+	return envDuration("POCKLY_SYNC_HINTS_POLL_INTERVAL", 0, 0, 24*time.Hour)
+}
+
+func recentNexusSessions(sessions []pair.SyncSession, max int, policy nexusSyncPolicy, hints map[string]syncHint, now time.Time) []pair.SyncSession {
 	candidates := make([]pair.SyncSession, 0, len(sessions))
+	cutoff := syncWindowCutoff(now, policy.SyncWindowDays)
 	for _, session := range sessions {
 		if session.SessionID == "" {
+			continue
+		}
+		priority := sessionSyncPriority(session, hints, now)
+		if !priority && !sessionWithinSyncWindow(session, cutoff) {
 			continue
 		}
 		candidates = append(candidates, session)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
+		priorityI := sessionSyncPriority(candidates[i], hints, now)
+		priorityJ := sessionSyncPriority(candidates[j], hints, now)
+		if priorityI != priorityJ {
+			return priorityI
+		}
 		if candidates[i].LastTimestamp == candidates[j].LastTimestamp {
 			return candidates[i].SessionID > candidates[j].SessionID
 		}
@@ -2364,6 +2645,108 @@ func recentNexusSessions(sessions []pair.SyncSession, max int) []pair.SyncSessio
 		return candidates[:max]
 	}
 	return candidates
+}
+
+func sessionSyncPriority(session pair.SyncSession, hints map[string]syncHint, now time.Time) bool {
+	if _, ok := hints[session.SessionID]; ok {
+		return true
+	}
+	return sessionActiveWithin(session, now, activeSessionWindow)
+}
+
+func maxInt(values ...int) int {
+	out := 0
+	for _, value := range values {
+		if value > out {
+			out = value
+		}
+	}
+	return out
+}
+
+func syncWindowCutoff(now time.Time, days int) time.Time {
+	if days <= 0 {
+		return time.Time{}
+	}
+	return now.UTC().Add(-time.Duration(days) * 24 * time.Hour)
+}
+
+func sessionWithinSyncWindow(session pair.SyncSession, cutoff time.Time) bool {
+	if cutoff.IsZero() {
+		return true
+	}
+	ts := strings.TrimSpace(firstNonEmptyString(session.ChannelLastSeenAt, session.LastTimestamp))
+	if ts == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		if fallback, fallbackErr := time.Parse(time.RFC3339, ts); fallbackErr == nil {
+			parsed = fallback
+		} else {
+			return false
+		}
+	}
+	return !parsed.UTC().Before(cutoff)
+}
+
+func sessionActiveWithin(session pair.SyncSession, now time.Time, window time.Duration) bool {
+	if window <= 0 {
+		return false
+	}
+	ts := strings.TrimSpace(firstNonEmptyString(session.ChannelLastSeenAt, session.LastTimestamp))
+	if ts == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		if fallback, fallbackErr := time.Parse(time.RFC3339, ts); fallbackErr == nil {
+			parsed = fallback
+		} else {
+			return false
+		}
+	}
+	return !parsed.UTC().Before(now.UTC().Add(-window))
+}
+
+func envInt(name string, fallback, min, max int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	if value < min {
+		return fallback
+	}
+	if max > 0 && value > max {
+		return max
+	}
+	return value
+}
+
+func envDuration(name string, fallback, min, max time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := time.ParseDuration(raw)
+	if err != nil {
+		seconds, convErr := strconv.Atoi(raw)
+		if convErr != nil {
+			return fallback
+		}
+		value = time.Duration(seconds) * time.Second
+	}
+	if value < min {
+		return fallback
+	}
+	if max > 0 && value > max {
+		return max
+	}
+	return value
 }
 
 // defaultAgent supplies the conventional agent string for external terminal
@@ -2386,6 +2769,29 @@ func nexusSessionSyncSignature(session pair.SyncSession) string {
 		session.LastTimestamp,
 		session.ChannelLastSeenAt,
 	}, "\x00")
+}
+
+func catalogSyncSignature(req pair.SyncRequest) string {
+	if len(req.Sessions) == 0 {
+		return fmt.Sprintf("full=%t", req.FullReconcile)
+	}
+	parts := []string{
+		fmt.Sprintf("full=%t", req.FullReconcile),
+		strconv.Itoa(len(req.Sessions)),
+	}
+	for _, session := range req.Sessions {
+		parts = append(parts,
+			session.SessionID,
+			nexusSessionSyncSignature(session),
+			session.Title,
+			session.Snippet,
+			session.FirstMessage,
+			strconv.Itoa(session.LastSeq),
+			strconv.Itoa(session.TurnCount),
+			session.SyncState,
+		)
+	}
+	return strings.Join(parts, "\x00")
 }
 
 func historySyncSignature(req pair.SyncRequest) string {

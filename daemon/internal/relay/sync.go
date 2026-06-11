@@ -10,6 +10,7 @@ import (
 	"log"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/PocklyApp/Pockly/daemon/internal/agent"
 	"github.com/PocklyApp/Pockly/daemon/internal/agent/claude"
@@ -27,11 +28,9 @@ import (
 //
 // We keep the JSON body comfortably under 1 MiB. Sessions are emitted
 // most-recent-first, so when the budget is hit the OLDEST sessions are
-// the ones dropped from this snapshot. Because catalog syncs set
-// FullReconcile=true, Nexus drops those overflow sessions from its
-// catalog too — bounded and stable (the same recent set re-syncs each
-// tick; no thrash). Old sessions still live on disk and remain openable
-// via single-session sync if navigated to directly.
+// the ones dropped from this snapshot. A capped catalog is not an
+// authoritative deletion list, so callers must not set FullReconcile when
+// CatalogComplete is false.
 const catalogSyncMaxBytes = 900_000
 
 // catalogSyncBaseOverheadBytes is a conservative estimate of the JSON
@@ -56,15 +55,12 @@ func BuildSyncRequest(idx *index.Index, daemonDeviceID string, profile runner.Pr
 	return BuildCatalogSyncRequest(idx, daemonDeviceID, profile)
 }
 
-func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile runner.Profile) (pair.SyncRequest, error) {
+// BuildCatalogSyncSessions returns the complete, globally-recency-sorted
+// session metadata snapshot. BuildCatalogSyncRequest may byte-cap the HTTP
+// payload, but daemon-side lazy backfill still needs the full local list so a
+// Nexus sync hint for an older opened session can be honored.
+func BuildCatalogSyncSessions(idx *index.Index, profile runner.Profile) []pair.SyncSession {
 	projects := idx.Projects()
-	req := pair.SyncRequest{
-		Hello: pair.HelloMessage{
-			DeviceID: daemonDeviceID,
-			Version:  version.String(),
-		},
-	}
-
 	// Flatten (project, session) across all supported agent projects.
 	// idx.Projects() orders projects by cwd and sessions within a project by
 	// recency, but NOT globally by recency — so to keep the most recent
@@ -91,36 +87,53 @@ func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile ru
 		return entries[i].session.Timestamp > entries[j].session.Timestamp
 	})
 
-	// Emit most-recent-first, accumulating an estimate of the marshaled
-	// body size. Stop before crossing catalogSyncMaxBytes so the POST stays
-	// under nginx's body limit. Sessions past the cap are the oldest, so
-	// dropping them costs the least.
-	approxBytes := catalogSyncBaseOverheadBytes
-	totalEligible := len(entries)
-	emitted := 0
+	sessions := make([]pair.SyncSession, 0, len(entries))
 	for _, entry := range entries {
 		session := entry.session
-		// The first user message rides along as a server-stored sidebar
-		// snippet. Nexus stores SyncSession.Snippet directly.
-		ss := pair.SyncSession{
+		title := firstNonEmpty(session.FirstMessageForTitle, session.FirstMessage, session.Snippet)
+		snippet := firstNonEmpty(session.FirstMessage, session.Snippet, title)
+		sessions = append(sessions, pair.SyncSession{
 			SessionID:         session.SessionID,
 			Agent:             entry.agentName,
 			RunnerAlias:       profile.AliasFor(entry.agentName),
 			Cwd:               safeCwdLabel(entry.cwd),
-			Snippet:           firstNonEmpty(session.FirstMessage, session.Snippet),
+			Title:             title,
+			Snippet:           snippet,
 			FirstMessage:      session.FirstMessageForTitle,
 			LastSeq:           0,
 			LastTimestamp:     session.Timestamp,
 			ChannelLastSeenAt: session.Timestamp,
 			SyncState:         "catalog_only",
-			TurnCount:         0,
-		}
+			TurnCount:         session.TurnCount,
+		})
+	}
+	return sessions
+}
 
+func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile runner.Profile) (pair.SyncRequest, error) {
+	req := pair.SyncRequest{
+		Hello: pair.HelloMessage{
+			DeviceID: daemonDeviceID,
+			Version:  version.String(),
+		},
+		CatalogComplete: true,
+	}
+
+	// Emit most-recent-first, accumulating an estimate of the marshaled
+	// body size. Stop before crossing catalogSyncMaxBytes so the POST stays
+	// under nginx's body limit. Sessions past the cap are the oldest, so
+	// dropping them costs the least.
+	sessions := BuildCatalogSyncSessions(idx, profile)
+	approxBytes := catalogSyncBaseOverheadBytes
+	totalEligible := len(sessions)
+	emitted := 0
+	for _, ss := range sessions {
 		// Always emit at least one session so a single oversized entry can't
 		// produce an empty catalog (it would still 413, but Nexus would at
 		// least see one session rather than reconcile to zero).
 		unitBytes := approxJSONLen(ss)
 		if emitted > 0 && approxBytes+unitBytes > catalogSyncMaxBytes {
+			req.CatalogComplete = false
 			break
 		}
 		approxBytes += unitBytes
@@ -215,12 +228,14 @@ func BuildSingleSessionWindowSyncRequestContext(ctx context.Context, idx *index.
 	if hasOlder || minSeq > 1 {
 		syncState = "partial"
 	}
+	title := firstNonEmpty(firstUserMessageTitle(data.Blocks), safeSessionTitle(ref.Agent, firstNonEmpty(data.Cwd, ref.Cwd), sessionID))
 	req.Sessions = append(req.Sessions, pair.SyncSession{
 		SessionID:         sessionID,
 		Agent:             ref.Agent,
 		RunnerAlias:       profile.AliasFor(ref.Agent),
 		Cwd:               safeCwdLabel(firstNonEmpty(data.Cwd, ref.Cwd)),
-		Snippet:           safeSessionTitle(ref.Agent, firstNonEmpty(data.Cwd, ref.Cwd), sessionID),
+		Title:             title,
+		Snippet:           title,
 		LastSeq:           totalCount,
 		LastTimestamp:     lastBlockTimestamp(data.Blocks, ""),
 		ChannelLastSeenAt: lastBlockTimestamp(data.Blocks, ""),
@@ -301,6 +316,17 @@ func safeSessionTitle(agentName, cwd, sessionID string) string {
 		shortID = shortID[:8]
 	}
 	return fmt.Sprintf("%s · %s · %s", project, agentLabel, shortID)
+}
+
+func firstUserMessageTitle(blocks []agent.Block) string {
+	for _, block := range blocks {
+		if block.Kind == agent.BlockUserMessage {
+			if text := strings.TrimSpace(block.Text); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 func firstNonEmpty(values ...string) string {

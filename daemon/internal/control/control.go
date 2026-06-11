@@ -120,12 +120,15 @@ type TerminalEvent struct {
 	RequestID         string    `json:"request_id,omitempty"`
 	TerminalSessionID string    `json:"terminal_session_id"`
 	Seq               int64     `json:"seq,omitempty"`
+	SeqStart          int64     `json:"seq_start,omitempty"`
+	SeqEnd            int64     `json:"seq_end,omitempty"`
 	Kind              string    `json:"kind"`
 	SessionStatus     string    `json:"session_status,omitempty"`
 	TurnStatus        string    `json:"turn_status,omitempty"`
 	Payload           string    `json:"payload,omitempty"`
 	Error             string    `json:"error,omitempty"`
 	Timestamp         time.Time `json:"timestamp,omitempty"`
+	Truncated         bool      `json:"truncated,omitempty"`
 	// Populated by daemon when it spontaneously creates a terminal session
 	// for an inject (no preceding TERMINAL_CREATE from Nexus). Nexus
 	// uses these to upsert a terminal_sessions row so subsequent
@@ -405,6 +408,21 @@ type PermissionDecider interface {
 	Decide(requestID, decision string) error
 }
 
+// SyncHintPush is a Nexus→daemon notice that a session should be prioritized
+// for lazy window sync (the user just opened it in the web reader). It rides
+// the already-open control WS — outgoing WebSocket messages are free on the
+// managed runtime, so pushed hints replace hint polling as the default
+// transport.
+type SyncHintPush struct {
+	SessionID    string `json:"session_id"`
+	Reason       string `json:"reason,omitempty"`
+	PreferredMin int    `json:"preferred_min,omitempty"`
+}
+
+// SyncHintHandler receives Nexus-pushed sync hints. Implementations must be
+// fast and non-blocking — it is called from the control WS read loop.
+type SyncHintHandler func(SyncHintPush)
+
 type envelope struct {
 	Type            string              `json:"type"`
 	DeviceID        string              `json:"device_id,omitempty"`
@@ -415,6 +433,7 @@ type envelope struct {
 	SyncEvent       *SyncSessionEvent   `json:"sync_event,omitempty"`
 	Terminal        *TerminalRequest    `json:"terminal_request,omitempty"`
 	TerminalEvent   *TerminalEvent      `json:"terminal_event,omitempty"`
+	SyncHint        *SyncHintPush       `json:"sync_hint,omitempty"`
 	ListDirRequest  *ListDirRequest     `json:"list_dir_request,omitempty"`
 	ListDirResponse *ListDirResponse    `json:"list_dir_response,omitempty"`
 	UpdateRequest   *UpdateRequest      `json:"update_request,omitempty"`
@@ -473,6 +492,10 @@ type Client struct {
 	// GitDiff answers GIT_DIFF_GET by running `git diff` in the session's
 	// working tree. nil disables the precise-diff surface.
 	GitDiff GitDiffHandler
+	// SyncHint receives Nexus-pushed lazy-sync priority hints (the user
+	// opened a session in the web). nil = hints only arrive through the
+	// optional HTTP poll (POCKLY_SYNC_HINTS_POLL_INTERVAL).
+	SyncHint SyncHintHandler
 	// SessionDelete answers SESSION_DELETE by removing the session's local
 	// transcript file(s). nil disables the surface.
 	SessionDelete SessionDeleteHandler
@@ -509,12 +532,13 @@ type StartTaskAgentOptions struct {
 }
 
 type runner struct {
-	mu             sync.Mutex
-	active         map[string]context.CancelFunc
-	terminal       *liveterminal.Manager
-	terminalEvents chan TerminalEvent
-	sdkDriver      SDKDriverEnsurer
-	codexTerminals map[string]*codexProcessTerminal
+	mu                  sync.Mutex
+	active              map[string]context.CancelFunc
+	terminal            *liveterminal.Manager
+	terminalEvents      chan TerminalEvent
+	sdkDriver           SDKDriverEnsurer
+	codexTerminals      map[string]*codexProcessTerminal
+	terminalSubscribers map[string]int
 	// agentSettings is the same handler stored on Client; runStartTask
 	// uses it to record initial model/permission_mode after a PTY
 	// Create succeeds. Nil-safe — older builds that don't wire one
@@ -522,6 +546,13 @@ type runner struct {
 	// will then return empty values, same as before).
 	agentSettings AgentSettingsHandler
 }
+
+const (
+	terminalBatchFlushInterval = 200 * time.Millisecond
+	terminalBatchMaxBytes      = 16 * 1024
+	terminalBatchRingMaxBytes  = 1024 * 1024
+	terminalBatchRingMaxAge    = 5 * time.Minute
+)
 
 type codexProcessTerminal struct {
 	app       *codexapp.Client
@@ -535,12 +566,13 @@ func Run(ctx context.Context, cfg Client) error {
 		terminalManager = liveterminal.NewManager()
 	}
 	r := &runner{
-		active:         map[string]context.CancelFunc{},
-		terminal:       terminalManager,
-		terminalEvents: make(chan TerminalEvent, 1024),
-		sdkDriver:      cfg.SDKDriver,
-		codexTerminals: map[string]*codexProcessTerminal{},
-		agentSettings:  cfg.AgentSettings,
+		active:              map[string]context.CancelFunc{},
+		terminal:            terminalManager,
+		terminalEvents:      make(chan TerminalEvent, 1024),
+		sdkDriver:           cfg.SDKDriver,
+		codexTerminals:      map[string]*codexProcessTerminal{},
+		terminalSubscribers: map[string]int{},
+		agentSettings:       cfg.AgentSettings,
 	}
 	// Reconnect with a self-resetting exponential backoff. A flaky network or a
 	// TUN/HTTP proxy in front of the daemon will sever the long-lived control WS
@@ -579,8 +611,8 @@ const (
 	// drop. Small so a transient proxy cut on an otherwise-healthy connection is
 	// invisible to the user.
 	controlReconnectInitial = 500 * time.Millisecond
-	// controlReconnectMax caps the backoff so a prolonged outage (e.g. a deploy
-	// rolling the Worker) doesn't stretch reconnects out to minutes.
+	// controlReconnectMax caps the backoff so a prolonged outage or rolling
+	// deploy doesn't stretch reconnects out to minutes.
 	controlReconnectMax = 30 * time.Second
 	// controlReconnectStable is how long a connection must survive to be judged
 	// healthy; a drop after this resets the backoff to the initial delay.
@@ -634,9 +666,19 @@ var (
 	startTaskPostEvidenceDeathWindow = 2 * time.Second
 )
 
+// controlDataKeepaliveEnabled gates ordinary DAEMON_STATUS data keepalive
+// frames. It defaults off because protocol-level WebSocket ping is the normal
+// lightweight liveness path. Set POCKLY_CONTROL_DATA_KEEPALIVE=1 for
+// deployments whose proxy stack does not reliably forward protocol ping/pong
+// control frames.
+func controlDataKeepaliveEnabled() bool {
+	v := strings.TrimSpace(os.Getenv("POCKLY_CONTROL_DATA_KEEPALIVE"))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "on") || strings.EqualFold(v, "enabled")
+}
+
 // controlKeepalive pushes a DAEMON_STATUS over the control WS every interval so
-// an idle daemon (no live wrapped session emitting events) stays "online" at
-// Nexus instead of flapping to a perpetual yellow "connecting" dot.
+// an idle daemon (no live wrapped session emitting events) can stay "online" in
+// proxy stacks that don't reliably forward WS PING/PONG control frames.
 //
 // Why this is needed: Nexus closes the control WS after a 60s read
 // deadline without traffic, and it relies on WS PING/PONG control frames to
@@ -739,7 +781,7 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 	sendSync := func(evt SyncSessionEvent) {
 		_ = writeEnvelope(envelope{Type: "SYNC_SESSION_EVENT", SyncEvent: &evt})
 	}
-	sendTerminal := func(evt TerminalEvent) {
+	rawSendTerminal := func(evt TerminalEvent) {
 		// Surface write failures as local logs plus optional diagnostics so
 		// operators can distinguish stream gaps from agent output gaps.
 		if err := writeEnvelope(envelope{Type: "TERMINAL_EVENT", TerminalEvent: &evt}); err != nil {
@@ -756,15 +798,22 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 			})
 		}
 	}
+	terminalBatcher := newTerminalEventBatcher(rawSendTerminal, terminalBatchFlushInterval, terminalBatchMaxBytes, terminalBatchRingMaxBytes, terminalBatchRingMaxAge)
+	terminalBatcher.SetShouldSend(r.shouldForwardTerminalEvent)
+	defer terminalBatcher.Close()
+	sendTerminal := func(evt TerminalEvent) {
+		terminalBatcher.Add(evt)
+	}
 	done := make(chan struct{})
 	defer close(done)
 	// Detect a silently-dropped link. A TUN/HTTP proxy can vanish the TCP
 	// without a WS close frame, leaving ReadJSON blocked forever while the
 	// daemon believes it is still online (and Nexus has already dropped it).
 	// Require some inbound frame within controlReadWait; a received PONG (or any
-	// data) below pushes the deadline out. Cloudflare answers pings even while
-	// the Durable Object hibernates, and a TUN proxy tunnels control frames
-	// transparently, so a missing PONG means the link is genuinely gone.
+	// data) below pushes the deadline out. Runtimes with hibernated sockets can
+	// answer protocol pings without ordinary data frames, and a TUN proxy tunnels
+	// control frames transparently, so a missing PONG means the link is genuinely
+	// gone.
 	_ = conn.SetReadDeadline(time.Now().Add(controlReadWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(controlReadWait))
@@ -789,10 +838,13 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 			}
 		}
 	}()
-	// Keep an idle control WS alive through edge/proxy infrastructure (see
-	// controlKeepalive). A failed keepalive write closes the conn so the
-	// ReadJSON loop below unblocks and the outer loop reconnects.
-	go controlKeepalive(ctx, done, controlKeepaliveInterval, cfg.Identity.DeviceID, writeEnvelope, func() { _ = conn.Close() })
+	// Keep an idle control WS alive through edge/proxy infrastructure only
+	// when explicitly requested. The default path relies on WS protocol pings;
+	// ordinary DAEMON_STATUS data frames are a compatibility fallback for proxy
+	// stacks that drop or hide control frames.
+	if controlDataKeepaliveEnabled() {
+		go controlKeepalive(ctx, done, controlKeepaliveInterval, cfg.Identity.DeviceID, writeEnvelope, func() { _ = conn.Close() })
+	}
 	go func() {
 		for {
 			select {
@@ -839,6 +891,28 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 				continue
 			}
 			go r.handleTerminalCreate(ctx, cfg, *msg.Terminal)
+		case "TERMINAL_SUBSCRIBE":
+			if msg.Terminal == nil {
+				continue
+			}
+			if r.setTerminalSubscribed(msg.Terminal.TerminalSessionID, true) == 1 {
+				if snapshot, ok := terminalBatcher.SnapshotUndeliveredTerminal(msg.Terminal.TerminalSessionID); ok {
+					rawSendTerminal(snapshot)
+					terminalBatcher.MarkDelivered(snapshot)
+				}
+			}
+		case "TERMINAL_UNSUBSCRIBE":
+			if msg.Terminal == nil {
+				continue
+			}
+			if r.setTerminalSubscribed(msg.Terminal.TerminalSessionID, false) == 0 {
+				terminalBatcher.DropTerminal(msg.Terminal.TerminalSessionID)
+			}
+		case "SYNC_HINT":
+			if msg.SyncHint == nil || cfg.SyncHint == nil {
+				continue
+			}
+			cfg.SyncHint(*msg.SyncHint)
 		case "TERMINAL_INPUT":
 			if msg.Terminal == nil {
 				continue
@@ -1820,6 +1894,42 @@ func (r *runner) forwardTerminalEvent(evt TerminalEvent) {
 	case r.terminalEvents <- evt:
 	default:
 	}
+}
+
+func (r *runner) setTerminalSubscribed(terminalSessionID string, subscribed bool) int {
+	if strings.TrimSpace(terminalSessionID) == "" {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.terminalSubscribers == nil {
+		r.terminalSubscribers = map[string]int{}
+	}
+	count := r.terminalSubscribers[terminalSessionID]
+	if subscribed {
+		count++
+		r.terminalSubscribers[terminalSessionID] = count
+		return count
+	}
+	if count <= 1 {
+		delete(r.terminalSubscribers, terminalSessionID)
+		return 0
+	}
+	count--
+	r.terminalSubscribers[terminalSessionID] = count
+	return count
+}
+
+func (r *runner) shouldForwardTerminalEvent(evt TerminalEvent) bool {
+	if evt.Kind != string(liveterminal.EventTextDelta) {
+		return true
+	}
+	if strings.TrimSpace(evt.TerminalSessionID) == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.terminalSubscribers[evt.TerminalSessionID] > 0
 }
 
 func resolveTerminalCWD(cfg Client, req TerminalRequest) (string, error) {

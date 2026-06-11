@@ -5,6 +5,7 @@ package control
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -26,6 +27,225 @@ var testCtx = context.Background()
 // so start_task can emit session_created mid-flight; the resume tests
 // don't exercise that path but still need to satisfy the signature.
 func noopSend(InjectEvent) {}
+
+func TestTerminalEventBatcherMergesTextDeltas(t *testing.T) {
+	var sent []TerminalEvent
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 1024, 1024, time.Hour)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 1, Kind: "text_delta", Payload: "hel", Timestamp: time.Date(2026, 6, 6, 1, 0, 0, 0, time.UTC)})
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 2, Kind: "text_delta", Payload: "lo", Timestamp: time.Date(2026, 6, 6, 1, 0, 0, 200_000_000, time.UTC)})
+	if len(sent) != 0 {
+		t.Fatalf("batcher sent before flush: %d", len(sent))
+	}
+
+	batcher.FlushTerminal("ts_batch")
+	if len(sent) != 1 {
+		t.Fatalf("sent events = %d, want 1", len(sent))
+	}
+	if sent[0].Payload != "hello" {
+		t.Fatalf("payload = %q, want hello", sent[0].Payload)
+	}
+	if sent[0].SeqStart != 1 || sent[0].SeqEnd != 2 {
+		t.Fatalf("seq range = %d..%d, want 1..2", sent[0].SeqStart, sent[0].SeqEnd)
+	}
+	if sent[0].Truncated {
+		t.Fatal("first small batch should not be marked truncated")
+	}
+}
+
+func TestTerminalEventBatcherFlushesBeforeNonTextEvent(t *testing.T) {
+	var sent []TerminalEvent
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 1024, 1024, time.Hour)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 1, Kind: "text_delta", Payload: "pending"})
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Kind: "session_exited", SessionStatus: "exited"})
+
+	if len(sent) != 2 {
+		t.Fatalf("sent events = %d, want 2", len(sent))
+	}
+	if sent[0].Kind != "text_delta" || sent[0].Payload != "pending" {
+		t.Fatalf("first event = %#v, want pending text_delta", sent[0])
+	}
+	if sent[1].Kind != "session_exited" {
+		t.Fatalf("second event kind = %q, want session_exited", sent[1].Kind)
+	}
+}
+
+func TestTerminalEventBatcherFlushesAtMaxBytes(t *testing.T) {
+	var sent []TerminalEvent
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 8, 1024, time.Hour)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 1, Kind: "text_delta", Payload: "1234"})
+	if len(sent) != 0 {
+		t.Fatalf("sent events after first chunk = %d, want 0", len(sent))
+	}
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 2, Kind: "text_delta", Payload: "5678"})
+	if len(sent) != 1 {
+		t.Fatalf("sent events after max bytes = %d, want 1", len(sent))
+	}
+	if sent[0].Payload != "12345678" {
+		t.Fatalf("payload = %q, want 12345678", sent[0].Payload)
+	}
+}
+
+func TestTerminalEventBatcherMarksRingOverflowAsTruncated(t *testing.T) {
+	var sent []TerminalEvent
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 1024, 8, time.Hour)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 1, Kind: "text_delta", Payload: "12345"})
+	batcher.FlushTerminal("ts_batch")
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_batch", Seq: 2, Kind: "text_delta", Payload: "67890"})
+	batcher.FlushTerminal("ts_batch")
+
+	if len(sent) != 2 {
+		t.Fatalf("sent events = %d, want 2", len(sent))
+	}
+	if sent[0].Truncated {
+		t.Fatal("first batch should not be truncated")
+	}
+	if !sent[1].Truncated {
+		t.Fatal("second batch should be truncated after ring overflow")
+	}
+}
+
+func TestTerminalEventBatcherDropTerminalSealsPendingTextWithoutSending(t *testing.T) {
+	var sent []TerminalEvent
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 1024, 1024, time.Hour)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_drop", Seq: 1, Kind: "text_delta", Payload: "pending"})
+	batcher.DropTerminal("ts_drop")
+	batcher.FlushTerminal("ts_drop")
+
+	if len(sent) != 0 {
+		t.Fatalf("dropped terminal flushed %d events, want 0", len(sent))
+	}
+	snapshot, ok := batcher.SnapshotTerminal("ts_drop")
+	if !ok {
+		t.Fatal("expected dropped text to remain in daemon-local ring")
+	}
+	if snapshot.Payload != "pending" {
+		t.Fatalf("snapshot payload = %q, want pending", snapshot.Payload)
+	}
+}
+
+func TestTerminalSubscriptionGatesTextDeltasOnly(t *testing.T) {
+	r := &runner{}
+	text := TerminalEvent{TerminalSessionID: "ts_sub", Kind: string(liveterminal.EventTextDelta), Payload: "hello"}
+	status := TerminalEvent{TerminalSessionID: "ts_sub", Kind: string(liveterminal.EventSessionReady), SessionStatus: "live"}
+
+	if r.shouldForwardTerminalEvent(text) {
+		t.Fatal("text_delta must not forward before a terminal stream subscribes")
+	}
+	if !r.shouldForwardTerminalEvent(status) {
+		t.Fatal("non-text terminal status events must still forward without a subscriber")
+	}
+	if got := r.setTerminalSubscribed("ts_sub", true); got != 1 {
+		t.Fatalf("subscribe count = %d, want 1", got)
+	}
+	if !r.shouldForwardTerminalEvent(text) {
+		t.Fatal("text_delta should forward while subscribed")
+	}
+	if got := r.setTerminalSubscribed("ts_sub", true); got != 2 {
+		t.Fatalf("second subscribe count = %d, want 2", got)
+	}
+	if got := r.setTerminalSubscribed("ts_sub", false); got != 1 {
+		t.Fatalf("first unsubscribe count = %d, want 1", got)
+	}
+	if !r.shouldForwardTerminalEvent(text) {
+		t.Fatal("text_delta should still forward while one subscriber remains")
+	}
+	if got := r.setTerminalSubscribed("ts_sub", false); got != 0 {
+		t.Fatalf("final unsubscribe count = %d, want 0", got)
+	}
+	if r.shouldForwardTerminalEvent(text) {
+		t.Fatal("text_delta must stop forwarding after all streams unsubscribe")
+	}
+}
+
+func TestTerminalBatcherRetainsUnsubscribedOutputLocally(t *testing.T) {
+	var sent []TerminalEvent
+	r := &runner{}
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 1024, 1024, time.Hour)
+	batcher.SetShouldSend(r.shouldForwardTerminalEvent)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_ring", Seq: 1, Kind: string(liveterminal.EventTextDelta), Payload: "offline "})
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_ring", Seq: 2, Kind: string(liveterminal.EventTextDelta), Payload: "output"})
+	batcher.FlushTerminal("ts_ring")
+	if len(sent) != 0 {
+		t.Fatalf("unsubscribed output sent to cloud: %d events", len(sent))
+	}
+	snapshot, ok := batcher.SnapshotTerminal("ts_ring")
+	if !ok || snapshot.Payload != "offline output" {
+		t.Fatalf("local snapshot = (%+v, %v), want offline output", snapshot, ok)
+	}
+
+	r.setTerminalSubscribed("ts_ring", true)
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_ring", Seq: 3, Kind: string(liveterminal.EventTextDelta), Payload: " live"})
+	batcher.FlushTerminal("ts_ring")
+	if len(sent) != 1 {
+		t.Fatalf("subscribed output sent events = %d, want 1", len(sent))
+	}
+	if sent[0].Payload != " live" {
+		t.Fatalf("subscribed payload = %q, want live delta only", sent[0].Payload)
+	}
+}
+
+func TestTerminalBatcherReplaysUndeliveredOutputOnSubscribe(t *testing.T) {
+	var sent []TerminalEvent
+	r := &runner{}
+	batcher := newTerminalEventBatcher(func(evt TerminalEvent) {
+		sent = append(sent, evt)
+	}, time.Hour, 1024, 1024, time.Hour)
+	batcher.SetShouldSend(r.shouldForwardTerminalEvent)
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_replay", Seq: 1, Kind: string(liveterminal.EventTextDelta), Payload: "before "})
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_replay", Seq: 2, Kind: string(liveterminal.EventTextDelta), Payload: "open"})
+	batcher.FlushTerminal("ts_replay")
+	if len(sent) != 0 {
+		t.Fatalf("unsubscribed output sent to cloud: %d events", len(sent))
+	}
+
+	if got := r.setTerminalSubscribed("ts_replay", true); got != 1 {
+		t.Fatalf("subscribe count = %d, want 1", got)
+	}
+	snapshot, ok := batcher.SnapshotUndeliveredTerminal("ts_replay")
+	if !ok {
+		t.Fatal("expected undelivered snapshot")
+	}
+	sent = append(sent, snapshot)
+	batcher.MarkDelivered(snapshot)
+	if len(sent) != 1 || sent[0].Payload != "before open" {
+		t.Fatalf("replay sent = %#v, want before open", sent)
+	}
+
+	if got := r.setTerminalSubscribed("ts_replay", true); got != 2 {
+		t.Fatalf("second subscribe count = %d, want 2", got)
+	}
+	if snapshot, ok := batcher.SnapshotUndeliveredTerminal("ts_replay"); ok {
+		t.Fatalf("duplicate replay snapshot = %#v, want none", snapshot)
+	}
+
+	batcher.Add(TerminalEvent{TerminalSessionID: "ts_replay", Seq: 3, Kind: string(liveterminal.EventTextDelta), Payload: " live"})
+	batcher.FlushTerminal("ts_replay")
+	if len(sent) != 2 {
+		t.Fatalf("sent events = %d, want replay + live", len(sent))
+	}
+	if sent[1].Payload != " live" {
+		t.Fatalf("live payload = %q, want live delta only", sent[1].Payload)
+	}
+}
 
 // TestInjectIntoPTYSucceedsWhenWrapperBound is the v1.6.x happy path:
 // when a wrapper has registered an external terminal and bound it to the
@@ -812,5 +1032,42 @@ func TestControlKeepaliveStopsOnWriteError(t *testing.T) {
 	case <-finished:
 	case <-time.After(2 * time.Second):
 		t.Fatal("controlKeepalive did not return after write error")
+	}
+}
+
+func TestControlDataKeepaliveDisabledByDefault(t *testing.T) {
+	t.Setenv("POCKLY_CONTROL_DATA_KEEPALIVE", "")
+	if controlDataKeepaliveEnabled() {
+		t.Fatal("control data keepalive should be disabled by default")
+	}
+}
+
+func TestControlDataKeepaliveCanBeEnabled(t *testing.T) {
+	t.Setenv("POCKLY_CONTROL_DATA_KEEPALIVE", "1")
+	if !controlDataKeepaliveEnabled() {
+		t.Fatal("control data keepalive should be enabled by env")
+	}
+}
+
+func TestSyncHintEnvelopeDecodesAndRoutes(t *testing.T) {
+	raw := `{"type":"SYNC_HINT","sync_hint":{"session_id":"sess-1","reason":"recently_opened","preferred_min":100}}`
+	var msg envelope
+	if err := json.Unmarshal([]byte(raw), &msg); err != nil {
+		t.Fatal(err)
+	}
+	if msg.SyncHint == nil {
+		t.Fatal("sync_hint must decode")
+	}
+	if msg.SyncHint.SessionID != "sess-1" || msg.SyncHint.Reason != "recently_opened" || msg.SyncHint.PreferredMin != 100 {
+		t.Fatalf("sync_hint = %+v", msg.SyncHint)
+	}
+
+	var received []SyncHintPush
+	cfg := Client{SyncHint: func(hint SyncHintPush) { received = append(received, hint) }}
+	if msg.SyncHint != nil && cfg.SyncHint != nil {
+		cfg.SyncHint(*msg.SyncHint)
+	}
+	if len(received) != 1 || received[0].SessionID != "sess-1" {
+		t.Fatalf("handler received = %+v", received)
 	}
 }

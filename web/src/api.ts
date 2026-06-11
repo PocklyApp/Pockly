@@ -7,6 +7,15 @@ import { clearBrowserDeviceState, ensureBrowserDeviceState, loadBrowserDeviceSta
 import { telemetryNetworkEnabled, trackEvent } from "./observability";
 import { configuredNexusURL } from "./runtime-config";
 
+export const CONTROL_EVENT_POLL_MAX_MS = 35 * 60 * 1000;
+export const DEFAULT_INITIAL_TURN_LIMIT = 20;
+export const CONTROL_EVENT_POLL_INITIAL_DELAY_MS = 300;
+export const CONTROL_EVENT_POLL_INTERVAL_MS = 2000;
+// Steady cadence when a live realtime subscription already delivers turns and
+// the poll only needs lifecycle events (completed/failed/approval).
+export const CONTROL_EVENT_POLL_RELAXED_MS = 5000;
+export const TERMINAL_EVENT_POLL_INTERVAL_MS = 2000;
+
 export type User = {
   user_id: string;
   email: string;
@@ -190,6 +199,8 @@ export type WSState = "connecting" | "live" | "reconnecting" | "disconnected" | 
 export type InjectEvent = {
   request_id: string;
   type: "inject_started" | "stream_event" | "session_created" | "approval_required" | "inject_completed" | "inject_failed" | "inject_cancelled";
+  status?: string;
+  streaming?: boolean;
   turn?: SessionTurn;
   session_id?: string;
   message?: string;
@@ -210,7 +221,29 @@ export type SyncSessionEvent = {
   total_turn_count?: number;
   message?: string;
   error?: string;
+  streaming?: boolean;
 };
+
+export type CursorEventResponse<TEvent> = {
+  events: Array<{
+    cursor: string;
+    event_id?: string;
+    request_id?: string;
+    device_id?: string;
+    session_id?: string;
+    type?: string;
+    created_at?: string;
+    payload: TEvent;
+  }>;
+  next_cursor?: string;
+  // Session-scoped polls also deliver fresh turn rows (written once into
+  // session_turns by the server-side event sink) instead of duplicating turn
+  // payloads inside event rows.
+  turns?: SessionTurn[];
+  next_seq?: number;
+};
+
+export type SessionEventCursorResponse<TEvent extends InjectEvent | SyncSessionEvent> = CursorEventResponse<TEvent>;
 
 export type SessionTurnsResponse = {
   session_id: string;
@@ -238,15 +271,19 @@ export type TerminalSession = {
 };
 
 export type TerminalEvent = {
+  event_id?: string;
   request_id?: string;
   terminal_session_id: string;
   seq?: number;
+  seq_start?: number;
+  seq_end?: number;
   kind: "session_started" | "session_ready" | "user_input" | "text_delta" | "message_added" | "permission_request" | "prompt_ready" | "agent_error" | "session_exited" | "session_disconnected" | "error" | "terminal_session";
   session_status?: TerminalSession["session_status"];
   turn_status?: TerminalSession["turn_status"];
   payload?: string;
   error?: string;
   timestamp?: string;
+  truncated?: boolean;
 };
 
 export type DaemonProjectSession = {
@@ -311,6 +348,19 @@ export type VoiceTranscription = {
 export type FeedbackSubmission = {
   feedback_id: string;
   status: "accepted";
+};
+
+export type NexusRuntimeCapabilities = {
+  runtime: string;
+  realtime?: boolean;
+  browser_realtime?: boolean;
+  control_streaming?: boolean;
+  terminal?: boolean;
+  terminal_streaming?: boolean;
+  web_push?: boolean;
+  stt?: boolean;
+  release_update?: boolean;
+  contract_version?: string;
 };
 
 export type DaemonDeviceAuthorization = {
@@ -420,6 +470,10 @@ export async function getSession() {
   return fetchJSON<{ authenticated: boolean; user?: User }>("/api/auth/session", {
     method: "GET",
   });
+}
+
+export async function getRuntimeCapabilities() {
+  return fetchJSON<NexusRuntimeCapabilities>("/api/runtime", { method: "GET" });
 }
 
 export async function devLogin(email: string, name: string) {
@@ -732,11 +786,10 @@ export async function registerCurrentBrowserDevice() {
 }
 
 export async function getSessionTurns(sessionId: string, deviceId: string) {
-  const response = await fetchWithBrowserDevice<SessionTurnsResponse>(
+  return await fetchWithBrowserDevice<SessionTurnsResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/turns`,
     { device_id: deviceId },
   );
-  return response;
 }
 
 export async function streamSessionInject(input: {
@@ -749,16 +802,27 @@ export async function streamSessionInject(input: {
   // and appends @<path> references to the prompt for Claude Code / Codex.
   files?: File[];
   signal?: AbortSignal;
+  // Last turn seq the reader already has — the polling fallback delivers only
+  // newer turns from session_turns. Omit/0 redelivers from the start (the
+  // reader merges by seq, so that is wasteful but harmless).
+  afterSeq?: number;
+  // Relaxed steady poll cadence (e.g. CONTROL_EVENT_POLL_RELAXED_MS) when a
+  // live realtime subscription already carries the turns.
+  pollIntervalMs?: number;
   onEvent: (event: InjectEvent) => void;
 }) {
   const url = `/api/sessions/${encodeURIComponent(input.sessionId)}/inject`;
   const query = { device_id: input.deviceId };
+  const pollOptions = {
+    afterSeq: input.afterSeq ?? 0,
+    ...(input.pollIntervalMs ? { pollIntervalMs: input.pollIntervalMs } : {}),
+  };
   if (input.files && input.files.length > 0) {
     const form = new FormData();
     form.set("text", input.text);
     if (input.model) form.set("model", input.model);
     for (const file of input.files) form.append("files", file, file.name);
-    return streamControlMultipart<InjectEvent>(url, query, form, input.onEvent, input.signal);
+    return streamControlMultipart<InjectEvent>(url, query, form, input.onEvent, input.signal, pollOptions);
   }
   return streamControl(
     url,
@@ -766,6 +830,7 @@ export async function streamSessionInject(input: {
     { text: input.text, model: input.model },
     input.onEvent,
     input.signal,
+    pollOptions,
   );
 }
 
@@ -890,6 +955,22 @@ export async function setSessionPref(input: {
   });
 }
 
+export async function markSessionOpened(input: {
+  sessionId: string;
+  deviceId: string;
+  openedAt?: string;
+}): Promise<{ device_id: string; session_id: string; last_opened_at: string }> {
+  const auth = await authenticateBrowserDevice();
+  return fetchJSON<{ device_id: string; session_id: string; last_opened_at: string }>(`/api/sessions/${encodeURIComponent(input.sessionId)}/opened`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${auth.device_access_token}` },
+    body: JSON.stringify({
+      device_id: input.deviceId,
+      ...(input.openedAt === undefined ? {} : { opened_at: input.openedAt }),
+    }),
+  });
+}
+
 export async function setProjectPref(input: {
   deviceId: string;
   cwd: string;
@@ -1005,7 +1086,7 @@ export async function streamSessionSync(input: {
   return streamControl(
     `/api/sessions/${encodeURIComponent(input.sessionId)}/sync`,
     { device_id: input.deviceId },
-    { limit: input.limit ?? 20, before_seq: input.beforeSeq ?? 0 },
+    { limit: input.limit ?? DEFAULT_INITIAL_TURN_LIMIT, before_seq: input.beforeSeq ?? 0 },
     input.onEvent,
     input.signal,
   );
@@ -1028,6 +1109,9 @@ export async function streamNewTask(input: {
     buildNewTaskRequestBody(input),
     input.onEvent,
     input.signal,
+    // Brand-new session: every turn is new. The poll starts on the
+    // request_id feed and switches to the session feed at session_created.
+    { afterSeq: 0 },
   );
 }
 
@@ -1164,11 +1248,12 @@ export async function streamTerminalSession(input: {
   onEvent: (event: TerminalEvent) => void;
 }) {
   const auth = await authenticateBrowserDevice();
+  const token = auth.device_access_token;
   const init: RequestInit = {
     method: "GET",
     credentials: "include",
     headers: {
-      Authorization: `Bearer ${auth.device_access_token}`,
+      Authorization: `Bearer ${token}`,
     },
   };
   if (input.signal) init.signal = input.signal;
@@ -1179,10 +1264,61 @@ export async function streamTerminalSession(input: {
     const message = parsed && typeof parsed === "object" && "error" in parsed
       ? String((parsed as { error: unknown }).error)
       : text.trim() || `${res.status} ${res.statusText}`.trim();
+    if (res.status === 501 && parsed && typeof parsed === "object" && (parsed as { code?: unknown }).code === "unsupported_runtime") {
+      await pollTerminalSession(input, token);
+      return;
+    }
     throw new Error(message);
   }
   if (!res.body) throw new Error("stream response missing body");
   await readSSEStream(res.body, input.onEvent);
+}
+
+async function pollTerminalSession(input: {
+  terminalSessionId: string;
+  signal?: AbortSignal;
+  onEvent: (event: TerminalEvent) => void;
+}, token: string) {
+  const base = `/api/terminal-sessions/${encodeURIComponent(input.terminalSessionId)}`;
+  const authHeaders = { Authorization: `Bearer ${token}` };
+  await fetchJSON<{ status: string }>(`${base}/subscribe`, {
+    method: "POST",
+    credentials: "include",
+    headers: authHeaders,
+  });
+  let cursor = "";
+  try {
+    for (;;) {
+      if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      await sleep(TERMINAL_EVENT_POLL_INTERVAL_MS, input.signal);
+      const eventsURL = new URL(`${base}/events`, window.location.origin);
+      eventsURL.searchParams.set("after", cursor);
+      eventsURL.searchParams.set("limit", "100");
+      const response = await fetchJSON<CursorEventResponse<TerminalEvent>>(eventsURL.pathname + eventsURL.search, {
+        method: "GET",
+        credentials: "include",
+        headers: authHeaders,
+      });
+      cursor = response.next_cursor || cursor;
+      for (const event of response.events || []) {
+        if (event.cursor) cursor = event.cursor;
+        if (event.payload) {
+          input.onEvent(event.payload);
+          if (terminalEventEndsPolling(event.payload)) return;
+        }
+      }
+    }
+  } finally {
+    await fetch(`${base}/unsubscribe`, {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders,
+    }).catch(() => undefined);
+  }
+}
+
+function terminalEventEndsPolling(event: TerminalEvent) {
+  return event.kind === "session_exited" || event.kind === "session_disconnected" || event.session_status === "exited" || event.session_status === "error";
 }
 
 export async function listDevTerminalSessions() {
@@ -1370,22 +1506,51 @@ export async function submitFeedback(input: {
   return data as FeedbackSubmission;
 }
 
+// Keepalive for the realtime socket. The server's Durable Object answers the
+// literal "POCKLY_PING" with "POCKLY_PONG" at the edge via the hibernation
+// auto-response pair — without waking (or billing) the DO — so this doubles as
+// a free dead-link detector: a missing PONG within the liveness window means
+// the link is gone and the socket reconnects.
+export const REALTIME_KEEPALIVE_PING = "POCKLY_PING";
+export const REALTIME_KEEPALIVE_PONG = "POCKLY_PONG";
+export const REALTIME_KEEPALIVE_INTERVAL_MS = 30_000;
+export const REALTIME_LIVENESS_TIMEOUT_MS = 75_000;
+
+export type HostStatusUpdate = {
+  device_id: string;
+  presence_status?: string | undefined;
+  presence_reason?: string | undefined;
+  control_connected?: boolean | undefined;
+  app_version?: string | undefined;
+};
+
 export function subscribeToSession(input: {
   sessionId: string;
   deviceId: string;
   afterSeq: number;
   onTurn: (turn: SessionTurn) => void;
   onStatus: (status: WSState, detail?: string) => void;
+  // Presence pushes for the user's daemons. While the subscription is live
+  // these replace most foreground presence polling.
+  onHostStatus?: (status: HostStatusUpdate) => void;
 }): SessionSubscription {
   let closed = false;
   let socket: WebSocket | null = null;
   let reconnectTimer: number | null = null;
   let reconnectAttempt = 0;
+  let keepaliveTimer: number | null = null;
 
   const clearReconnect = () => {
     if (reconnectTimer != null) {
       window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    }
+  };
+
+  const clearKeepalive = () => {
+    if (keepaliveTimer != null) {
+      window.clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
     }
   };
 
@@ -1410,9 +1575,11 @@ export function subscribeToSession(input: {
 
       const ws = new WebSocket(url.toString());
       socket = ws;
+      let lastLiveAt = Date.now();
       ws.addEventListener("open", () => {
         if (closed || socket !== ws) return;
         reconnectAttempt = 0;
+        lastLiveAt = Date.now();
         trackEvent("session_ws_opened");
         input.onStatus("connecting");
         ws.send(JSON.stringify({
@@ -1421,14 +1588,31 @@ export function subscribeToSession(input: {
           device_id: input.deviceId,
           after_seq: input.afterSeq,
         }));
+        clearKeepalive();
+        keepaliveTimer = window.setInterval(() => {
+          if (closed || socket !== ws || ws.readyState !== WebSocket.OPEN) return;
+          if (Date.now() - lastLiveAt > REALTIME_LIVENESS_TIMEOUT_MS) {
+            // Half-open link: no PONG (or any frame) inside the window.
+            // Closing triggers the reconnect path.
+            ws.close();
+            return;
+          }
+          ws.send(REALTIME_KEEPALIVE_PING);
+        }, REALTIME_KEEPALIVE_INTERVAL_MS);
       });
       ws.addEventListener("message", (event) => {
         if (closed || socket !== ws) return;
-        const payload = JSON.parse(String(event.data)) as {
-          type?: string;
-          turn?: SessionTurn;
-          message?: string;
-        };
+        lastLiveAt = Date.now();
+        const raw = String(event.data);
+        // Edge-answered keepalive (and any other non-JSON frame) only counts
+        // as liveness; it carries no payload.
+        if (raw === REALTIME_KEEPALIVE_PONG || !raw.startsWith("{")) return;
+        let payload: { type?: string; turn?: SessionTurn; message?: string } & Partial<HostStatusUpdate>;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          return;
+        }
         switch (payload.type) {
           case "TURN":
             if (payload.turn) {
@@ -1437,6 +1621,17 @@ export function subscribeToSession(input: {
             break;
           case "SESSION_STATUS":
             input.onStatus("live", payload.message);
+            break;
+          case "HOST_STATUS":
+            if (payload.device_id) {
+              input.onHostStatus?.({
+                device_id: payload.device_id,
+                presence_status: payload.presence_status,
+                presence_reason: payload.presence_reason,
+                control_connected: payload.control_connected,
+                app_version: payload.app_version,
+              });
+            }
             break;
           case "ERROR":
             input.onStatus("error", payload.message ?? "subscription error");
@@ -1449,6 +1644,7 @@ export function subscribeToSession(input: {
         if (socket === ws) {
           socket = null;
         }
+        clearKeepalive();
         trackEvent("session_ws_closed");
         if (!closed) scheduleReconnect();
       });
@@ -1468,6 +1664,7 @@ export function subscribeToSession(input: {
     close() {
       closed = true;
       clearReconnect();
+      clearKeepalive();
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({
           type: "UNSUBSCRIBE",
@@ -1565,12 +1762,22 @@ function buildControlURL(url: string, query: Record<string, string> | undefined)
   return new URL(resolveNexusHTTPURL(finalURL.toString()));
 }
 
+// pollOptions tunes the JSON-accepted fallback poll. afterSeq opts the poll
+// into turn delivery from session_turns (the reader's last known seq).
+// pollIntervalMs relaxes the steady-state cadence — used when a live realtime
+// subscription already delivers turns and the poll only tracks lifecycle.
+type ControlPollOptions = {
+  afterSeq?: number;
+  pollIntervalMs?: number;
+};
+
 async function streamControl<TEvent extends InjectEvent | SyncSessionEvent>(
   url: string,
   query: Record<string, string> | undefined,
   body: unknown,
   onEvent: (event: TEvent) => void,
   signal?: AbortSignal,
+  pollOptions?: ControlPollOptions,
 ) {
   const auth = await authenticateBrowserDevice();
   const init: RequestInit = {
@@ -1583,7 +1790,7 @@ async function streamControl<TEvent extends InjectEvent | SyncSessionEvent>(
     body: JSON.stringify(body),
   };
   if (signal) init.signal = signal;
-  return runControlStream<TEvent>(buildControlURL(url, query), init, onEvent);
+  return runControlStream<TEvent>(buildControlURL(url, query), init, onEvent, pollOptions);
 }
 
 // Same control stream, but the body is multipart/form-data (file attachments).
@@ -1594,6 +1801,7 @@ async function streamControlMultipart<TEvent extends InjectEvent | SyncSessionEv
   form: FormData,
   onEvent: (event: TEvent) => void,
   signal?: AbortSignal,
+  pollOptions?: ControlPollOptions,
 ) {
   const auth = await authenticateBrowserDevice();
   const init: RequestInit = {
@@ -1605,13 +1813,14 @@ async function streamControlMultipart<TEvent extends InjectEvent | SyncSessionEv
     body: form,
   };
   if (signal) init.signal = signal;
-  return runControlStream<TEvent>(buildControlURL(url, query), init, onEvent);
+  return runControlStream<TEvent>(buildControlURL(url, query), init, onEvent, pollOptions);
 }
 
 async function runControlStream<TEvent extends InjectEvent | SyncSessionEvent>(
   finalURL: URL,
   init: RequestInit,
   onEvent: (event: TEvent) => void,
+  pollOptions?: ControlPollOptions,
 ) {
   const res = await fetch(finalURL.toString(), init);
   if (!res.ok) {
@@ -1631,6 +1840,16 @@ async function runControlStream<TEvent extends InjectEvent | SyncSessionEvent>(
     err.status = res.status;
     throw err;
   }
+  const contentType = res.headers.get("content-type") || "";
+  if (!contentType.includes("text/event-stream")) {
+    const payload = await res.json().catch(() => null);
+    if (payload && typeof payload === "object") {
+      onEvent(payload as TEvent);
+      await pollAcceptedControlEvents(finalURL, payload as TEvent, onEvent, init.signal as AbortSignal | undefined, pollOptions);
+      return;
+    }
+    throw new Error("control response missing stream events");
+  }
   if (!res.body) throw new Error("stream response missing body");
   trackEvent("inject_stream_started");
   await readSSEStream(res.body, (evt: TEvent) => {
@@ -1638,6 +1857,99 @@ async function runControlStream<TEvent extends InjectEvent | SyncSessionEvent>(
       trackEvent("inject_" + evt.type, { agent: evt.turn?.agent, has_error: Boolean(evt.error) });
     }
     onEvent(evt);
+  });
+}
+
+async function pollAcceptedControlEvents<TEvent extends InjectEvent | SyncSessionEvent>(
+  finalURL: URL,
+  accepted: TEvent,
+  onEvent: (event: TEvent) => void,
+  signal?: AbortSignal,
+  pollOptions?: ControlPollOptions,
+) {
+  if ((accepted as { streaming?: boolean }).streaming !== false) return;
+  const requestID = String((accepted as { request_id?: string }).request_id || "");
+  if (!requestID) return;
+  let pollURL = controlEventsURL(finalURL, accepted, requestID);
+  if (!pollURL) return;
+  const wantTurns = pollOptions?.afterSeq !== undefined;
+  const steadyIntervalMs = Math.max(CONTROL_EVENT_POLL_INTERVAL_MS, Number(pollOptions?.pollIntervalMs) || 0);
+  let cursor = "";
+  let seqCursor = Math.max(0, Number(pollOptions?.afterSeq) || 0);
+  const startedAt = Date.now();
+  let attempt = 0;
+  while (Date.now() - startedAt < CONTROL_EVENT_POLL_MAX_MS) {
+    if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    await sleep(attempt < 2 ? CONTROL_EVENT_POLL_INITIAL_DELAY_MS : steadyIntervalMs, signal);
+    attempt += 1;
+    pollURL.searchParams.set("after", cursor);
+    pollURL.searchParams.set("limit", "100");
+    const sessionScoped = pollURL.pathname.startsWith("/api/sessions/");
+    if (wantTurns && sessionScoped) {
+      pollURL.searchParams.set("after_seq", String(seqCursor));
+    }
+    const response = await fetchWithBrowserDevice<SessionEventCursorResponse<TEvent>>(pollURL.pathname + pollURL.search);
+    cursor = response.next_cursor || cursor;
+    // Turn content arrives from session_turns (written once server-side) and
+    // is surfaced to callers as the same stream_event shape the SSE path
+    // produced, so the reader's append/merge logic is untouched.
+    for (const turn of response.turns || []) {
+      seqCursor = Math.max(seqCursor, Number(turn.seq) || 0);
+      onEvent({ request_id: requestID, type: "stream_event", turn } as unknown as TEvent);
+    }
+    if (typeof response.next_seq === "number") {
+      seqCursor = Math.max(seqCursor, response.next_seq);
+    }
+    for (const event of response.events || []) {
+      if (event.cursor) cursor = event.cursor;
+      if (event.payload && typeof event.payload === "object") {
+        onEvent(event.payload);
+        // A new-session task starts on the request_id-only feed; once
+        // session_created names the session, switch to the session-scoped
+        // feed so turn delivery picks up. The event cursor stays valid —
+        // both paths filter the same rows by request_id.
+        const created = event.payload as { type?: string; session_id?: string; device_id?: string };
+        if (created.type === "session_created" && created.session_id && !pollURL.pathname.startsWith("/api/sessions/")) {
+          const next = controlEventsURL(finalURL, { ...(accepted as object), ...created } as TEvent, requestID);
+          if (next?.pathname.startsWith("/api/sessions/")) pollURL = next;
+        }
+        if (isTerminalControlEvent(event.payload)) return;
+      }
+    }
+  }
+  throw new Error("control event polling timed out");
+}
+
+function controlEventsURL<TEvent extends InjectEvent | SyncSessionEvent>(finalURL: URL, accepted: TEvent, requestID: string): URL | null {
+  const sessionID = String((accepted as { session_id?: string }).session_id || "");
+  const deviceID = finalURL.searchParams.get("device_id") || String((accepted as { device_id?: string }).device_id || "");
+  if (sessionID && deviceID) {
+    const url = new URL(`/api/sessions/${encodeURIComponent(sessionID)}/events`, window.location.origin);
+    url.searchParams.set("device_id", deviceID);
+    url.searchParams.set("request_id", requestID);
+    return url;
+  }
+  return new URL(`/api/injects/${encodeURIComponent(requestID)}/events`, window.location.origin);
+}
+
+function isTerminalControlEvent(event: InjectEvent | SyncSessionEvent) {
+  const inject = event as InjectEvent;
+  if (inject.type === "inject_completed" || inject.type === "inject_failed" || inject.type === "inject_cancelled") return true;
+  const sync = event as SyncSessionEvent;
+  return sync.status === "completed" || sync.status === "failed" || sync.stage === "completed" || sync.stage === "failed";
+}
+
+function sleep(ms: number, signal?: AbortSignal) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    }, { once: true });
   });
 }
 

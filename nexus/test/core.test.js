@@ -49,7 +49,10 @@ describe("Nexus core provider bundle", () => {
     assert.deepEqual(await runtime.json(), {
       runtime: "self_hosted",
       realtime: true,
+      browser_realtime: true,
+      control_streaming: true,
       terminal: true,
+      terminal_streaming: true,
       web_push: false,
       stt: false,
       release_update: true,

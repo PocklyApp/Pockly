@@ -37,6 +37,10 @@ import { daemonReleaseSnapshot, withDaemonReleaseInfo } from "./release.js";
 import { createStore } from "./store.js";
 
 const onlineWindowMs = 2 * 60 * 1000;
+const recentlyOpenedSyncHintMs = 24 * 60 * 60 * 1000;
+const prioritySyncHintTurnLimit = 100;
+const defaultHostsOnlineCacheMs = 1000;
+const hostsOnlineCache = new Map();
 
 export async function handleRequest(request, env = {}, ctx = {}) {
   const url = new URL(request.url);
@@ -68,6 +72,7 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (path === "/api/daemon/login") return await daemonLogin(request, store);
     if (path === "/api/daemon/remote-access") return await setDaemonRemoteAccess(request, store);
     if (path === "/api/daemon/sync") return await daemonSync(request, store);
+    if (path === "/api/daemon/sync-hints") return await daemonSyncHints(request, store);
     if (path === "/api/devices/register-browser") return await registerBrowser(request, store);
     if (path === "/api/devices/qr-grant") return await createBrowserQRGrant(request, store, url);
     if (path === "/api/devices/qr-claim") return await claimBrowserQRGrant(request, store);
@@ -76,12 +81,12 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (path === "/api/devices/revoke") return await revokeDevice(request, store);
     if (path === "/api/device-challenge") return await createDeviceChallenge(request, store);
     if (path === "/api/device-challenge/verify") return await verifyDeviceChallenge(request, store);
-    if (path === "/api/hosts/online") return await listOnlineHosts(request, store, env);
+    if (path === "/api/hosts/online") return await listOnlineHosts(request, store, env, requestRuntime.providers.telemetryProvider);
     if (path === "/api/push/vapid-public-key") return await getVAPIDPublicKey(request, env);
     if (path === "/api/push/subscriptions") return await pushSubscriptions(request, store, env);
     if (path === "/api/voice/transcriptions") return await transcribeVoice(request, store, env);
     if (path === "/api/feedback") return await submitFeedback(request, store);
-    if (path === "/api/sessions") return await listSessions(request, store, env);
+    if (path === "/api/sessions") return await listSessions(request, store, env, requestRuntime.providers.telemetryProvider);
     if (path === "/api/prefs") return await listPrefs(request, store);
     if (path === "/api/projects/prefs") return await setProjectPrefs(request, store);
     if (path === "/api/tasks") return await startTask(request, store, env);
@@ -112,11 +117,20 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     const injectCancel = path.match(/^\/api\/injects\/([^/]+)\/cancel$/);
     if (injectCancel) return await cancelInject(request, store, env, decodeURIComponent(injectCancel[1]));
 
+    const injectEvents = path.match(/^\/api\/injects\/([^/]+)\/events$/);
+    if (injectEvents) return await listInjectEvents(request, store, decodeURIComponent(injectEvents[1]), url);
+
     const sessionTurns = path.match(/^\/api\/sessions\/([^/]+)\/turns$/);
     if (sessionTurns) return await listSessionTurns(request, store, decodeURIComponent(sessionTurns[1]), url);
 
+    const sessionEvents = path.match(/^\/api\/sessions\/([^/]+)\/events$/);
+    if (sessionEvents) return await listSessionEvents(request, store, decodeURIComponent(sessionEvents[1]), url);
+
     const sessionPrefs = path.match(/^\/api\/sessions\/([^/]+)\/prefs$/);
     if (sessionPrefs) return await setSessionPrefs(request, store, decodeURIComponent(sessionPrefs[1]));
+
+    const sessionOpened = path.match(/^\/api\/sessions\/([^/]+)\/opened$/);
+    if (sessionOpened) return await markSessionOpened(request, store, env, decodeURIComponent(sessionOpened[1]));
 
     const sessionAction = path.match(/^\/api\/sessions\/([^/]+)\/(inject|sync|agent-settings|diff|delete|reveal)$/);
     if (sessionAction) return await sessionControlAction(request, store, env, decodeURIComponent(sessionAction[1]), sessionAction[2], url);
@@ -124,7 +138,7 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     const permissionAction = path.match(/^\/api\/permission-requests\/([^/]+)\/decide$/);
     if (permissionAction) return await decidePermissionRequest(request, store, env, decodeURIComponent(permissionAction[1]));
 
-    const terminalAction = path.match(/^\/api\/terminal-sessions\/([^/]+)\/(input|stop|open-terminal|stream)$/);
+    const terminalAction = path.match(/^\/api\/terminal-sessions\/([^/]+)\/(input|stop|open-terminal|stream|subscribe|unsubscribe|events)$/);
     if (terminalAction) return await terminalSessionByID(request, store, env, decodeURIComponent(terminalAction[1]), terminalAction[2]);
 
     if (path === "/api/ws") return await browserWebSocket(request, store, env, url);
@@ -923,7 +937,9 @@ async function registerBrowser(request, store) {
 async function announceBrowser(request, store) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   const { device } = await requireDeviceAuth(request, store, "browser");
-  await store.touchDevice(device.device_id, new Date().toISOString());
+  const body = await readJSON(request);
+  const now = new Date().toISOString();
+  await store.touchDevice(device.device_id, now);
   return jsonResponse({ announced: true, daemons_notified: 0 });
 }
 
@@ -1019,11 +1035,11 @@ async function daemonSync(request, store) {
     const sessionID = String(turn.session_id ?? "");
     uploadedTurnsBySession.set(sessionID, (uploadedTurnsBySession.get(sessionID) ?? 0) + 1);
   }
+  await store.upsertTurns(turns.map((turn) => syncTurnRecord(user, device, turn, now)));
   if (body.full_reconcile) {
     await store.deleteMissingDeviceSessions(user.user_id, device.device_id, sessions.map((session) => String(session.session_id)));
   }
-  await store.upsertSessions(sessions.map((session) => syncSessionRecord(user, device, session, now, uploadedTurnsBySession.get(String(session.session_id)) ?? 0)));
-  await store.upsertTurns(turns.map((turn) => syncTurnRecord(user, device, turn, now)));
+  await store.upsertSessions(await Promise.all(sessions.map((session) => syncSessionRecord(store, user, device, session, now, uploadedTurnsBySession.get(String(session.session_id)) ?? 0))));
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
@@ -1033,16 +1049,67 @@ async function daemonSync(request, store) {
   });
 }
 
-async function listSessions(request, store, env) {
+async function daemonSyncHints(request, store) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user, device } = await requireDeviceAuth(request, store, "daemon");
+  const [sessions, prefs, openHints] = await Promise.all([
+    store.listSessionsForUser(user.user_id),
+    store.listSessionPrefsForUser(user.user_id),
+    store.listSessionOpenHintsForUser(user.user_id),
+  ]);
+  const sessionIDs = new Set(
+    sessions
+      .filter((session) => session.device_id === device.device_id)
+      .map((session) => String(session.session_id)),
+  );
+  const cutoff = Date.now() - recentlyOpenedSyncHintMs;
+  const hintsBySessionID = new Map();
+  for (const pref of prefs) {
+    if (pref.device_id !== device.device_id || !sessionIDs.has(String(pref.session_id))) continue;
+    if (!pref.pinned) continue;
+    hintsBySessionID.set(String(pref.session_id), {
+      session_id: pref.session_id,
+      reason: "pinned",
+      preferred_min: prioritySyncHintTurnLimit,
+    });
+  }
+  for (const hint of openHints) {
+    if (hint.device_id !== device.device_id || !sessionIDs.has(String(hint.session_id)) || hintsBySessionID.has(String(hint.session_id))) continue;
+    const opened = Date.parse(hint.last_opened_at || "");
+    if (!Number.isFinite(opened) || opened < cutoff) continue;
+    hintsBySessionID.set(String(hint.session_id), {
+      session_id: hint.session_id,
+      reason: "recently_opened",
+      preferred_min: prioritySyncHintTurnLimit,
+    });
+  }
+  const hints = [...hintsBySessionID.values()];
+  hints.sort((left, right) => {
+    if (left.reason !== right.reason) return left.reason === "pinned" ? -1 : 1;
+    return String(left.session_id).localeCompare(String(right.session_id));
+  });
+  return jsonResponse({ sessions: hints.slice(0, 50) });
+}
+
+async function listSessions(request, store, env, telemetryProvider = null) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store);
   const control = createControlHubForUser(env, user.user_id);
   const sessions = await store.listSessionsForUser(user.user_id);
   const devices = new Map((await store.listDevicesForUser(user.user_id)).map((device) => [device.device_id, device]));
+  const daemonDeviceIDs = uniqueDaemonDeviceIDs(sessions, devices);
+  const onlineByDeviceID = daemonDeviceIDs.length > 0 ? await control.onlineDevices(daemonDeviceIDs) : {};
   const rows = [];
   for (const session of sessions) {
-    rows.push(publicSession(session, devices.get(session.device_id), await control.isDaemonOnline(session.device_id)));
+    rows.push(publicSession(session, devices.get(session.device_id), Boolean(onlineByDeviceID[session.device_id])));
   }
+  void recordPresenceTelemetry(telemetryProvider, request, {
+    command: "sessions",
+    presence_source: daemonDeviceIDs.length > 0 ? "batch_do" : "none",
+    sessions_count: sessions.length,
+    unique_daemon_count: daemonDeviceIDs.length,
+    presence_batch_size: daemonDeviceIDs.length,
+  });
   return jsonResponse({ sessions: rows });
 }
 
@@ -1108,6 +1175,50 @@ async function setSessionPrefs(request, store, sessionID) {
   });
 }
 
+async function markSessionOpened(request, store, env, sessionID) {
+  if (request.method !== "POST") return methodNotAllowed("POST");
+  const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
+  const body = await request.json().catch(() => null);
+  const deviceID = String(body?.device_id ?? "");
+  if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
+  const openedAt = body?.opened_at ? String(body.opened_at) : new Date().toISOString();
+  const hint = await store.upsertSessionOpenHint({
+    user_id: user.user_id,
+    device_id: deviceID,
+    session_id: sessionID,
+    last_opened_at: openedAt,
+    updated_at: new Date().toISOString(),
+  });
+  await pushSyncHintToDaemon(env, user.user_id, deviceID, sessionID);
+  return jsonResponse({
+    device_id: hint.device_id,
+    session_id: hint.session_id,
+    last_opened_at: hint.last_opened_at,
+  });
+}
+
+// Nudge the daemon over its already-open control WS so the opened session's
+// lazy backfill starts immediately. Outgoing WebSocket messages are not billed,
+// so pushing replaces the daemon-side hint polling loop as the default
+// transport. Best-effort: an offline daemon falls back to the persisted open
+// hint (consumed by the optional poll) and the regular sync flow.
+async function pushSyncHintToDaemon(env, userID, daemonDeviceID, sessionID) {
+  try {
+    const control = createControlHubForUser(env, userID);
+    await control.dispatch(daemonDeviceID, {
+      type: "SYNC_HINT",
+      sync_hint: {
+        session_id: sessionID,
+        reason: "recently_opened",
+        preferred_min: prioritySyncHintTurnLimit,
+      },
+    });
+  } catch {
+    // Daemon offline or hub unavailable — opening still works through the
+    // explicit sync path; the hint only accelerates proactive backfill.
+  }
+}
+
 async function setProjectPrefs(request, store) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   const { user } = await requireDeviceAuth(request, store);
@@ -1155,9 +1266,65 @@ async function listSessionTurns(request, store, sessionID, url) {
   });
 }
 
-async function listOnlineHosts(request, store, env) {
+async function listSessionEvents(request, store, sessionID, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
-  const { user } = await requireUserFromCookieOrDevice(request, store);
+  const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
+  const deviceID = requiredString(url.searchParams.get("device_id") ?? "", "device_id");
+  const session = await store.getSession(user.user_id, deviceID, sessionID);
+  if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
+  return jsonResponse(await sessionEventsResponse(store, user.user_id, deviceID, sessionID, {
+    after: url.searchParams.get("after") ?? "",
+    after_seq: url.searchParams.get("after_seq") ?? "",
+    request_id: url.searchParams.get("request_id") ?? "",
+    limit: url.searchParams.get("limit") ?? "",
+  }));
+}
+
+async function listInjectEvents(request, store, requestID, url) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
+  return jsonResponse(await sessionEventsResponse(store, user.user_id, "", "", {
+    after: url.searchParams.get("after") ?? "",
+    request_id: requestID,
+    limit: url.searchParams.get("limit") ?? "",
+  }));
+}
+
+async function sessionEventsResponse(store, userID, deviceID, sessionID, options = {}) {
+  const events = await store.listSessionEvents(userID, deviceID, sessionID, options);
+  const publicEvents = events.map(publicSessionEvent);
+  const response = {
+    events: publicEvents,
+    next_cursor: publicEvents[publicEvents.length - 1]?.cursor || String(options.after || ""),
+  };
+  // Session-scoped polls also carry fresh turn content from session_turns.
+  // Live turns land there once (written by the event sink) instead of being
+  // duplicated into a session_events row per turn.
+  if (deviceID && sessionID && options.after_seq !== undefined && options.after_seq !== "") {
+    const afterSeq = Number(options.after_seq) || 0;
+    const turns = await store.listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, options.limit);
+    response.turns = turns.map(publicTurn);
+    response.next_seq = turns.length > 0 ? Number(turns[turns.length - 1].seq) : afterSeq;
+  }
+  return response;
+}
+
+async function listOnlineHosts(request, store, env, telemetryProvider = null) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user, device } = await requireUserFromCookieOrDevice(request, store);
+  const cacheKey = hostsOnlineCacheKey(user.user_id, device?.device_id || "", env);
+  const cacheTTL = hostsOnlineCacheMs(env);
+  const cached = cacheTTL > 0 ? hostsOnlineCache.get(cacheKey) : null;
+  const now = Date.now();
+  if (cached && now - cached.fetchedAt < cacheTTL) {
+    void recordPresenceTelemetry(telemetryProvider, request, {
+      presence_source: "cache",
+      sessions_count: cached.sessionsCount,
+      unique_daemon_count: cached.uniqueDaemonCount,
+      presence_batch_size: 0,
+    });
+    return jsonResponse({ hosts: cached.hosts });
+  }
   const control = createControlHubForUser(env, user.user_id);
   const release = await daemonReleaseSnapshot(env);
   const devices = await store.listDevicesForUser(user.user_id);
@@ -1166,13 +1333,30 @@ async function listOnlineHosts(request, store, env) {
   for (const session of sessions) {
     activeSessionsByDevice.set(session.device_id, (activeSessionsByDevice.get(session.device_id) ?? 0) + 1);
   }
+  const daemonDevices = devices.filter((entry) => entry.device_type === "daemon" && entry.status !== "revoked");
+  const onlineByDeviceID = daemonDevices.length > 0 ? await control.onlineDevices(daemonDevices.map((device) => device.device_id)) : {};
   const hosts = [];
-  for (const device of devices.filter((entry) => entry.device_type === "daemon" && entry.status !== "revoked")) {
+  for (const device of daemonDevices) {
     hosts.push(withDaemonReleaseInfo(
-      publicHost(device, activeSessionsByDevice.get(device.device_id) ?? 0, await control.isDaemonOnline(device.device_id)),
+      publicHost(device, activeSessionsByDevice.get(device.device_id) ?? 0, Boolean(onlineByDeviceID[device.device_id])),
       release,
     ));
   }
+  if (cacheTTL > 0) {
+    hostsOnlineCache.set(cacheKey, {
+      fetchedAt: now,
+      hosts,
+      sessionsCount: sessions.length,
+      uniqueDaemonCount: daemonDevices.length,
+    });
+    pruneHostsOnlineCache(now, cacheTTL);
+  }
+  void recordPresenceTelemetry(telemetryProvider, request, {
+    presence_source: daemonDevices.length > 0 ? "batch_do" : "none",
+    sessions_count: sessions.length,
+    unique_daemon_count: daemonDevices.length,
+    presence_batch_size: daemonDevices.length,
+  });
   return jsonResponse({ hosts });
 }
 
@@ -1260,6 +1444,9 @@ async function daemonControl(request, store, env) {
 
 async function browserWebSocket(request, store, env, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
+  if (!browserRealtimeEnabled(env)) {
+    return errorResponse("browser realtime is disabled in this runtime", ErrorCode.UnsupportedRuntime, { status: 501 });
+  }
   const { userID, deviceID } = await authorizeBrowserRealtimeWebSocket(request, store, url);
   const control = createControlHubForUser(env, userID);
   return control.acceptBrowserWebSocket(request, { userID, deviceID });
@@ -1277,6 +1464,9 @@ export async function authorizeNexusWebSocket(request, env = {}) {
     }
     if (path === "/api/ws") {
       if (request.method !== "GET") return { ok: false, response: methodNotAllowed("GET") };
+      if (!browserRealtimeEnabled(requestRuntime.env)) {
+        return { ok: false, response: errorResponse("browser realtime is disabled in this runtime", ErrorCode.UnsupportedRuntime, { status: 501 }) };
+      }
       return { ok: true, endpoint: "browser", ...(await authorizeBrowserRealtimeWebSocket(request, store, url)) };
     }
     return { ok: false, response: errorResponse("not found", ErrorCode.NotFound, { status: 404 }) };
@@ -1301,6 +1491,9 @@ function createRequestRuntime(env = {}, ctx = {}) {
   const runtimeEnv = {
     ...env,
     ...(providers.controlHub ? { POCKLY_CONTROL_HUB: providers.controlHub } : {}),
+    POCKLY_CONTROL_EVENT_SINK: createSessionEventSink(requireNexusProvider(providers, "store"), {
+      persistTerminalEvents: terminalEventCacheEnabled(env),
+    }),
     ...(providers.blobStore ? { RELEASES: providers.blobStore } : {}),
     ...(providers.sttProvider ? { POCKLY_STT_PROVIDER: providers.sttProvider } : {}),
     ...(providers.pushProvider ? { POCKLY_PUSH_PROVIDER: providers.pushProvider } : {}),
@@ -1310,6 +1503,142 @@ function createRequestRuntime(env = {}, ctx = {}) {
     env: runtimeEnv,
     store: requireNexusProvider(providers, "store"),
   };
+}
+
+export function createSessionEventSink(store, options = {}) {
+  const persistTerminalEvents = options.persistTerminalEvents !== false;
+  return {
+    async onControlEvent(payload, meta = {}) {
+      // Turn content goes straight into session_turns — the same row the
+      // daemon's window sync would write later (a byte-identical re-upsert is
+      // a zero-write no-op under the conditional upsert). Persisting the turn
+      // once instead of duplicating it inside a session_events row halves the
+      // D1 row-writes of an active turn; pollers read it back via the
+      // turns/next_seq fields of the events response.
+      const turnRow = sessionTurnRecord(payload, meta);
+      if (turnRow) {
+        try {
+          await store.upsertTurns([turnRow]);
+        } catch {
+          // The daemon window sync re-uploads the same turns from the local
+          // jsonl, so a failed live write only delays content, never loses it.
+        }
+      }
+      const event = sessionEventRecord(payload, meta, { turnPersisted: Boolean(turnRow) });
+      if (!event) return;
+      try {
+        await store.appendSessionEvent(event);
+      } catch {
+        // Recent events are an active-turn optimization. The daemon catalog and
+        // window sync remain the source of truth, so sink failures must not
+        // break control-plane delivery.
+      }
+    },
+    async onTerminalEvent(payload, meta = {}) {
+      if (!persistTerminalEvents) return;
+      const event = terminalEventRecord(payload, meta);
+      if (!event) return;
+      try {
+        await store.appendSessionEvent(event);
+      } catch {
+        // Terminal event polling is only a fallback for runtimes without a long
+        // terminal stream. Terminal streams and daemon-local buffers remain the
+        // source of truth.
+      }
+    },
+  };
+}
+
+// sessionTurnRecord maps a turn-carrying control event onto a session_turns
+// row (the durable shape syncTurnRecord also produces). Returns null when the
+// routing keys are unresolvable — the caller then falls back to persisting the
+// full event row so no content is dropped.
+function sessionTurnRecord(payload, meta = {}) {
+  const turn = payload?.turn && typeof payload.turn === "object" ? payload.turn : null;
+  if (!turn) return null;
+  const userID = String(meta.userID || "");
+  const deviceID = String(turn.device_id || payload.device_id || meta.daemonDeviceID || "");
+  const sessionID = String(turn.session_id || payload.session_id || "");
+  const seq = Number(turn.seq);
+  if (!userID || !deviceID || !sessionID || !Number.isFinite(seq) || seq <= 0) return null;
+  const now = new Date().toISOString();
+  return {
+    user_id: userID,
+    device_id: deviceID,
+    session_id: sessionID,
+    seq,
+    agent: String(turn.agent || ""),
+    kind: String(turn.kind || ""),
+    timestamp: String(turn.timestamp || payload.timestamp || now),
+    payload: turn.payload === undefined || turn.payload === null
+      ? null
+      : (typeof turn.payload === "string" ? turn.payload : JSON.stringify(turn.payload)),
+    updated_at: now,
+  };
+}
+
+function sessionEventRecord(payload, meta = {}, options = {}) {
+  if (!shouldPersistSessionEvent(payload, meta, options)) return null;
+  const requestID = String(payload?.request_id || "");
+  if (!requestID) return null;
+  const turn = payload.turn && typeof payload.turn === "object" ? payload.turn : null;
+  const sessionID = String(payload.session_id || turn?.session_id || "");
+  const deviceID = String(payload.device_id || turn?.device_id || meta.daemonDeviceID || "");
+  if (!deviceID) return null;
+  const userID = String(meta.userID || "");
+  if (!userID) return null;
+  const now = new Date().toISOString();
+  return {
+    user_id: userID,
+    device_id: deviceID,
+    session_id: sessionID,
+    request_id: requestID,
+    event_type: String(payload.type || payload.stage || meta.kind || "control_event"),
+    payload: JSON.stringify(payload),
+    created_at: String(payload.timestamp || turn?.timestamp || now),
+  };
+}
+
+function shouldPersistSessionEvent(payload, meta = {}, options = {}) {
+  const type = String(payload?.type || payload?.stage || meta.kind || "");
+  // Lifecycle/status events always persist — they drive the poller's state
+  // machine and are few per inject.
+  if (type === "session_created") return true;
+  if (type === "approval_required") return true;
+  if (type === "inject_completed" || type === "inject_failed" || type === "inject_cancelled") return true;
+  if (type === "completed" || type === "failed") return true;
+  if (payload?.status === "completed" || payload?.status === "failed") return true;
+  // Pure turn events (stream_event) are content, not lifecycle. When the turn
+  // was already written into session_turns, skip the duplicate event row;
+  // keep the old behavior as a fallback when the turn keys were unresolvable.
+  if (payload?.turn && typeof payload.turn === "object" && !options.turnPersisted) return true;
+  return false;
+}
+
+function terminalEventRecord(payload, meta = {}) {
+  if (!payload || typeof payload !== "object") return null;
+  const terminalSessionID = String(payload.terminal_session_id || "");
+  if (!terminalSessionID) return null;
+  const userID = String(meta.userID || payload.user_id || "");
+  if (!userID) return null;
+  const now = new Date().toISOString();
+  return {
+    user_id: userID,
+    device_id: String(payload.daemon_device_id || payload.device_id || meta.daemonDeviceID || ""),
+    session_id: String(payload.session_id || meta.sessionID || ""),
+    request_id: terminalSessionID,
+    event_type: String(payload.kind || "terminal_event"),
+    payload: JSON.stringify(payload),
+    created_at: String(payload.timestamp || now),
+  };
+}
+
+function terminalEventCacheEnabled(env = {}) {
+  const configured = env.TERMINAL_EVENT_CACHE_ENABLED ?? env.POCKLY_TERMINAL_EVENT_CACHE_ENABLED;
+  if (configured !== undefined && configured !== null && String(configured) !== "") {
+    return enabledFlag(configured);
+  }
+  return String(env.POCKLY_NEXUS_RUNTIME || env.NEXUS_RUNTIME || "").trim() !== "managed";
 }
 
 async function authorizeDaemonControlWebSocket(request, store) {
@@ -1454,7 +1783,7 @@ async function sessionInject(request, store, env, sessionID, url) {
   const options = injectStreamOptions(sessionID);
   options.initialEvent = { request_id: requestID, type: "inject_started", session_id: sessionID };
   options.userID = user.user_id;
-  return control.streamRequest(daemon.device_id, {
+  const envelope = {
     type: "INJECT_REQUEST",
     request: {
       request_id: requestID,
@@ -1468,7 +1797,19 @@ async function sessionInject(request, store, env, sessionID, url) {
       model: body.model,
       files: body.files,
     },
-  }, requestID, options);
+  };
+  if (!controlStreamingEnabled(env)) {
+    await control.dispatch(daemon.device_id, envelope);
+    return jsonResponse({
+      request_id: requestID,
+      status: "accepted",
+      type: "inject_started",
+      session_id: sessionID,
+      device_id: daemon.device_id,
+      streaming: false,
+    });
+  }
+  return control.streamRequest(daemon.device_id, envelope, requestID, options);
 }
 
 async function sessionSync(request, store, env, sessionID, url) {
@@ -1485,7 +1826,7 @@ async function sessionSync(request, store, env, sessionID, url) {
   const options = syncStreamOptions(sessionID, daemon.device_id);
   options.initialEvent = { ...options.initialEvent, request_id: requestID };
   options.userID = user.user_id;
-  return control.streamRequest(daemon.device_id, {
+  const envelope = {
     type: "SYNC_SESSION_REQUEST",
     sync_request: {
       request_id: requestID,
@@ -1496,7 +1837,19 @@ async function sessionSync(request, store, env, sessionID, url) {
       limit: Number(body.limit ?? 20),
       before_seq: Number(body.before_seq ?? 0),
     },
-  }, requestID, options);
+  };
+  if (!controlStreamingEnabled(env)) {
+    await control.dispatch(daemon.device_id, envelope);
+    return jsonResponse({
+      request_id: requestID,
+      session_id: sessionID,
+      device_id: daemon.device_id,
+      stage: "queued",
+      status: "running",
+      streaming: false,
+    });
+  }
+  return control.streamRequest(daemon.device_id, envelope, requestID, options);
 }
 
 async function sessionAgentSettings(request, store, env, sessionID, url) {
@@ -1617,7 +1970,7 @@ async function startTask(request, store, env) {
   const options = injectStreamOptions(sessionID);
   options.initialEvent = { request_id: requestID, type: "inject_started", session_id: sessionID };
   options.userID = user.user_id;
-  return control.streamRequest(daemon.device_id, {
+  const envelope = {
     type: "INJECT_REQUEST",
     request: {
       request_id: requestID,
@@ -1632,7 +1985,19 @@ async function startTask(request, store, env) {
       permission_mode: body.permission_mode || "",
       effort: body.effort || "",
     },
-  }, requestID, options);
+  };
+  if (!controlStreamingEnabled(env)) {
+    await control.dispatch(daemon.device_id, envelope);
+    return jsonResponse({
+      request_id: requestID,
+      status: "accepted",
+      type: "inject_started",
+      session_id: sessionID,
+      device_id: daemon.device_id,
+      streaming: false,
+    });
+  }
+  return control.streamRequest(daemon.device_id, envelope, requestID, options);
 }
 
 async function terminalSessions(request, store, env) {
@@ -1683,8 +2048,20 @@ async function terminalSessionByID(request, store, env, terminalSessionID, actio
         if (request.method !== "POST") return methodNotAllowed("POST");
         await control.openTerminalSession(user.user_id, terminalSessionID);
         return jsonResponse({ status: "queued" });
+      case "subscribe":
+        if (request.method !== "POST") return methodNotAllowed("POST");
+        return jsonResponse(await control.subscribeTerminalSession(user.user_id, terminalSessionID));
+      case "unsubscribe":
+        if (request.method !== "POST") return methodNotAllowed("POST");
+        return jsonResponse(await control.unsubscribeTerminalSession(user.user_id, terminalSessionID));
+      case "events":
+        if (request.method !== "GET") return methodNotAllowed("GET");
+        return jsonResponse(await listTerminalEvents(store, control, request, user.user_id, terminalSessionID));
       case "stream":
         if (request.method !== "GET") return methodNotAllowed("GET");
+        if (!terminalStreamingEnabled(env)) {
+          return errorResponse("terminal streaming is disabled in this runtime", ErrorCode.UnsupportedRuntime, { status: 501 });
+        }
         return control.streamTerminalSession(user.user_id, terminalSessionID);
       default:
         return errorResponse("not found", ErrorCode.NotFound, { status: 404 });
@@ -1696,6 +2073,18 @@ async function terminalSessionByID(request, store, env, terminalSessionID, actio
     }
     return mapControlError(error);
   }
+}
+
+function browserRealtimeEnabled(env = {}) {
+  return enabledFlag(env.BROWSER_REALTIME_ENABLED ?? env.REALTIME_ENABLED);
+}
+
+function controlStreamingEnabled(env = {}) {
+  return enabledFlag(env.CONTROL_STREAMING_ENABLED ?? "1");
+}
+
+function terminalStreamingEnabled(env = {}) {
+  return enabledFlag(env.TERMINAL_STREAMING_ENABLED ?? env.TERMINAL_ENABLED);
 }
 
 async function acceptTelemetry(request, provider) {
@@ -1866,6 +2255,26 @@ async function cancelInject(request, store, env, requestID) {
     }
     return mapControlError(error);
   }
+}
+
+async function listTerminalEvents(store, control, request, userID, terminalSessionID) {
+  const url = new URL(request.url);
+  const options = {
+    after: url.searchParams.get("after") || "",
+    limit: url.searchParams.get("limit") || "",
+  };
+  const persisted = await store.listSessionEvents(userID, "", "", {
+    ...options,
+    request_id: terminalSessionID,
+  });
+  if (persisted.length > 0) {
+    const events = persisted.map(publicSessionEvent);
+    return {
+      events,
+      next_cursor: events.at(-1)?.cursor || options.after,
+    };
+  }
+  return control.listTerminalEvents(userID, terminalSessionID, options);
 }
 
 async function unsupportedControl(request, action) {
@@ -2097,9 +2506,19 @@ async function assertDaemonAssignable(store, daemonDeviceID, userID, publicKey) 
   }
 }
 
-function syncSessionRecord(user, device, session, now, uploadedTurnCount) {
+async function syncSessionRecord(store, user, device, session, now, uploadedTurnCount) {
+  const existing = await store.getSession(user.user_id, device.device_id, requiredString(session.session_id, "session_id"));
+  const persistedTurnCount = uploadedTurnCount > 0
+    ? (await store.listTurns(user.user_id, device.device_id, String(session.session_id))).length
+    : Number(existing?.synced_turn_count ?? 0);
   const minSeq = Number(session.min_seq ?? 0);
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
+  const syncedMinSeq = uploadedTurnCount > 0
+    ? mergeSyncedMinSeq(existing?.synced_min_seq, minSeq)
+    : Number(existing?.synced_min_seq ?? 0);
+  const syncedMaxSeq = uploadedTurnCount > 0
+    ? Math.max(Number(existing?.synced_max_seq ?? 0), maxSeq)
+    : Number(existing?.synced_max_seq ?? 0);
   return {
     user_id: user.user_id,
     computer_id: device.computer_id ?? null,
@@ -2114,15 +2533,112 @@ function syncSessionRecord(user, device, session, now, uploadedTurnCount) {
     last_seq: Number(session.last_seq ?? maxSeq),
     last_timestamp: session.last_timestamp || now,
     channel_last_seen_at: session.channel_last_seen_at || device.last_seen_at || now,
-    sync_state: session.sync_state || (uploadedTurnCount > 0 ? "ready" : "catalog_only"),
+    sync_state: mergedSyncState(existing, session, uploadedTurnCount, {
+      persistedTurnCount,
+      syncedMinSeq,
+      syncedMaxSeq,
+    }),
     turn_count: Number(session.turn_count ?? 0),
     last_sync_error: "",
-    synced_turn_count: uploadedTurnCount,
-    synced_min_seq: uploadedTurnCount > 0 ? minSeq : 0,
-    synced_max_seq: uploadedTurnCount > 0 ? maxSeq : 0,
-    has_older_turns: Boolean(session.has_older),
+    synced_turn_count: persistedTurnCount,
+    synced_min_seq: syncedMinSeq,
+    synced_max_seq: syncedMaxSeq,
+    has_older_turns: mergedHasOlderTurns(existing, session, uploadedTurnCount, { syncedMinSeq, syncedMaxSeq }),
     updated_at: session.last_timestamp || now,
   };
+}
+
+function mergeSyncedMinSeq(existing, incoming) {
+  const current = Number(existing ?? 0);
+  const next = Number(incoming ?? 0);
+  if (current <= 0) return next > 0 ? next : 0;
+  if (next <= 0) return current;
+  return Math.min(current, next);
+}
+
+function mergedSyncState(existing, session, uploadedTurnCount, synced = {}) {
+  const incoming = session.sync_state || (uploadedTurnCount > 0 ? "ready" : "catalog_only");
+  if (incoming === "failed" || incoming === "syncing") return incoming;
+  if (incoming === "partial" || session.has_older) return "partial";
+  if (uploadedTurnCount > 0) {
+    const total = Number(session.turn_count ?? 0);
+    if (
+      total > 0 &&
+      Number(synced.persistedTurnCount ?? 0) >= total &&
+      Number(synced.syncedMinSeq ?? 0) <= 1 &&
+      Number(synced.syncedMaxSeq ?? 0) >= total
+    ) {
+      return "fully_synced";
+    }
+    return "partial";
+  }
+  if (incoming === "fully_synced") return "fully_synced";
+  if (existing?.sync_state && existing.sync_state !== "catalog_only") return existing.sync_state;
+  return incoming;
+}
+
+function mergedHasOlderTurns(existing, session, uploadedTurnCount, synced = {}) {
+  if (uploadedTurnCount > 0) {
+    const total = Number(session.turn_count ?? 0);
+    if (
+      !session.has_older &&
+      total > 0 &&
+      Number(synced.syncedMinSeq ?? 0) <= 1 &&
+      Number(synced.syncedMaxSeq ?? 0) >= total
+    ) {
+      return false;
+    }
+  }
+  return Boolean(session.has_older || existing?.has_older_turns);
+}
+
+function uniqueDaemonDeviceIDs(sessions, devicesByID) {
+  const ids = new Set();
+  for (const session of sessions) {
+    const deviceID = String(session.device_id || "");
+    if (!deviceID) continue;
+    const device = devicesByID.get(deviceID);
+    if (!device || device.device_type !== "daemon" || device.status !== "active" || !device.remote_access_enabled) continue;
+    ids.add(deviceID);
+  }
+  return [...ids];
+}
+
+function hostsOnlineCacheKey(userID, requesterDeviceID, env = {}) {
+  return `${env.POCKLY_HOSTS_ONLINE_CACHE_SCOPE || "default"}:${userID || ""}:${requesterDeviceID || "cookie"}`;
+}
+
+function hostsOnlineCacheMs(env = {}) {
+  const parsed = Number(env.POCKLY_HOSTS_ONLINE_CACHE_MS ?? defaultHostsOnlineCacheMs);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultHostsOnlineCacheMs;
+  return Math.min(5000, parsed);
+}
+
+function pruneHostsOnlineCache(now, ttlMs) {
+  const maxAge = Math.max(ttlMs * 4, 5000);
+  for (const [key, entry] of hostsOnlineCache.entries()) {
+    if (now - entry.fetchedAt > maxAge) hostsOnlineCache.delete(key);
+  }
+}
+
+async function recordPresenceTelemetry(provider, request, fields) {
+  if (!provider) return;
+  const event = {
+    name: "nexus_presence_refresh",
+    command: String(fields.command || "hosts_online"),
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    presence_source: String(fields.presence_source || "none"),
+    sessions_count: Number(fields.sessions_count || 0),
+    unique_daemon_count: Number(fields.unique_daemon_count || 0),
+    presence_batch_size: Number(fields.presence_batch_size || 0),
+  };
+  const payload = JSON.stringify({ events: [event] });
+  try {
+    await invokeTelemetryProvider(provider, payload, request);
+  } catch {
+    // Presence telemetry must never affect the hot path.
+  }
 }
 
 function syncTurnRecord(user, device, turn, now) {
@@ -2224,6 +2740,19 @@ function publicTurn(turn) {
     kind: turn.kind,
     timestamp: turn.timestamp,
     ...(turn.payload ? { payload: parsePayload(turn.payload) } : {}),
+  };
+}
+
+function publicSessionEvent(event) {
+  return {
+    cursor: String(event.event_id || ""),
+    event_id: String(event.event_id || ""),
+    request_id: event.request_id || "",
+    device_id: event.device_id || "",
+    session_id: event.session_id || "",
+    type: event.event_type || "",
+    created_at: event.created_at || "",
+    payload: parsePayload(event.payload),
   };
 }
 

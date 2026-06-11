@@ -148,9 +148,163 @@ describe("Node production Redis control hub", () => {
       await hubB.close();
     }
   });
+
+  it("routes remote terminal subscription hints to the daemon owner node", async () => {
+    const bus = new FakeRedisBus();
+    const hubA = await createStartedHub(bus, "node_a");
+    const hubB = await createStartedHub(bus, "node_b");
+    const envelopes = [];
+    try {
+      hubB.attachDaemonForTest("dd_remote", "usr_remote", async (envelope) => {
+        envelopes.push(envelope);
+      });
+      await eventually(async () => assert.equal(await hubA.isDaemonOnline("dd_remote"), true));
+
+      await hubA.createTerminalSession({
+        request_id: "term_remote",
+        terminal_session_id: "ts_remote_sub",
+        user_id: "usr_remote",
+        daemon_device_id: "dd_remote",
+        browser_device_id: "bd_remote",
+        session_id: "sess_remote",
+        agent: "claude-code",
+        cwd: "/work/app",
+      });
+      envelopes.length = 0;
+
+      await hubA.subscribeTerminalSession("usr_remote", "ts_remote_sub");
+      await eventually(() => {
+        assert.equal(envelopes.at(-1)?.type, "TERMINAL_SUBSCRIBE");
+      });
+      assert.equal(envelopes.at(-1).terminal_request.terminal_session_id, "ts_remote_sub");
+
+      await hubA.unsubscribeTerminalSession("usr_remote", "ts_remote_sub");
+      await eventually(() => {
+        assert.equal(envelopes.at(-1)?.type, "TERMINAL_UNSUBSCRIBE");
+      });
+      assert.equal(envelopes.at(-1).terminal_request.terminal_session_id, "ts_remote_sub");
+    } finally {
+      await hubA.close();
+      await hubB.close();
+    }
+  });
+
+  it("persists remote daemon control events through the inner hub event sink", async () => {
+    const bus = new FakeRedisBus();
+    const persisted = [];
+    const hubA = await createStartedHub(bus, "node_a");
+    const hubB = await createStartedHub(bus, "node_b", {
+      onControlEvent: (payload, meta) => persisted.push({ payload, meta }),
+    });
+    try {
+      hubB.attachDaemonForTest("dd_remote", "usr_remote", async (envelope, reply) => {
+        if (envelope.type !== "INJECT_REQUEST") return;
+        reply({
+          type: "INJECT_EVENT",
+          event: {
+            request_id: envelope.request.request_id,
+            type: "inject_completed",
+            session_id: "sess_remote",
+            turn: {
+              device_id: "dd_remote",
+              session_id: "sess_remote",
+              seq: 2,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: "2026-06-06T01:00:00Z",
+              payload: { text: "remote persisted" },
+            },
+          },
+        });
+      });
+      await eventually(async () => assert.equal(await hubA.isDaemonOnline("dd_remote"), true));
+
+      const options = injectStreamOptions("sess_remote");
+      options.userID = "usr_remote";
+      const response = hubA.streamRequest("dd_remote", {
+        type: "INJECT_REQUEST",
+        request: {
+          request_id: "inj_remote_persist",
+          daemon_device_id: "dd_remote",
+          browser_device_id: "bd_remote",
+          session_id: "sess_remote",
+          mode: "resume_session",
+          text: "hello",
+        },
+      }, "inj_remote_persist", options);
+      await readSSEEvents(response, 1);
+
+      await eventually(() => {
+        assert.equal(persisted.length, 1);
+      });
+      assert.equal(persisted[0].payload.type, "inject_completed");
+      assert.equal(persisted[0].meta.userID, "usr_remote");
+      assert.equal(persisted[0].meta.daemonDeviceID, "dd_remote");
+    } finally {
+      await hubA.close();
+      await hubB.close();
+    }
+  });
+
+  it("persists remote daemon dispatch events for polling fallback without stream routes", async () => {
+    const bus = new FakeRedisBus();
+    const persisted = [];
+    const hubA = await createStartedHub(bus, "node_a");
+    const hubB = await createStartedHub(bus, "node_b", {
+      onControlEvent: (payload, meta) => persisted.push({ payload, meta }),
+    });
+    try {
+      hubB.attachDaemonForTest("dd_remote", "usr_remote", async (envelope, reply) => {
+        if (envelope.type !== "INJECT_REQUEST") return;
+        reply({
+          type: "INJECT_EVENT",
+          event: {
+            request_id: envelope.request.request_id,
+            type: "inject_completed",
+            session_id: "sess_remote",
+            turn: {
+              device_id: "dd_remote",
+              session_id: "sess_remote",
+              seq: 2,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: "2026-06-06T01:00:00Z",
+              payload: { text: "remote polling fallback persisted" },
+            },
+          },
+        });
+      });
+      await eventually(async () => assert.equal(await hubA.isDaemonOnline("dd_remote"), true));
+
+      await hubA.dispatch("dd_remote", {
+        type: "INJECT_REQUEST",
+        request: {
+          request_id: "inj_remote_polling",
+          daemon_device_id: "dd_remote",
+          browser_device_id: "bd_remote",
+          session_id: "sess_remote",
+          mode: "resume_session",
+          text: "hello",
+        },
+      });
+
+      await eventually(() => {
+        assert.equal(persisted.length, 1);
+      });
+      assert.equal(hubA.remoteStreams.size, 0);
+      assert.equal(persisted[0].payload.request_id, "inj_remote_polling");
+      assert.equal(persisted[0].payload.type, "inject_completed");
+      assert.equal(persisted[0].payload.turn.payload.text, "remote polling fallback persisted");
+      assert.equal(persisted[0].meta.userID, "usr_remote");
+      assert.equal(persisted[0].meta.daemonDeviceID, "dd_remote");
+    } finally {
+      await hubA.close();
+      await hubB.close();
+    }
+  });
 });
 
-async function createStartedHub(bus, nodeID) {
+async function createStartedHub(bus, nodeID, eventSink = null) {
   const hub = new RedisControlHub({
     commandClient: bus.createClient(),
     subscriberClient: bus.createClient(),
@@ -159,6 +313,7 @@ async function createStartedHub(bus, nodeID) {
     ownerTTLSeconds: 30,
     logger: { warn: () => {} },
     ownsClients: true,
+    ...(eventSink ? { eventSink } : {}),
   });
   await hub.start();
   return hub;

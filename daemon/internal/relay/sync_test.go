@@ -4,6 +4,7 @@
 package relay
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -58,6 +59,9 @@ func TestBuildSyncRequestStableSeq(t *testing.T) {
 	if len(req1.Sessions) != 1 || req1.Sessions[0].LastSeq != 0 || req1.Sessions[0].SyncState != "catalog_only" {
 		t.Fatalf("unexpected sessions: %+v", req1.Sessions)
 	}
+	if req1.Sessions[0].TurnCount != 3 {
+		t.Fatalf("catalog turn_count = %d, want 3", req1.Sessions[0].TurnCount)
+	}
 	if req1.Sessions[0].RunnerAlias != "claude" {
 		t.Fatalf("runner alias = %q, want claude", req1.Sessions[0].RunnerAlias)
 	}
@@ -72,19 +76,52 @@ func TestBuildSyncRequestStableSeq(t *testing.T) {
 	if req1.Sessions[0].Snippet != "hello from claude" {
 		t.Fatalf("snippet = %q, want the plaintext first message", req1.Sessions[0].Snippet)
 	}
+	if req1.Sessions[0].Title != "hello from claude" {
+		t.Fatalf("title = %q, want the first message title", req1.Sessions[0].Title)
+	}
 }
 
-func TestBuildSingleSessionSyncRequestEmitsPlaintextTurns(t *testing.T) {
+func TestBuildCatalogSyncRequestCarriesMetadataOnlyForOldHistory(t *testing.T) {
+	idx := fixtureIndex(t)
+	req, err := BuildCatalogSyncRequest(idx, "dd_test", claudeProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Sessions) != 1 {
+		t.Fatalf("len(sessions) = %d, want 1", len(req.Sessions))
+	}
+	session := req.Sessions[0]
+	if session.SyncState != "catalog_only" {
+		t.Fatalf("sync_state = %q, want catalog_only", session.SyncState)
+	}
+	if session.TurnCount != 3 {
+		t.Fatalf("turn_count = %d, want 3", session.TurnCount)
+	}
+	if session.LastSeq != 0 || session.MinSeq != 0 || session.MaxSeq != 0 || session.HasOlder {
+		t.Fatalf("catalog session should not claim a turn window: %+v", session)
+	}
+	if session.Title == "" || session.Snippet == "" || session.FirstMessage == "" || session.LastTimestamp == "" {
+		t.Fatalf("catalog session missing required metadata: %+v", session)
+	}
+	if len(req.Turns) != 0 {
+		t.Fatalf("catalog sync included %d turns, want metadata only", len(req.Turns))
+	}
+}
+
+func TestBuildSingleSessionSyncRequestEmitsLocalPlaintextTurns(t *testing.T) {
 	idx := fixtureIndex(t)
 	req, err := BuildSingleSessionSyncRequest(idx, "dd_test", "11111111-1111-1111-1111-111111111111", claudeProfile, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(req.Turns) != 3 {
-		t.Fatalf("len(turns) = %d, want 3 plaintext turns", len(req.Turns))
+		t.Fatalf("len(turns) = %d, want 3 local turns", len(req.Turns))
 	}
 	if len(req.Sessions) != 1 || req.Sessions[0].RunnerAlias != "claude" || req.Sessions[0].ChannelLastSeenAt != "2026-05-18T10:00:02Z" {
 		t.Fatalf("unexpected session metadata: %+v", req.Sessions)
+	}
+	if req.Sessions[0].Title != "hello from claude" || req.Sessions[0].Snippet != "hello from claude" {
+		t.Fatalf("single-session sync title/snippet = %q/%q, want first user message", req.Sessions[0].Title, req.Sessions[0].Snippet)
 	}
 	for i, turn := range req.Turns {
 		if turn.Seq != i+1 {
@@ -94,11 +131,12 @@ func TestBuildSingleSessionSyncRequestEmitsPlaintextTurns(t *testing.T) {
 			t.Fatalf("turn[%d].session_id = %q", i, turn.SessionID)
 		}
 	}
-	// Plaintext now: the content Nexus stores IS the conversation.
+	// The builder returns local plaintext so daemon can still compute stable
+	// signatures and encrypt per recipient immediately before upload.
 	raw, _ := json.Marshal(req.Turns)
 	for _, want := range []string{"hello from claude", "Read"} {
 		if !strings.Contains(string(raw), want) {
-			t.Fatalf("plaintext turns missing %q: %s", want, raw)
+			t.Fatalf("local turns missing %q: %s", want, raw)
 		}
 	}
 }
@@ -321,6 +359,45 @@ func TestSelectBlockWindowLatestAndOlderChunks(t *testing.T) {
 	}
 }
 
+func TestBuildSingleSessionWindowSyncRequestDefaultsToLatestTwenty(t *testing.T) {
+	idx, sessionID := fixtureIndexWithTurns(t, 25)
+	req, err := BuildSingleSessionWindowSyncRequestContext(context.Background(), idx, "dd_test", sessionID, claudeProfile, SessionWindow{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Turns) != 20 {
+		t.Fatalf("len(turns) = %d, want default latest 20", len(req.Turns))
+	}
+	if req.Turns[0].Seq != 6 || req.Turns[len(req.Turns)-1].Seq != 25 {
+		t.Fatalf("window seq = %d..%d, want 6..25", req.Turns[0].Seq, req.Turns[len(req.Turns)-1].Seq)
+	}
+	if len(req.Sessions) != 1 {
+		t.Fatalf("len(sessions) = %d, want 1", len(req.Sessions))
+	}
+	meta := req.Sessions[0]
+	if meta.SyncState != "partial" || meta.TurnCount != 25 || meta.MinSeq != 6 || meta.MaxSeq != 25 || !meta.HasOlder {
+		t.Fatalf("unexpected window metadata: %+v", meta)
+	}
+}
+
+func TestBuildSingleSessionWindowSyncRequestAllowsPriorityHundred(t *testing.T) {
+	idx, sessionID := fixtureIndexWithTurns(t, 130)
+	req, err := BuildSingleSessionWindowSyncRequestContext(context.Background(), idx, "dd_test", sessionID, claudeProfile, SessionWindow{Limit: 100}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(req.Turns) != 100 {
+		t.Fatalf("len(turns) = %d, want priority window 100", len(req.Turns))
+	}
+	if req.Turns[0].Seq != 31 || req.Turns[len(req.Turns)-1].Seq != 130 {
+		t.Fatalf("window seq = %d..%d, want 31..130", req.Turns[0].Seq, req.Turns[len(req.Turns)-1].Seq)
+	}
+	meta := req.Sessions[0]
+	if meta.SyncState != "partial" || meta.TurnCount != 130 || meta.MinSeq != 31 || meta.MaxSeq != 130 || !meta.HasOlder {
+		t.Fatalf("unexpected priority window metadata: %+v", meta)
+	}
+}
+
 func TestPayloadForBlockCarriesRichRendererFields(t *testing.T) {
 	payload, err := payloadForBlock(agent.Block{
 		Kind:                agent.BlockImage,
@@ -447,6 +524,35 @@ func fixtureIndex(t *testing.T) *index.Index {
 		t.Fatal(err)
 	}
 	return idx
+}
+
+func fixtureIndexWithTurns(t *testing.T, count int) (*index.Index, string) {
+	t.Helper()
+	claudeHome := filepath.Join(t.TempDir(), ".claude", "projects")
+	projectDir := filepath.Join(claudeHome, "-tmp-window-project")
+	mustMkdirAll(t, projectDir)
+
+	sessionID := "66666666-6666-6666-6666-666666666666"
+	lines := make([]string, 0, count)
+	base := time.Date(2026, 5, 22, 10, 0, 0, 0, time.UTC)
+	for i := 1; i <= count; i++ {
+		ts := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339)
+		if i%2 == 1 {
+			lines = append(lines, fmt.Sprintf(`{"sessionId":%q,"cwd":"/tmp/window/project","timestamp":%q,"type":"user","message":{"role":"user","content":%q}}`, sessionID, ts, fmt.Sprintf("user %02d", i)))
+		} else {
+			lines = append(lines, fmt.Sprintf(`{"sessionId":%q,"cwd":"/tmp/window/project","timestamp":%q,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":%q}]}}`, sessionID, ts, fmt.Sprintf("assistant %02d", i)))
+		}
+	}
+	mustWriteFile(t, filepath.Join(projectDir, sessionID+".jsonl"), strings.Join(lines, "\n")+"\n")
+
+	idx := index.New(index.Config{
+		ClaudeHome:      claudeHome,
+		RefreshInterval: time.Minute,
+	})
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	return idx, sessionID
 }
 
 func richFixtureIndex(t *testing.T) *index.Index {
@@ -613,6 +719,9 @@ func TestBuildCatalogSyncRequestBoundsBodyToByteBudget(t *testing.T) {
 	}
 	if len(req.Sessions) == 0 {
 		t.Fatal("catalog sync dropped ALL sessions; expected the most recent ones to survive")
+	}
+	if req.CatalogComplete {
+		t.Fatal("capped catalog reported CatalogComplete=true; caller would incorrectly full-reconcile and delete older sessions")
 	}
 
 	// 3. The kept sessions must be the MOST RECENT ones: every dropped

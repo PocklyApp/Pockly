@@ -13,7 +13,15 @@ import {
   devicePresenceStatus,
   findCreatedSessionForDraft,
   groupSessions,
+  mergeHostPresenceIntoSessions,
+  offlineLazyBackfillMessage,
   pickSelection,
+  PRESENCE_REFRESH_BACKGROUND_MS,
+  PRESENCE_REFRESH_FOREGROUND_MS,
+  SESSION_CATALOG_REFRESH_MS,
+  shouldRefreshSessionCatalog,
+  shouldSyncSessionOnOpen,
+  shouldUseBrowserRealtime,
   shouldGateAuthenticatedWorkspaceSplash,
   workspaceHomeEmptyState,
   type ReaderSelection,
@@ -396,4 +404,156 @@ test("findCreatedSessionForDraft still binds a draft with explicit cwd to a matc
   });
   const matched = findCreatedSessionForDraft([unrelatedSession, matchingSession], draftWithCwd);
   assert.equal(matched?.session_id, "sess_matched");
+});
+
+test("presence polling refreshes session catalog only on interval or forced resume", () => {
+  assert.equal(PRESENCE_REFRESH_FOREGROUND_MS, 10_000);
+  assert.equal(PRESENCE_REFRESH_BACKGROUND_MS, 60_000);
+  assert.equal(SESSION_CATALOG_REFRESH_MS, 60_000);
+  assert.equal(shouldRefreshSessionCatalog({
+    now: 5_000,
+    lastSessionRefreshAt: 0,
+    visible: true,
+    intervalMs: 60_000,
+  }), false);
+  assert.equal(shouldRefreshSessionCatalog({
+    now: 60_000,
+    lastSessionRefreshAt: 0,
+    visible: true,
+    intervalMs: 60_000,
+  }), true);
+  assert.equal(shouldRefreshSessionCatalog({
+    now: 120_000,
+    lastSessionRefreshAt: 0,
+    visible: false,
+    intervalMs: 60_000,
+  }), false);
+  assert.equal(shouldRefreshSessionCatalog({
+    now: 5_000,
+    lastSessionRefreshAt: 0,
+    visible: false,
+    force: true,
+    intervalMs: 60_000,
+  }), true);
+});
+
+test("session websocket requires explicit runtime support", () => {
+  assert.equal(shouldUseBrowserRealtime(null), false);
+  assert.equal(shouldUseBrowserRealtime({ runtime: "self_hosted" }), false);
+  assert.equal(shouldUseBrowserRealtime({ runtime: "self_hosted", browser_realtime: false }), false);
+  assert.equal(shouldUseBrowserRealtime({ runtime: "self_hosted", browser_realtime: true }), true);
+});
+
+test("host-only presence refresh updates session writability without catalog refresh", () => {
+  const current = [
+    session("sess_a", "dd_a", {
+      connection_mode: "read_only",
+      writable: false,
+      channel_last_seen_at: "2026-05-23T07:50:00Z",
+    }),
+    session("sess_b", "dd_b", {
+      connection_mode: "sdk_headless",
+      writable: true,
+    }),
+  ];
+
+  const online = mergeHostPresenceIntoSessions(current, [
+    host("dd_a", {
+      presence_status: "online",
+      remote_access_enabled: true,
+      status: "active",
+      last_seen_at: "2026-05-23T08:10:00Z",
+      last_channel_seen_at: "2026-05-23T08:10:00Z",
+    }),
+    host("dd_b", {
+      presence_status: "offline",
+      remote_access_enabled: true,
+      status: "active",
+    }),
+  ]);
+
+  assert.notEqual(online, current);
+  assert.equal(online[0].writable, true);
+  assert.equal(online[0].connection_mode, "sdk_headless");
+  assert.equal(online[0].channel_last_seen_at, "2026-05-23T08:10:00Z");
+  assert.equal(online[1].writable, false);
+  assert.equal(online[1].connection_mode, "read_only");
+});
+
+test("host-only presence refresh preserves session object identity when unchanged", () => {
+  const current = [session("sess_a", "dd_a")];
+  const next = mergeHostPresenceIntoSessions(current, [
+    host("dd_a", {
+      presence_status: "online",
+      remote_access_enabled: true,
+      status: "active",
+      last_channel_seen_at: "2026-05-23T08:00:00Z",
+    }),
+  ]);
+
+  assert.equal(next, current);
+});
+
+test("offline catalog-only session explains lazy history backfill instead of loss", () => {
+  const message = offlineLazyBackfillMessage(session("sess_old", "dd_a", {
+    connection_mode: "read_only",
+    writable: false,
+    sync_state: "catalog_only",
+    turn_count: 80,
+    synced_turn_count: 0,
+  }));
+
+  assert.equal(message?.title, "Complete history needs this computer online");
+  assert.match(message?.body ?? "", /0 \/ 80/);
+});
+
+test("offline partial session keeps synced history visible with complete-history hint", () => {
+  const message = offlineLazyBackfillMessage(session("sess_partial", "dd_a", {
+    connection_mode: "read_only",
+    writable: false,
+    sync_state: "partial",
+    turn_count: 80,
+    synced_turn_count: 20,
+  }));
+
+  assert.equal(message?.title, "Complete history needs this computer online");
+  assert.match(message?.body ?? "", /20 \/ 80/);
+});
+
+test("offline fully synced session keeps the generic offline handoff copy", () => {
+  const message = offlineLazyBackfillMessage(session("sess_done", "dd_a", {
+    connection_mode: "read_only",
+    writable: false,
+    sync_state: "fully_synced",
+    turn_count: 20,
+    synced_turn_count: 20,
+  }));
+
+  assert.equal(message, null);
+});
+
+test("opening catalog-only or empty partial sessions triggers lazy sync", () => {
+  assert.equal(shouldSyncSessionOnOpen(session("sess_old", "dd_a", {
+    sync_state: "catalog_only",
+    turn_count: 80,
+    synced_turn_count: 0,
+  }), []), true);
+  assert.equal(shouldSyncSessionOnOpen(session("sess_partial", "dd_a", {
+    sync_state: "partial",
+    turn_count: 80,
+    synced_turn_count: 20,
+  }), []), true);
+});
+
+test("opening already hydrated or fully synced sessions does not re-sync", () => {
+  assert.equal(shouldSyncSessionOnOpen(session("sess_partial", "dd_a", {
+    sync_state: "partial",
+    turn_count: 80,
+    synced_turn_count: 20,
+  }), [{ session_id: "sess_partial", device_id: "dd_a", seq: 61, kind: "assistant_text", agent: "claude-code", timestamp: "2026-05-23T08:00:00Z", payload: { text: "loaded" } }]), false);
+  assert.equal(shouldSyncSessionOnOpen(session("sess_done", "dd_a", {
+    sync_state: "fully_synced",
+    turn_count: 20,
+    synced_turn_count: 20,
+  }), []), false);
 });

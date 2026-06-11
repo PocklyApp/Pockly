@@ -5,13 +5,11 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 
 import { SQLNexusStore } from "../store.js";
-
-const migrationPath = fileURLToPath(new URL("../../migrations/0001_initial.sql", import.meta.url));
+import { readMigrationSQLFiles } from "./migrations.js";
 
 export function createSQLiteNexusStore(options = {}) {
   const databasePath = options.databasePath || path.join(options.dataDir || defaultNexusDataDir(), "nexus.sqlite");
@@ -19,7 +17,7 @@ export function createSQLiteNexusStore(options = {}) {
   const db = new Database(databasePath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
-  db.exec(fs.readFileSync(migrationPath, "utf8"));
+  for (const sql of readMigrationSQLFiles()) db.exec(sql);
   const store = new SQLNexusStore(new SQLiteStatementAdapter(db));
   store.databasePath = databasePath;
   store.close = () => db.close();
@@ -36,8 +34,12 @@ class SQLiteStatementAdapter {
   }
 
   prepare(sql) {
-    return new SQLiteStatement(this.db.prepare(sql));
+    return new SQLiteStatement(this.db.prepare(translateSQLiteSQL(sql)));
   }
+}
+
+function translateSQLiteSQL(sql) {
+  return sql.replace(/\bIS\s+DISTINCT\s+FROM\b/gi, "IS NOT");
 }
 
 class SQLiteStatement {

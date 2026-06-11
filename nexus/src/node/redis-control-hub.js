@@ -55,9 +55,11 @@ export class RedisControlHub {
     this.remoteStreamRoutes = new Map();
     this.localDaemonUsers = new Map();
     this.started = false;
+    const localEventSink = options.eventSink || null;
     this.localHub = options.localHub || new InMemoryControlHub({
       terminalStorage: options.terminalStorage || null,
       notificationSink: options.notificationSink || null,
+      eventSink: localEventSink,
       presenceResolver: async (deviceID) => this.resolvePresence(deviceID),
       distributedSink: {
         onDaemonEnvelope: (deviceID, envelope, userID) => {
@@ -96,6 +98,11 @@ export class RedisControlHub {
     this.ownerRefreshTimer.unref?.();
   }
 
+  setEventSink(eventSink) {
+    this.eventSink = eventSink;
+    if (this.localHub) this.localHub.eventSink = eventSink;
+  }
+
   async close() {
     clearInterval(this.ownerRefreshTimer);
     for (const deviceID of this.localDaemonUsers.keys()) {
@@ -114,6 +121,26 @@ export class RedisControlHub {
   isDaemonOnline(deviceID) {
     if (this.localHub.isDaemonOnline(deviceID)) return true;
     return this.getOwner(deviceID).then((owner) => Boolean(owner?.nodeID));
+  }
+
+  async onlineDevices(deviceIDs = []) {
+    const ids = uniqueStrings(deviceIDs);
+    const online = {};
+    const remoteIDs = [];
+    for (const deviceID of ids) {
+      if (this.localHub.isDaemonOnline(deviceID)) online[deviceID] = true;
+      else remoteIDs.push(deviceID);
+    }
+    if (remoteIDs.length === 0) return online;
+    const keys = remoteIDs.map((deviceID) => this.ownerKey(deviceID));
+    let values;
+    if (typeof this.commandClient.mGet === "function") values = await this.commandClient.mGet(keys);
+    else if (typeof this.commandClient.mget === "function") values = await this.commandClient.mget(keys);
+    else values = await Promise.all(keys.map((key) => this.commandClient.get(key)));
+    for (let i = 0; i < remoteIDs.length; i += 1) {
+      online[remoteIDs[i]] = Boolean(parseOwnerValue(values?.[i])?.nodeID);
+    }
+    return online;
   }
 
   acceptDaemonWebSocket(request, input) {
@@ -261,11 +288,27 @@ export class RedisControlHub {
     return this.localHub.streamTerminalSession(userID, terminalSessionID);
   }
 
+  async subscribeTerminalSession(userID, terminalSessionID) {
+    await this.dispatchTerminalAction(userID, terminalSessionID, "TERMINAL_SUBSCRIBE");
+    return { status: "subscribed", terminal_session_id: terminalSessionID };
+  }
+
+  async unsubscribeTerminalSession(userID, terminalSessionID) {
+    await this.dispatchTerminalAction(userID, terminalSessionID, "TERMINAL_UNSUBSCRIBE");
+    return { status: "unsubscribed", terminal_session_id: terminalSessionID };
+  }
+
+  listTerminalEvents(userID, terminalSessionID, options = {}) {
+    return this.localHub.listTerminalEvents(userID, terminalSessionID, options);
+  }
+
   async dispatchTerminalAction(userID, terminalSessionID, type) {
     const session = this.localHub.requireTerminalSession(userID, terminalSessionID);
     if (this.localHub.isDaemonOnline(session.daemon_device_id)) {
       if (type === "TERMINAL_STOP") return await this.localHub.stopTerminalSession(userID, terminalSessionID);
       if (type === "TERMINAL_OPEN_TERMINAL") return await this.localHub.openTerminalSession(userID, terminalSessionID);
+      if (type === "TERMINAL_SUBSCRIBE") return await this.localHub.subscribeTerminalSession(userID, terminalSessionID);
+      if (type === "TERMINAL_UNSUBSCRIBE") return await this.localHub.unsubscribeTerminalSession(userID, terminalSessionID);
     }
     await this.dispatch(session.daemon_device_id, {
       type,
@@ -517,13 +560,7 @@ export class RedisControlHub {
 
   async getOwner(deviceID) {
     const value = await this.commandClient.get(this.ownerKey(deviceID));
-    if (!value) return null;
-    try {
-      const parsed = JSON.parse(value);
-      return { nodeID: parsed.node_id || parsed.nodeID || "", userID: parsed.user_id || parsed.userID || "" };
-    } catch {
-      return { nodeID: String(value), userID: "" };
-    }
+    return parseOwnerValue(value);
   }
 
   async setOwner(deviceID, userID) {
@@ -597,6 +634,28 @@ function parseMessage(raw) {
   } catch {
     return null;
   }
+}
+
+function parseOwnerValue(value) {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value);
+    return { nodeID: parsed.node_id || parsed.nodeID || "", userID: parsed.user_id || parsed.userID || "" };
+  } catch {
+    return { nodeID: String(value), userID: "" };
+  }
+}
+
+function uniqueStrings(values) {
+  const out = [];
+  const seen = new Set();
+  for (const value of values || []) {
+    const next = String(value || "");
+    if (!next || seen.has(next)) continue;
+    seen.add(next);
+    out.push(next);
+  }
+  return out;
 }
 
 function randomID(prefix) {

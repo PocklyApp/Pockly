@@ -221,9 +221,10 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(sessions.map((session) => session.session_id), ["sess_codex", "sess_claude"]);
     assert.deepEqual(new Set(sessions.map((session) => session.agent)), new Set(["claude-code", "codex"]));
     assert.equal(sessions.find((session) => session.session_id === "sess_claude").writable, true);
-    assert.equal(sessions.find((session) => session.session_id === "sess_claude").sync_state, "ready");
+    assert.equal(sessions.find((session) => session.session_id === "sess_claude").sync_state, "fully_synced");
     assert.equal(sessions.find((session) => session.session_id === "sess_codex").sync_state, "catalog_only");
     assert.equal(sessions.find((session) => session.session_id === "sess_codex").synced_turn_count, 0);
+    assert.equal(sessions.find((session) => session.session_id === "sess_codex").turn_count, 1);
 
     const turns = await call(env, "GET", `/api/sessions/sess_claude/turns?device_id=${daemon.daemon_device_id}`, null, {
       authorization: `Bearer ${browser.device_access_token}`,
@@ -239,6 +240,8 @@ describe("worker-native Nexus api", () => {
     const catalogOnlyBody = await catalogOnlyTurns.json();
     assert.equal(catalogOnlyBody.turns.length, 0);
     assert.equal(catalogOnlyBody.needs_sync, true);
+    assert.equal(catalogOnlyBody.total_turn_count, 1);
+    assert.equal(catalogOnlyBody.synced_turn_count, 0);
 
     const hosts = await call(env, "GET", "/api/hosts/online", null, { cookie });
     const hostBody = await hosts.json();
@@ -253,6 +256,330 @@ describe("worker-native Nexus api", () => {
     const daemonDevice = (await devices.json()).devices.find((device) => device.device_id === daemon.daemon_device_id);
     assert.equal(daemonDevice.daemon_latest_version, "v0.1.1");
     assert.equal(daemonDevice.daemon_update_available, true);
+  });
+
+  it("stores a partial lazy sync window without treating missing older turns as lost", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+
+    const turns = [];
+    for (let seq = 81; seq <= 100; seq += 1) {
+      turns.push({
+        session_id: "sess_partial",
+        seq,
+        agent: "claude-code",
+        kind: seq % 2 === 0 ? "assistant_text" : "user_message",
+        timestamp: `2026-06-06T01:${String(seq - 80).padStart(2, "0")}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      });
+    }
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_partial",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "old but visible",
+        last_seq: 100,
+        last_timestamp: "2026-06-06T01:20:00.000Z",
+        sync_state: "partial",
+        turn_count: 100,
+        min_seq: 81,
+        max_seq: 100,
+        has_older: true,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    assert.equal((await sync.json()).turn_count, 20);
+
+    const listed = await call(env, "GET", "/api/sessions", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_partial");
+    assert.equal(session.sync_state, "partial");
+    assert.equal(session.turn_count, 100);
+    assert.equal(session.synced_turn_count, 20);
+    assert.equal(session.synced_min_seq, 81);
+    assert.equal(session.synced_max_seq, 100);
+    assert.equal(session.has_older_turns, true);
+
+    const turnRes = await call(env, "GET", `/api/sessions/sess_partial/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const body = await turnRes.json();
+    assert.equal(body.turns.length, 20);
+    assert.equal(body.oldest_seq, 81);
+    assert.equal(body.latest_seq, 100);
+    assert.equal(body.total_turn_count, 100);
+    assert.equal(body.synced_turn_count, 20);
+    assert.equal(body.has_older_turns, true);
+    assert.equal(body.needs_sync, false);
+  });
+
+  it("stores synced turn payloads for session history", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const connected = await call(env, "POST", `/api/hosts/${daemon.daemon_device_id}/connect`, {
+      browser_device_id: browser.browser_device_id,
+      browser_device_pubkey: browserKeys.publicKey,
+      device_name: "Test Browser",
+      user_agent: "node-test",
+    }, { cookie });
+    assert.equal(connected.status, 200);
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_payload",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_payload",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: { text: "plaintext history" },
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const turns = await call(env, "GET", `/api/sessions/sess_payload/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const body = await turns.json();
+    assert.deepEqual(body.turns[0].payload, { text: "plaintext history" });
+  });
+
+  it("merges lazy backfill windows instead of replacing the latest synced range", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+
+    const syncWindow = async (min, max, hasOlder) => {
+      const turns = [];
+      for (let seq = min; seq <= max; seq += 1) {
+        turns.push({
+          session_id: "sess_merge",
+          seq,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: `2026-06-06T02:${String(seq).padStart(2, "0")}:00.000Z`,
+          payload: { text: `turn ${seq}` },
+        });
+      }
+      const res = await call(env, "POST", "/api/daemon/sync", {
+        hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+        sessions: [{
+          session_id: "sess_merge",
+          agent: "claude-code",
+          cwd: "/work/app",
+          snippet: "merge windows",
+          last_seq: 60,
+          last_timestamp: "2026-06-06T02:59:00.000Z",
+          sync_state: hasOlder ? "partial" : "fully_synced",
+          turn_count: 60,
+          min_seq: min,
+          max_seq: max,
+          has_older: hasOlder,
+        }],
+        turns,
+      }, { authorization: `Bearer ${daemon.device_access_token}` });
+      assert.equal(res.status, 200);
+    };
+
+    await syncWindow(41, 60, true);
+    await syncWindow(21, 40, true);
+
+    const middle = await call(env, "GET", `/api/sessions/sess_merge/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const middleBody = await middle.json();
+    assert.equal(middleBody.turns.length, 40);
+    assert.equal(middleBody.oldest_seq, 21);
+    assert.equal(middleBody.latest_seq, 60);
+    assert.equal(middleBody.synced_turn_count, 40);
+    assert.equal(middleBody.has_older_turns, true);
+
+    await syncWindow(1, 20, false);
+
+    const complete = await call(env, "GET", `/api/sessions/sess_merge/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const completeBody = await complete.json();
+    assert.equal(completeBody.turns.length, 60);
+    assert.equal(completeBody.oldest_seq, 1);
+    assert.equal(completeBody.latest_seq, 60);
+    assert.equal(completeBody.synced_turn_count, 60);
+    assert.equal(completeBody.has_older_turns, false);
+
+    const listed = await call(env, "GET", "/api/sessions", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_merge");
+    assert.equal(session.sync_state, "fully_synced");
+    assert.equal(session.synced_min_seq, 1);
+    assert.equal(session.synced_max_seq, 60);
+    assert.equal(session.has_older_turns, false);
+  });
+
+  it("uses one batch presence lookup for large session catalogs", async () => {
+    const env = testEnv();
+    const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
+    env.POCKLY_CONTROL_HUB = control;
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const sessions = Array.from({ length: 336 }, (_, index) => ({
+      session_id: `sess_large_${String(index).padStart(3, "0")}`,
+      agent: index % 2 === 0 ? "claude-code" : "codex",
+      cwd: "/work/app",
+      snippet: `session ${index}`,
+      last_seq: 1,
+      last_timestamp: new Date(Date.UTC(2026, 5, 6, 1, 0, index)).toISOString(),
+      turn_count: 1,
+      min_seq: 1,
+      max_seq: 1,
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    control.onlineDeviceBatches = [];
+    const telemetryEvents = [];
+    const ctx = {
+      providers: {
+        telemetryProvider: {
+          record: async ({ text }) => telemetryEvents.push(...JSON.parse(text).events),
+        },
+      },
+    };
+
+    const listed = await call(env, "GET", "/api/sessions", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, ctx);
+    assert.equal(listed.status, 200);
+    const body = await listed.json();
+    assert.equal(body.sessions.length, 336);
+    assert.equal(body.sessions.every((session) => session.writable === true), true);
+    assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
+    assert.equal(telemetryEvents[0].command, "sessions");
+    assert.equal(telemetryEvents[0].sessions_count, 336);
+    assert.equal(telemetryEvents[0].unique_daemon_count, 1);
+    assert.equal(telemetryEvents[0].presence_batch_size, 1);
+  });
+
+  it("uses batch presence for host lists", async () => {
+    const env = testEnv();
+    const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
+    env.POCKLY_CONTROL_HUB = control;
+    env.POCKLY_HOSTS_ONLINE_CACHE_MS = "0";
+    const cookie = await loginCookie(env);
+    await loginDaemon(env, cookie);
+    control.onlineDeviceBatches = [];
+
+    const hosts = await call(env, "GET", "/api/hosts/online", null, { cookie });
+    assert.equal(hosts.status, 200);
+    const body = await hosts.json();
+    assert.equal(body.hosts.length, 1);
+    assert.equal(body.hosts[0].presence_status, "online");
+    assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
+  });
+
+  it("short-caches host presence and emits low-cardinality telemetry", async () => {
+    const env = testEnv();
+    const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
+    const telemetryEvents = [];
+    env.POCKLY_CONTROL_HUB = control;
+    const cookie = await loginCookie(env);
+    await loginDaemon(env, cookie);
+    control.onlineDeviceBatches = [];
+
+    const ctx = {
+      providers: {
+        telemetryProvider: {
+          record: async ({ text }) => telemetryEvents.push(...JSON.parse(text).events),
+        },
+      },
+    };
+    const first = await call(env, "GET", "/api/hosts/online", null, { cookie }, ctx);
+    const second = await call(env, "GET", "/api/hosts/online", null, { cookie }, ctx);
+    assert.equal(first.status, 200);
+    assert.equal(second.status, 200);
+    assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
+    assert.deepEqual(telemetryEvents.map((event) => event.presence_source), ["batch_do", "cache"]);
+    assert.equal(telemetryEvents[0].sessions_count, 0);
+    assert.equal(telemetryEvents[0].unique_daemon_count, 1);
+    assert.equal(telemetryEvents[0].presence_batch_size, 1);
+  });
+
+  it("does not touch presence for catalogs without controllable daemon devices", async () => {
+    const env = testEnv();
+    const control = new CountingControlHub();
+    env.POCKLY_CONTROL_HUB = control;
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const disabled = await call(env, "POST", "/api/daemon/remote-access", { enabled: false }, {
+      authorization: `Bearer ${daemon.device_access_token}`,
+    });
+    assert.equal(disabled.status, 200);
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [
+        {
+          session_id: "sess_historical",
+          agent: "claude-code",
+          cwd: "/work/app",
+          last_seq: 1,
+          last_timestamp: "2026-06-06T01:00:01Z",
+          turn_count: 1,
+        },
+      ],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    control.onlineDeviceBatches = [];
+
+    const listed = await call(env, "GET", "/api/sessions", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(listed.status, 200);
+    const sessions = (await listed.json()).sessions;
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0].writable, false);
+    assert.deepEqual(control.onlineDeviceBatches, []);
+  });
+
+  it("does not touch presence when there are no daemon hosts", async () => {
+    const env = testEnv();
+    const control = new CountingControlHub();
+    env.POCKLY_CONTROL_HUB = control;
+    const cookie = await loginCookie(env);
+    const hosts = await call(env, "GET", "/api/hosts/online", null, { cookie });
+    assert.equal(hosts.status, 200);
+    assert.deepEqual(await hosts.json(), { hosts: [] });
+    assert.deepEqual(control.onlineDeviceBatches, []);
   });
 
   it("runs the daemon device authorization claim and confirm flow", async () => {
@@ -603,6 +930,8 @@ describe("worker-native Nexus api", () => {
 
   it("routes control-plane requests to the attached daemon", async () => {
     const env = testEnv();
+    env.TERMINAL_ENABLED = "1";
+    env.TERMINAL_STREAMING_ENABLED = "1";
     const cookie = await loginCookie(env);
     const browserKeys = await generateSigningKeyPair();
     const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
@@ -798,8 +1127,380 @@ describe("worker-native Nexus api", () => {
       "TERMINAL_INPUT",
       "TERMINAL_OPEN_TERMINAL",
       "TERMINAL_STOP",
+      "TERMINAL_SUBSCRIBE",
+      "TERMINAL_UNSUBSCRIBE",
     ]);
     assert.equal(envelopes.find((envelope) => envelope.type === "INJECT_REQUEST").request.model, "opus");
+    const terminalSubscribe = envelopes.find((envelope) => envelope.type === "TERMINAL_SUBSCRIBE");
+    assert.equal(terminalSubscribe.terminal_request.terminal_session_id, terminal.terminal_session_id);
+  });
+
+  it("uses polling fallback transport without browser websocket or long control streams", async () => {
+    const env = testEnv();
+    env.POCKLY_NEXUS_RUNTIME = "managed";
+    env.REALTIME_ENABLED = "1";
+    env.BROWSER_REALTIME_ENABLED = "0";
+    env.CONTROL_STREAMING_ENABLED = "0";
+    env.TERMINAL_ENABLED = "1";
+    env.TERMINAL_STREAMING_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [
+        { session_id: "sess_low", agent: "claude-code", cwd: "/work/app", last_seq: 1, last_timestamp: "2026-06-06T01:00:01Z", turn_count: 1 },
+      ],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+
+    const envelopes = [];
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      envelopes.push(envelope);
+      if (envelope.type === "INJECT_REQUEST") {
+        reply({
+          type: "INJECT_EVENT",
+          event: {
+            request_id: envelope.request.request_id,
+            type: "inject_started",
+            session_id: envelope.request.session_id,
+            message: "noise event should not be persisted",
+          },
+        });
+        // A mid-turn stream_event: its turn must land in session_turns (one
+        // write) and must NOT be duplicated into a session_events row.
+        reply({
+          type: "INJECT_EVENT",
+          event: {
+            request_id: envelope.request.request_id,
+            type: "stream_event",
+            session_id: envelope.request.session_id,
+            turn: {
+              device_id: daemon.daemon_device_id,
+              session_id: envelope.request.session_id,
+              seq: 2,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: "2026-06-06T01:00:02Z",
+              payload: { text: "live streamed block" },
+            },
+          },
+        });
+        reply({
+          type: "INJECT_EVENT",
+          event: {
+            request_id: envelope.request.request_id,
+            type: "inject_completed",
+            session_id: envelope.request.session_id,
+            turn: {
+              device_id: daemon.daemon_device_id,
+              session_id: envelope.request.session_id,
+              seq: 3,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: "2026-06-06T01:00:03Z",
+              payload: { text: "polling fallback done" },
+            },
+          },
+        });
+      }
+      if (envelope.type === "SYNC_SESSION_REQUEST") {
+        reply({
+          type: "SYNC_SESSION_EVENT",
+          sync_event: {
+            request_id: envelope.sync_request.request_id,
+            session_id: envelope.sync_request.session_id,
+            device_id: daemon.daemon_device_id,
+            stage: "completed",
+            status: "completed",
+            processed: 1,
+            total: 1,
+          },
+        });
+      }
+    });
+
+    const browserSocket = await call(env, "GET", `/api/ws?access_token=${encodeURIComponent(browser.device_access_token)}`);
+    assert.equal(browserSocket.status, 501);
+    assert.equal((await browserSocket.json()).code, "unsupported_runtime");
+
+    const inject = await call(env, "POST", `/api/sessions/sess_low/inject?device_id=${daemon.daemon_device_id}`, {
+      text: "hello",
+      model: "opus",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(inject.status, 200);
+    assert.equal(inject.headers.get("content-type"), "application/json; charset=utf-8");
+    const injectBody = await inject.json();
+    const injectEnvelope = envelopes.find((envelope) => envelope.type === "INJECT_REQUEST");
+    assert.equal(injectBody.status, "accepted");
+    assert.equal(injectBody.type, "inject_started");
+    assert.equal(injectBody.session_id, "sess_low");
+    assert.equal(injectBody.device_id, daemon.daemon_device_id);
+    assert.equal(injectBody.streaming, false);
+    assert.equal(injectBody.request_id, injectEnvelope.request.request_id);
+    assert.equal(injectEnvelope.request.model, "opus");
+    const injectEventBody = await readEventsEventually(env, `/api/sessions/sess_low/events?device_id=${daemon.daemon_device_id}&request_id=${injectBody.request_id}&after_seq=1`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 1);
+    // Only the lifecycle event persists as a session_events row; the mid-turn
+    // stream_event content arrives once through session_turns instead.
+    assert.equal(injectEventBody.events.length, 1);
+    assert.equal(injectEventBody.events[0].payload.type, "inject_completed");
+    assert.equal(injectEventBody.events[0].payload.turn.payload.text, "polling fallback done");
+    assert.deepEqual(injectEventBody.turns.map((turn) => [turn.seq, turn.payload.text]), [
+      [2, "live streamed block"],
+      [3, "polling fallback done"],
+    ]);
+    assert.equal(injectEventBody.next_seq, 3);
+    // Cursor advance: nothing new after seq 3.
+    const drained = await call(env, "GET", `/api/sessions/sess_low/events?device_id=${daemon.daemon_device_id}&request_id=${injectBody.request_id}&after=${encodeURIComponent(injectEventBody.next_cursor)}&after_seq=3`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const drainedBody = await drained.json();
+    assert.equal(drainedBody.events.length, 0);
+    assert.deepEqual(drainedBody.turns, []);
+    assert.equal(drainedBody.next_seq, 3);
+    // The live-written turns are durable: the plain turns endpoint sees them
+    // without any daemon window sync having run.
+    const turnsAfterInject = await call(env, "GET", `/api/sessions/sess_low/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const turnsAfterInjectBody = await turnsAfterInject.json();
+    assert.deepEqual(turnsAfterInjectBody.turns.map((turn) => turn.seq).filter((seq) => seq >= 2), [2, 3]);
+
+    const sync = await call(env, "POST", `/api/sessions/sess_low/sync?device_id=${daemon.daemon_device_id}`, {
+      limit: 20,
+      before_seq: 81,
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(sync.status, 200);
+    assert.equal(sync.headers.get("content-type"), "application/json; charset=utf-8");
+    const syncBody = await sync.json();
+    const syncEnvelope = envelopes.find((envelope) => envelope.type === "SYNC_SESSION_REQUEST");
+    assert.equal(syncBody.status, "running");
+    assert.equal(syncBody.stage, "queued");
+    assert.equal(syncBody.session_id, "sess_low");
+    assert.equal(syncBody.streaming, false);
+    assert.equal(syncBody.request_id, syncEnvelope.sync_request.request_id);
+    assert.equal(syncEnvelope.sync_request.limit, 20);
+    assert.equal(syncEnvelope.sync_request.before_seq, 81);
+    const syncEventBody = await readEventsEventually(env, `/api/sessions/sess_low/events?device_id=${daemon.daemon_device_id}&request_id=${syncBody.request_id}`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 1);
+    assert.equal(syncEventBody.events.length, 1);
+    assert.equal(syncEventBody.events[0].payload.status, "completed");
+
+    const terminalCreate = await call(env, "POST", "/api/terminal-sessions", {
+      daemon_device_id: daemon.daemon_device_id,
+      session_id: "sess_low",
+      agent: "claude-code",
+      cwd: "/work/app",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(terminalCreate.status, 200);
+    const terminal = (await terminalCreate.json()).terminal_session;
+    assert.match(terminal.terminal_session_id, /^ts_/);
+    assert.equal(envelopes.some((envelope) => envelope.type === "TERMINAL_CREATE"), true);
+
+    const terminalStream = await call(env, "GET", `/api/terminal-sessions/${terminal.terminal_session_id}/stream`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(terminalStream.status, 501);
+    assert.equal((await terminalStream.json()).code, "unsupported_runtime");
+
+    await env.POCKLY_NEXUS_STORE.appendSessionEvent({
+      user_id: "usr_test",
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_low",
+      request_id: terminal.terminal_session_id,
+      event_type: "text_delta",
+      payload: JSON.stringify({
+        terminal_session_id: terminal.terminal_session_id,
+        kind: "text_delta",
+        payload: "persisted terminal batch",
+        timestamp: "2026-06-06T01:00:03Z",
+      }),
+      created_at: "2026-06-06T01:00:03Z",
+    });
+    const terminalEvents = await call(env, "GET", `/api/terminal-sessions/${terminal.terminal_session_id}/events`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(terminalEvents.status, 200);
+    const terminalEventsBody = await terminalEvents.json();
+    assert.equal(terminalEventsBody.events.length, 1);
+    assert.equal(terminalEventsBody.events[0].payload.payload, "persisted terminal batch");
+
+    await env.POCKLY_NEXUS_STORE.appendSessionEvent({
+      user_id: "usr_test",
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_low",
+      request_id: injectBody.request_id,
+      event_type: "inject_completed",
+      payload: JSON.stringify({
+        request_id: injectBody.request_id,
+        type: "inject_completed",
+        session_id: "sess_low",
+        turn: {
+          device_id: daemon.daemon_device_id,
+          session_id: "sess_low",
+          seq: 3,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: "2026-06-06T01:00:04Z",
+          payload: { text: "control event after terminal cursor" },
+        },
+      }),
+      created_at: "2026-06-06T01:00:04Z",
+    });
+    const afterTerminalCursor = await call(env, "GET", `/api/sessions/sess_low/events?device_id=${daemon.daemon_device_id}&after=${encodeURIComponent(terminalEventsBody.next_cursor)}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(afterTerminalCursor.status, 200);
+    const afterTerminalCursorBody = await afterTerminalCursor.json();
+    assert.equal(afterTerminalCursorBody.events.length, 1);
+    assert.equal(afterTerminalCursorBody.events[0].payload.turn.payload.text, "control event after terminal cursor");
+  });
+
+  it("falls back to live control terminal events when persisted cache is disabled", async () => {
+    const env = testEnv();
+    env.POCKLY_NEXUS_RUNTIME = "managed";
+    env.TERMINAL_EVENT_CACHE_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async () => {});
+
+    const terminalCreate = await call(env, "POST", "/api/terminal-sessions", {
+      daemon_device_id: daemon.daemon_device_id,
+      session_id: "sess_live_events",
+      agent: "claude-code",
+      cwd: "/work/app",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(terminalCreate.status, 200);
+    const terminal = (await terminalCreate.json()).terminal_session;
+
+    env.POCKLY_CONTROL_HUB.receiveDaemonEnvelope(daemon.daemon_device_id, {
+      type: "TERMINAL_EVENT",
+      terminal_event: {
+        terminal_session_id: terminal.terminal_session_id,
+        kind: "text_delta",
+        payload: "live terminal batch",
+        session_id: "sess_live_events",
+        timestamp: "2026-06-06T01:00:03Z",
+      },
+    });
+
+    const first = await call(env, "GET", `/api/terminal-sessions/${terminal.terminal_session_id}/events?after=ev_0000000000000_000000`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    assert.equal(firstBody.events.length, 1);
+    assert.equal(firstBody.events[0].payload.payload, "live terminal batch");
+
+    const second = await call(env, "GET", `/api/terminal-sessions/${terminal.terminal_session_id}/events?after=${encodeURIComponent(firstBody.next_cursor)}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(second.status, 200);
+    assert.deepEqual(await second.json(), { events: [], next_cursor: firstBody.next_cursor });
+  });
+
+  it("exposes request-scoped events for polling fallback new-session starts before a session id exists", async () => {
+    const env = testEnv();
+    env.CONTROL_STREAMING_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      if (envelope.type !== "INJECT_REQUEST") return;
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "session_created",
+          session_id: "sess_new_low",
+          message: "Session created",
+        },
+      });
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "inject_completed",
+          session_id: "sess_new_low",
+          turn: {
+            device_id: daemon.daemon_device_id,
+            session_id: "sess_new_low",
+            seq: 1,
+            agent: "claude-code",
+            kind: "assistant_text",
+            timestamp: "2026-06-06T01:00:02Z",
+            payload: { text: "new polling fallback done" },
+          },
+        },
+      });
+    });
+
+    const start = await call(env, "POST", "/api/tasks", {
+      daemon_device_id: daemon.daemon_device_id,
+      agent: "claude-code",
+      cwd: "/work/app",
+      text: "hello",
+      model: "opus",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(start.status, 200);
+    const startBody = await start.json();
+    assert.equal(startBody.status, "accepted");
+    assert.equal(startBody.streaming, false);
+    assert.equal(startBody.session_id, "");
+
+    const body = await readEventsEventually(env, `/api/injects/${startBody.request_id}/events`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 2);
+    assert.deepEqual(body.events.map((event) => event.payload.type), ["session_created", "inject_completed"]);
+    assert.equal(body.events[1].payload.turn.payload.text, "new polling fallback done");
+  });
+
+  it("exposes polling fallback new-session failures before a session id exists", async () => {
+    const env = testEnv();
+    env.CONTROL_STREAMING_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      if (envelope.type !== "INJECT_REQUEST") return;
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "inject_failed",
+          error: "agent failed before session creation",
+        },
+      });
+    });
+
+    const start = await call(env, "POST", "/api/tasks", {
+      daemon_device_id: daemon.daemon_device_id,
+      agent: "claude-code",
+      cwd: "/work/app",
+      text: "hello",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(start.status, 200);
+    const startBody = await start.json();
+    assert.equal(startBody.status, "accepted");
+    assert.equal(startBody.session_id, "");
+
+    const body = await readEventsEventually(env, `/api/injects/${startBody.request_id}/events`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 1);
+    assert.equal(body.events.length, 1);
+    assert.equal(body.events[0].payload.type, "inject_failed");
+    assert.equal(body.events[0].payload.error, "agent failed before session creation");
+    assert.equal(body.events[0].session_id, "");
   });
 
   it("full reconcile removes sessions missing from the daemon snapshot", async () => {
@@ -948,7 +1649,10 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(await runtime.json(), {
       runtime: "self_hosted",
       realtime: true,
+      browser_realtime: true,
+      control_streaming: true,
       terminal: false,
+      terminal_streaming: false,
       web_push: true,
       stt: true,
       release_update: false,
@@ -1000,6 +1704,16 @@ describe("worker-native Nexus api", () => {
       pinned: true,
     }, auth);
     assert.equal(pin.status, 200);
+    const opened = await call(env, "POST", "/api/sessions/sess-1/opened", {
+      device_id: "dev-1",
+      opened_at: "2026-06-10T08:00:00.000Z",
+    }, auth);
+    assert.equal(opened.status, 200);
+    assert.deepEqual(await opened.json(), {
+      device_id: "dev-1",
+      session_id: "sess-1",
+      last_opened_at: "2026-06-10T08:00:00.000Z",
+    });
     const rename = await call(env, "POST", "/api/sessions/sess-1/prefs", {
       device_id: "dev-1",
       custom_title: "我的会话",
@@ -1068,18 +1782,100 @@ describe("worker-native Nexus api", () => {
     });
     assert.deepEqual(await otherList.json(), { session_prefs: [], project_prefs: [] });
   });
+
+  it("returns daemon sync hints for pinned and recently opened sessions only on that daemon", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [
+        { session_id: "sess_recent_open", agent: "claude-code", cwd: "/work", turn_count: 200, last_timestamp: "2026-06-10T00:00:00.000Z" },
+        { session_id: "sess_pinned_old", agent: "claude-code", cwd: "/work", turn_count: 200, last_timestamp: "2026-04-10T00:00:00.000Z" },
+        { session_id: "sess_old", agent: "claude-code", cwd: "/work", turn_count: 200, last_timestamp: "2026-04-09T00:00:00.000Z" },
+      ],
+      full_reconcile: true,
+    }, daemonAuth);
+
+    const now = new Date().toISOString();
+    await call(env, "POST", "/api/sessions/sess_recent_open/opened", {
+      device_id: daemon.daemon_device_id,
+      opened_at: now,
+    }, auth);
+    await call(env, "POST", "/api/sessions/sess_pinned_old/prefs", {
+      device_id: daemon.daemon_device_id,
+      pinned: true,
+    }, auth);
+    await call(env, "POST", "/api/sessions/sess_old/opened", {
+      device_id: daemon.daemon_device_id,
+      opened_at: "2020-01-01T00:00:00.000Z",
+    }, auth);
+    await call(env, "POST", "/api/sessions/sess_other_device/opened", {
+      device_id: "dd_other",
+      opened_at: now,
+    }, auth);
+
+    const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
+    assert.equal(hints.status, 200);
+    assert.deepEqual(await hints.json(), {
+      sessions: [
+        { session_id: "sess_pinned_old", reason: "pinned", preferred_min: 100 },
+        { session_id: "sess_recent_open", reason: "recently_opened", preferred_min: 100 },
+      ],
+    });
+  });
+
+  it("pushes a SYNC_HINT over the control WS when a session is opened", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const envelopes = [];
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest("dd_hint_push", "usr_test", async (envelope) => {
+      envelopes.push(envelope);
+    });
+
+    const opened = await call(env, "POST", "/api/sessions/sess_hint_push/opened", {
+      device_id: "dd_hint_push",
+    }, auth);
+    assert.equal(opened.status, 200);
+
+    const hint = envelopes.find((envelope) => envelope.type === "SYNC_HINT");
+    assert.ok(hint, "daemon should receive a SYNC_HINT envelope");
+    assert.deepEqual(hint.sync_hint, {
+      session_id: "sess_hint_push",
+      reason: "recently_opened",
+      preferred_min: 100,
+    });
+
+    // An offline daemon must not break the opened endpoint — the hint is
+    // best-effort and the persisted open hint still covers the poll path.
+    const offline = await call(env, "POST", "/api/sessions/sess_hint_push/opened", {
+      device_id: "dd_not_connected",
+    }, auth);
+    assert.equal(offline.status, 200);
+  });
 });
 
 function testEnv(options = {}) {
   return {
     POCKLY_NEXUS_STORE: new InMemoryNexusStore(),
     POCKLY_CONTROL_HUB: new InMemoryControlHub(),
+    POCKLY_HOSTS_ONLINE_CACHE_SCOPE: randomIDForTest("cache"),
     ...(options.devLogin === false ? {} : { POCKLY_NEXUS_DEV_LOGIN_ENABLED: "1" }),
   };
 }
 
 async function loginCookie(env) {
   const res = await call(env, "POST", "/api/dev/login", {
+    user_id: "usr_test",
     email: "test@example.local",
     name: "Test User",
   });
@@ -1137,7 +1933,11 @@ async function authenticateDevice(env, deviceId, audience, keyPair) {
   return body.device_access_token;
 }
 
-async function call(env, method, path, body, headers = {}) {
+async function call(env, method, path, body, headers = {}, ctx = {}) {
+  return await callWithContext(env, method, path, body, headers, ctx);
+}
+
+async function callWithContext(env, method, path, body, headers = {}, ctx = {}) {
   const init = {
     method,
     headers: {
@@ -1147,7 +1947,19 @@ async function call(env, method, path, body, headers = {}) {
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   };
-  return await handleRequest(new Request(`${base}${path}`, init), env);
+  return await handleRequest(new Request(`${base}${path}`, init), env, ctx);
+}
+
+async function readEventsEventually(env, path, headers, count) {
+  let body = { events: [] };
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const res = await call(env, "GET", path, null, headers);
+    assert.equal(res.status, 200);
+    body = await res.json();
+    if ((body.events || []).length >= count) return body;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return body;
 }
 
 async function readSSE(response) {
@@ -1199,6 +2011,10 @@ function sessionCookie(response) {
   return cookie.split(";")[0];
 }
 
+function randomIDForTest(prefix) {
+  return `${prefix}_${Math.random().toString(36).slice(2)}`;
+}
+
 class FakeObjectStore {
   constructor(objects) {
     this.objects = objects;
@@ -1208,6 +2024,27 @@ class FakeObjectStore {
     const value = this.objects[key];
     if (value == null) return null;
     return { text: async () => value };
+  }
+}
+
+class CountingControlHub extends InMemoryControlHub {
+  constructor(options = {}) {
+    super(options);
+    this.onlineDeviceIDs = new Set(options.onlineDeviceIDs || []);
+    this.onlineDeviceBatches = [];
+  }
+
+  async onlineDevices(deviceIDs = []) {
+    const ids = [];
+    const seen = new Set();
+    for (const deviceID of deviceIDs) {
+      const next = String(deviceID || "");
+      if (!next || seen.has(next)) continue;
+      seen.add(next);
+      ids.push(next);
+    }
+    this.onlineDeviceBatches.push(ids);
+    return Object.fromEntries(ids.map((deviceID) => [deviceID, this.onlineDeviceIDs.has(deviceID)]));
   }
 }
 

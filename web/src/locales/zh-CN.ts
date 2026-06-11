@@ -247,6 +247,8 @@ export const zhCN = {
     bridgeNoDeviceBody: "当前还没有可用 daemon。连接你的电脑后，这里才能读取和接力本机 Agent 会话。",
     bridgeOfflineTitle: "这台电脑当前离线",
     bridgeOfflineBody: "会话目录可能还在，但 Web 现在不能把消息接力回本机 Agent。请先打开 Pockly daemon。",
+    lazyBackfillOfflineTitle: "完整历史需要这台电脑在线",
+    lazyBackfillOfflineBody: "现在可以查看已同步的部分（{{loaded}} / {{total}} 条）。更早历史仍在你的电脑上，daemon 在线后会继续按需加载。",
     bridgeConnectingTitle: "这台电脑还在连接中",
     bridgeConnectingBody: "Pockly 已经看到这台电脑，但远程控制通道还在预热。稍等片刻，再继续这个会话会更稳。",
     bridgeDegradedTitle: "这台电脑当前状态不完整",

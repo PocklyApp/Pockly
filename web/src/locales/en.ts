@@ -247,6 +247,8 @@ export const en = {
     bridgeNoDeviceBody: "There is no available daemon yet. Connect your computer before Pockly can read and continue local agent sessions here.",
     bridgeOfflineTitle: "This computer is offline",
     bridgeOfflineBody: "The session catalog may still exist, but Web cannot hand messages back to the local agent until the Pockly daemon is online again.",
+    lazyBackfillOfflineTitle: "Complete history needs this computer online",
+    lazyBackfillOfflineBody: "Pockly can show the synced part of this session now ({{loaded}} / {{total}} turns). Earlier history stays on your computer and will load when the daemon is online.",
     bridgeConnectingTitle: "This computer is still connecting",
     bridgeConnectingBody: "Pockly has seen this computer recently, but the remote control channel is still warming up. Wait a moment before continuing the session.",
     bridgeDegradedTitle: "This computer needs attention",

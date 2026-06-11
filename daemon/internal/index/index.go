@@ -78,6 +78,10 @@ type Index struct {
 	// firstMessagesFull caches the longer first-message copy (≈800 chars)
 	// Nexus uses for title generation. Keyed + GC'd like firstMessages.
 	firstMessagesFull map[string]string
+	// turnCounts caches parsed block counts per session when the underlying
+	// JSONL file has not changed. Refresh runs frequently; re-parsing every
+	// session file on every tick is wasteful on large histories.
+	turnCounts map[string]turnCountCacheEntry
 	// firstScanDone closes after the first completed Refresh. The initial
 	// scan of a large session home takes tens of seconds, and the daemon
 	// boots it in the BACKGROUND so the local API and the Nexus control WS
@@ -105,6 +109,7 @@ func New(cfg Config) *Index {
 		changes:           make(chan struct{}, 1),
 		firstMessages:     map[string]string{},
 		firstMessagesFull: map[string]string{},
+		turnCounts:        map[string]turnCountCacheEntry{},
 		firstScanDone:     make(chan struct{}),
 	}
 }
@@ -283,6 +288,7 @@ func (i *Index) populateFirstMessages(projects []agent.Project, sessions map[str
 	live := make(map[string]struct{}, len(sessions))
 	for sid, ref := range sessions {
 		live[sid] = struct{}{}
+		count := i.countSessionBlocksCached(sid, ref)
 		cached := i.firstMessages[sid]
 		cachedFull := i.firstMessagesFull[sid]
 		if cached == "" {
@@ -294,14 +300,14 @@ func (i *Index) populateFirstMessages(projects []agent.Project, sessions map[str
 				i.firstMessagesFull[sid] = cachedFull
 			}
 		}
-		if cached == "" {
-			continue
-		}
 		for pi := range projects {
 			for si := range projects[pi].Sessions {
 				if projects[pi].Sessions[si].SessionID == sid {
-					projects[pi].Sessions[si].FirstMessage = cached
-					projects[pi].Sessions[si].FirstMessageForTitle = cachedFull
+					projects[pi].Sessions[si].TurnCount = count
+					if cached != "" {
+						projects[pi].Sessions[si].FirstMessage = cached
+						projects[pi].Sessions[si].FirstMessageForTitle = cachedFull
+					}
 				}
 			}
 		}
@@ -310,8 +316,49 @@ func (i *Index) populateFirstMessages(projects []agent.Project, sessions map[str
 		if _, ok := live[sid]; !ok {
 			delete(i.firstMessages, sid)
 			delete(i.firstMessagesFull, sid)
+			delete(i.turnCounts, sid)
 		}
 	}
+}
+
+type turnCountCacheEntry struct {
+	path    string
+	agent   string
+	modTime time.Time
+	size    int64
+	count   int
+}
+
+func (i *Index) countSessionBlocksCached(sessionID string, ref SessionRef) int {
+	info, err := os.Stat(ref.Path)
+	if err != nil {
+		delete(i.turnCounts, sessionID)
+		return 0
+	}
+	if cached, ok := i.turnCounts[sessionID]; ok &&
+		cached.path == ref.Path &&
+		cached.agent == ref.Agent &&
+		cached.size == info.Size() &&
+		cached.modTime.Equal(info.ModTime()) {
+		return cached.count
+	}
+	count := countSessionBlocks(ref)
+	i.turnCounts[sessionID] = turnCountCacheEntry{
+		path:    ref.Path,
+		agent:   ref.Agent,
+		modTime: info.ModTime(),
+		size:    info.Size(),
+		count:   count,
+	}
+	return count
+}
+
+func countSessionBlocks(ref SessionRef) int {
+	blocks, err := extractBlocks(ref)
+	if err != nil {
+		return 0
+	}
+	return len(blocks.Blocks)
 }
 
 // extractRawFirstMessage runs the per-agent first-user-message extractor.
@@ -326,6 +373,17 @@ func extractRawFirstMessage(ref SessionRef) string {
 		return codex.ExtractFirstUserMessage(ref.Path)
 	default:
 		return ""
+	}
+}
+
+func extractBlocks(ref SessionRef) (agent.SessionBlocks, error) {
+	switch ref.Agent {
+	case agentClaude:
+		return claude.ExtractBlocks(ref.Path)
+	case agentCodex:
+		return codex.ExtractBlocks(ref.Path)
+	default:
+		return agent.SessionBlocks{}, nil
 	}
 }
 

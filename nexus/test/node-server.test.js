@@ -56,7 +56,10 @@ describe("Node self-hosted Nexus server", () => {
       assert.deepEqual(await res.json(), {
         runtime: "self_hosted",
         realtime: true,
+        browser_realtime: true,
+        control_streaming: true,
         terminal: true,
+        terminal_streaming: true,
         web_push: false,
         stt: false,
         release_update: true,
@@ -443,6 +446,7 @@ describe("Node self-hosted Nexus server", () => {
         "TERMINAL_CREATE",
         "TERMINAL_INPUT",
         "TERMINAL_STOP",
+        "TERMINAL_SUBSCRIBE",
       ]);
     } finally {
       for (const socket of sockets) socket.close();

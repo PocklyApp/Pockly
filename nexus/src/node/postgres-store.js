@@ -3,14 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import fs from "node:fs";
-import { fileURLToPath } from "node:url";
-
 import pg from "pg";
 
 import { SQLNexusStore } from "../store.js";
-
-const migrationPath = fileURLToPath(new URL("../../migrations/0001_initial.sql", import.meta.url));
+import { readMigrationSQLFiles } from "./migrations.js";
 
 export async function createPostgresNexusStore(options = {}) {
   const client = options.client || new pg.Pool({
@@ -19,7 +15,9 @@ export async function createPostgresNexusStore(options = {}) {
     ssl: normalizeSSL(options.ssl ?? process.env.POCKLY_NEXUS_POSTGRES_SSL),
   });
   if (!client) throw new Error("Postgres client required");
-  if (options.migrate !== false) await client.query(fs.readFileSync(migrationPath, "utf8"));
+  if (options.migrate !== false) {
+    for (const sql of readMigrationSQLFiles()) await client.query(sql);
+  }
   const store = new SQLNexusStore(new PostgresStatementAdapter(client));
   store.databaseURL = redactDatabaseURL(options.connectionString || process.env.POCKLY_NEXUS_DATABASE_URL || process.env.DATABASE_URL || "");
   store.close = typeof client.end === "function" ? () => client.end() : () => Promise.resolve();
