@@ -251,6 +251,9 @@ CREATE INDEX IF NOT EXISTS idx_devices_user_type_status
 CREATE INDEX IF NOT EXISTS idx_sessions_user_updated
   ON sessions(user_id, updated_at DESC);
 
+CREATE INDEX IF NOT EXISTS idx_sessions_user_device_updated
+  ON sessions(user_id, device_id, updated_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_device_tokens_expires
   ON device_tokens(expires_at);
 

@@ -46,6 +46,40 @@ describe("Node production Postgres Nexus store adapter", () => {
     await store.close();
     assert.equal(client.closed, true);
   });
+
+  it("uses a lightweight session sync snapshot query", async () => {
+    const client = new FakePostgresClient();
+    const store = await createPostgresNexusStore({
+      client,
+      migrate: false,
+    });
+
+    const rows = await store.listDeviceSessionSyncSnapshots("usr_pg", "dd_pg");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].session_id, "sess_pg");
+    const query = client.queries.at(-1);
+    assert.match(query.sql, /SELECT\s+user_id, computer_id, device_id, session_id, agent/i);
+    assert.doesNotMatch(query.sql, /SELECT\s+\*/i);
+    assert.deepEqual(query.values, ["usr_pg", "dd_pg"]);
+  });
+
+  it("uses a lightweight session hint snapshot query", async () => {
+    const client = new FakePostgresClient();
+    const store = await createPostgresNexusStore({
+      client,
+      migrate: false,
+    });
+
+    const rows = await store.listDeviceSessionHintSnapshots("usr_pg", "dd_pg");
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].session_id, "sess_pg");
+    const query = client.queries.at(-1);
+    assert.match(query.sql, /SELECT\s+user_id, device_id, session_id, turn_count/i);
+    assert.doesNotMatch(query.sql, /SELECT\s+\*/i);
+    assert.doesNotMatch(query.sql, /first_message/i);
+    assert.doesNotMatch(query.sql, /snippet/i);
+    assert.deepEqual(query.values, ["usr_pg", "dd_pg"]);
+  });
 });
 
 class FakePostgresClient {
@@ -57,7 +91,7 @@ class FakePostgresClient {
 
   async query(sql, values = []) {
     this.queries.push({ sql, values });
-    if (sql.includes("CREATE TABLE IF NOT EXISTS")) return { rows: [], rowCount: 0 };
+    if (sql.includes("CREATE TABLE IF NOT EXISTS") || sql.includes("CREATE INDEX IF NOT EXISTS")) return { rows: [], rowCount: 0 };
     if (sql.includes("INSERT INTO users")) {
       const [user_id, email, name, password_hash, created_at, updated_at] = values;
       this.usersByEmail.set(email, { user_id, email, name, password_hash, created_at, updated_at });
@@ -66,6 +100,34 @@ class FakePostgresClient {
     if (sql.includes("SELECT * FROM users WHERE email")) {
       const row = this.usersByEmail.get(values[0]);
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
+    if (sql.includes("FROM sessions") && sql.includes("session_id") && !sql.includes("SELECT *")) {
+      return {
+        rows: [{
+          user_id: values[0],
+          computer_id: null,
+          device_id: values[1],
+          session_id: "sess_pg",
+          agent: "claude-code",
+          runner_alias: null,
+          cwd: "/workspace",
+          snippet: "hello",
+          first_message: "hello",
+          title: null,
+          last_seq: 1,
+          last_timestamp: "2026-06-06T00:00:00Z",
+          channel_last_seen_at: "2026-06-06T00:00:00Z",
+          sync_state: "catalog_only",
+          turn_count: 1,
+          last_sync_error: null,
+          synced_turn_count: 0,
+          synced_min_seq: 0,
+          synced_max_seq: 0,
+          has_older_turns: 0,
+          updated_at: "2026-06-06T00:00:00Z",
+        }],
+        rowCount: 1,
+      };
     }
     throw new Error(`unexpected SQL: ${sql}`);
   }

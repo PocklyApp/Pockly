@@ -41,6 +41,7 @@ const recentlyOpenedSyncHintMs = 24 * 60 * 60 * 1000;
 const prioritySyncHintTurnLimit = 100;
 const defaultHostsOnlineCacheMs = 1000;
 const hostsOnlineCache = new Map();
+const turnPayloadBlobPointerVersion = 1;
 
 export async function handleRequest(request, env = {}, ctx = {}) {
   const url = new URL(request.url);
@@ -71,7 +72,7 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (path === "/api/pairing-grants/consume") return await consumePairingGrant(request, store);
     if (path === "/api/daemon/login") return await daemonLogin(request, store);
     if (path === "/api/daemon/remote-access") return await setDaemonRemoteAccess(request, store);
-    if (path === "/api/daemon/sync") return await daemonSync(request, store);
+    if (path === "/api/daemon/sync") return await daemonSync(request, store, env, requestRuntime.providers);
     if (path === "/api/daemon/sync-hints") return await daemonSyncHints(request, store);
     if (path === "/api/devices/register-browser") return await registerBrowser(request, store);
     if (path === "/api/devices/qr-grant") return await createBrowserQRGrant(request, store, url);
@@ -118,13 +119,13 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (injectCancel) return await cancelInject(request, store, env, decodeURIComponent(injectCancel[1]));
 
     const injectEvents = path.match(/^\/api\/injects\/([^/]+)\/events$/);
-    if (injectEvents) return await listInjectEvents(request, store, decodeURIComponent(injectEvents[1]), url);
+    if (injectEvents) return await listInjectEvents(request, store, env, requestRuntime.providers, decodeURIComponent(injectEvents[1]), url);
 
     const sessionTurns = path.match(/^\/api\/sessions\/([^/]+)\/turns$/);
-    if (sessionTurns) return await listSessionTurns(request, store, decodeURIComponent(sessionTurns[1]), url);
+    if (sessionTurns) return await listSessionTurns(request, store, env, requestRuntime.providers, decodeURIComponent(sessionTurns[1]), url);
 
     const sessionEvents = path.match(/^\/api\/sessions\/([^/]+)\/events$/);
-    if (sessionEvents) return await listSessionEvents(request, store, decodeURIComponent(sessionEvents[1]), url);
+    if (sessionEvents) return await listSessionEvents(request, store, env, requestRuntime.providers, decodeURIComponent(sessionEvents[1]), url);
 
     const sessionPrefs = path.match(/^\/api\/sessions\/([^/]+)\/prefs$/);
     if (sessionPrefs) return await setSessionPrefs(request, store, decodeURIComponent(sessionPrefs[1]));
@@ -133,7 +134,7 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (sessionOpened) return await markSessionOpened(request, store, env, decodeURIComponent(sessionOpened[1]));
 
     const sessionAction = path.match(/^\/api\/sessions\/([^/]+)\/(inject|sync|agent-settings|diff|delete|reveal)$/);
-    if (sessionAction) return await sessionControlAction(request, store, env, decodeURIComponent(sessionAction[1]), sessionAction[2], url);
+    if (sessionAction) return await sessionControlAction(request, store, env, requestRuntime.providers, decodeURIComponent(sessionAction[1]), sessionAction[2], url);
 
     const permissionAction = path.match(/^\/api\/permission-requests\/([^/]+)\/decide$/);
     if (permissionAction) return await decidePermissionRequest(request, store, env, decodeURIComponent(permissionAction[1]));
@@ -1019,7 +1020,7 @@ async function verifyDeviceChallenge(request, store) {
   return jsonResponse({ verified: true, device_access_token: token });
 }
 
-async function daemonSync(request, store) {
+async function daemonSync(request, store, env = {}, providers = {}) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   const timings = syncTimings();
   const { user, device } = await requireDeviceAuth(request, store, "daemon");
@@ -1046,20 +1047,33 @@ async function daemonSync(request, store) {
     }
     uploadedTurnStatsBySession.set(sessionID, stats);
   }
-  await store.upsertTurns(turns.map((turn) => syncTurnRecord(user, device, turn, now)));
+  const turnRecords = turns.map((turn) => syncTurnRecord(user, device, turn, now));
+  await store.upsertTurns(await externalizeTurnPayloads(turnRecords, env, providers));
   timings.mark("upsert_turns");
   let existingSessions = null;
   const getExistingSessions = async () => {
-    existingSessions ??= await listDeviceSessions(store, user.user_id, device.device_id);
+    existingSessions ??= await listDeviceSessionSyncSnapshots(store, user.user_id, device.device_id);
     return existingSessions;
   };
+  let deletedSessionCount = 0;
   if (body.full_reconcile) {
     const keepSessionIDs = sessions.map((session) => String(session.session_id));
     const currentExistingSessions = await getExistingSessions();
+    const deletedHistoryBlobKeys = await collectMissingSessionHistoryBlobKeys(
+      store,
+      providers,
+      user.user_id,
+      device.device_id,
+      keepSessionIDs,
+      currentExistingSessions,
+    );
     if (typeof store.deleteMissingDeviceSessionsFromExisting === "function") {
-      await store.deleteMissingDeviceSessionsFromExisting(user.user_id, device.device_id, keepSessionIDs, currentExistingSessions);
+      deletedSessionCount = Number(await store.deleteMissingDeviceSessionsFromExisting(user.user_id, device.device_id, keepSessionIDs, currentExistingSessions) ?? 0) || 0;
     } else {
-      await store.deleteMissingDeviceSessions(user.user_id, device.device_id, keepSessionIDs);
+      deletedSessionCount = Number(await store.deleteMissingDeviceSessions(user.user_id, device.device_id, keepSessionIDs) ?? 0) || 0;
+    }
+    if (deletedSessionCount > 0) {
+      await deleteHistoryBlobsBestEffort(providers, deletedHistoryBlobKeys);
     }
   }
   timings.mark("reconcile");
@@ -1067,24 +1081,40 @@ async function daemonSync(request, store) {
     ? new Map((await getExistingSessions()).map((session) => [String(session.session_id), session]))
     : new Map();
   timings.mark("load_existing_sessions");
-  const sessionRecords = await Promise.all(sessions.map((session) => syncSessionRecord(
-    store,
-    user,
-    device,
-    session,
-    now,
-    uploadedTurnStatsBySession.get(String(session.session_id)),
-    existingBySessionID.get(String(session.session_id)) ?? null,
-  )));
+  let sessionFastPathCount = 0;
+  const changedSessionRecords = [];
+  for (const session of sessions) {
+    const sessionID = String(session.session_id);
+    const uploadedTurnStats = uploadedTurnStatsBySession.get(sessionID);
+    const existing = existingBySessionID.get(sessionID) ?? null;
+    if (unchangedCatalogSession(device, session, existing, uploadedTurnStats)) {
+      sessionFastPathCount += 1;
+      continue;
+    }
+    const record = await syncSessionRecord(
+      store,
+      user,
+      device,
+      session,
+      now,
+      uploadedTurnStats,
+      existing,
+    );
+    if (!sessionMatchesExisting(record, existing)) changedSessionRecords.push(record);
+  }
   timings.mark("build_session_records");
-  const changedSessionRecords = sessionRecords.filter((session) => !sessionMatchesExisting(session, existingBySessionID.get(String(session.session_id))));
+  const changedSessionCount = changedSessionRecords.length;
   timings.mark("filter_unchanged_sessions");
-  await store.upsertSessions(changedSessionRecords);
+  if (changedSessionCount > 0) {
+    await store.upsertSessions(changedSessionRecords);
+  }
   timings.mark("upsert_sessions");
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
-    session_upsert_count: changedSessionRecords.length,
+    session_upsert_count: changedSessionCount,
+    session_delete_count: deletedSessionCount,
+    session_fast_path_count: sessionFastPathCount,
     turn_count: turns.length,
     daemon_device: device.device_id,
     daemon_version: body.hello?.version ?? "",
@@ -1134,6 +1164,41 @@ function sessionMatchesExisting(session, existing) {
   return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
 }
 
+function unchangedCatalogSession(device, session, existing, uploadedTurnStats) {
+  if (!existing || Number(uploadedTurnStats?.count ?? 0) > 0) return false;
+  const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
+  const lastTimestamp = session.last_timestamp || "";
+  const expected = {
+    computer_id: device.computer_id ?? null,
+    agent: session.agent || "claude-code",
+    runner_alias: session.runner_alias || "",
+    cwd: session.cwd || "",
+    snippet: session.snippet || session.first_message || "",
+    first_message: session.first_message ?? existing?.first_message ?? "",
+    title: session.title || "",
+    last_seq: Number(session.last_seq ?? maxSeq),
+    last_timestamp: lastTimestamp || null,
+    channel_last_seen_at: session.channel_last_seen_at || existing.channel_last_seen_at || lastTimestamp || null,
+    turn_count: Number(session.turn_count ?? 0),
+    last_sync_error: "",
+  };
+  const checks = [
+    ["computer_id", stringOrNull],
+    ["agent", stringOrEmpty],
+    ["runner_alias", stringOrNull],
+    ["cwd", stringOrEmpty],
+    ["snippet", stringOrEmpty],
+    ["first_message", stringOrEmpty],
+    ["title", stringOrNull],
+    ["last_seq", numberValue],
+    ["last_timestamp", stringOrNull],
+    ["channel_last_seen_at", stringOrNull],
+    ["turn_count", numberValue],
+    ["last_sync_error", stringOrNull],
+  ];
+  return checks.every(([field, normalize]) => normalize(expected[field]) === normalize(existing[field]));
+}
+
 function stringOrEmpty(value) {
   return value == null ? "" : String(value);
 }
@@ -1156,28 +1221,40 @@ async function listDeviceSessions(store, userID, deviceID) {
   return sessions.filter((session) => String(session.device_id) === String(deviceID));
 }
 
+async function listDeviceSessionSyncSnapshots(store, userID, deviceID) {
+  if (typeof store.listDeviceSessionSyncSnapshots === "function") {
+    return await store.listDeviceSessionSyncSnapshots(userID, deviceID);
+  }
+  return await listDeviceSessions(store, userID, deviceID);
+}
+
+async function listDeviceSessionHintSnapshots(store, userID, deviceID) {
+  if (typeof store.listDeviceSessionHintSnapshots === "function") {
+    return await store.listDeviceSessionHintSnapshots(userID, deviceID);
+  }
+  return await listDeviceSessions(store, userID, deviceID);
+}
+
 async function daemonSyncHints(request, store) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user, device } = await requireDeviceAuth(request, store, "daemon");
   const [sessions, prefs, openHints] = await Promise.all([
-    store.listSessionsForUser(user.user_id),
-    store.listSessionPrefsForUser(user.user_id),
-    store.listSessionOpenHintsForUser(user.user_id),
+    listDeviceSessionHintSnapshots(store, user.user_id, device.device_id),
+    listSessionPrefsForDevice(store, user.user_id, device.device_id),
+    listSessionOpenHintsForDevice(store, user.user_id, device.device_id),
   ]);
   const sessionIDs = new Set(
     sessions
-      .filter((session) => session.device_id === device.device_id)
       .map((session) => String(session.session_id)),
   );
   const sessionsByID = new Map(
     sessions
-      .filter((session) => session.device_id === device.device_id)
       .map((session) => [String(session.session_id), session]),
   );
   const cutoff = Date.now() - recentlyOpenedSyncHintMs;
   const hintsBySessionID = new Map();
   for (const pref of prefs) {
-    if (pref.device_id !== device.device_id || !sessionIDs.has(String(pref.session_id))) continue;
+    if (!sessionIDs.has(String(pref.session_id))) continue;
     if (!pref.pinned) continue;
     hintsBySessionID.set(String(pref.session_id), {
       ...sessionSyncHintPayload(sessionsByID.get(String(pref.session_id)), String(pref.session_id)),
@@ -1186,7 +1263,7 @@ async function daemonSyncHints(request, store) {
     });
   }
   for (const hint of openHints) {
-    if (hint.device_id !== device.device_id || !sessionIDs.has(String(hint.session_id)) || hintsBySessionID.has(String(hint.session_id))) continue;
+    if (!sessionIDs.has(String(hint.session_id)) || hintsBySessionID.has(String(hint.session_id))) continue;
     const opened = Date.parse(hint.last_opened_at || "");
     if (!Number.isFinite(opened) || opened < cutoff) continue;
     hintsBySessionID.set(String(hint.session_id), {
@@ -1215,6 +1292,20 @@ async function daemonSyncHints(request, store) {
     return String(left.session_id).localeCompare(String(right.session_id));
   });
   return jsonResponse({ sessions: hints.slice(0, 50) });
+}
+
+async function listSessionPrefsForDevice(store, userID, deviceID) {
+  if (typeof store.listSessionPrefsForDevice === "function") {
+    return await store.listSessionPrefsForDevice(userID, deviceID);
+  }
+  return (await store.listSessionPrefsForUser(userID)).filter((pref) => String(pref.device_id) === String(deviceID));
+}
+
+async function listSessionOpenHintsForDevice(store, userID, deviceID) {
+  if (typeof store.listSessionOpenHintsForDevice === "function") {
+    return await store.listSessionOpenHintsForDevice(userID, deviceID);
+  }
+  return (await store.listSessionOpenHintsForUser(userID)).filter((hint) => String(hint.device_id) === String(deviceID));
 }
 
 async function listSessions(request, store, env, telemetryProvider = null) {
@@ -1373,14 +1464,14 @@ async function setProjectPrefs(request, store) {
   });
 }
 
-async function listSessionTurns(request, store, sessionID, url) {
+async function listSessionTurns(request, store, env, providers, sessionID, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store);
   const deviceID = url.searchParams.get("device_id") ?? "";
   if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
   const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID, { repairMetadata: true });
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
-  const parsedTurns = (await store.listTurns(user.user_id, deviceID, sessionID)).map(publicTurn);
+  const parsedTurns = await publicTurns(await store.listTurns(user.user_id, deviceID, sessionID), providers);
   const stats = {
     count: Number(session.actual_turn_count ?? session.synced_turn_count ?? 0) || 0,
     min_seq: Number(session.synced_min_seq ?? 0) || 0,
@@ -1417,13 +1508,13 @@ async function listSessionTurns(request, store, sessionID, url) {
   });
 }
 
-async function listSessionEvents(request, store, sessionID, url) {
+async function listSessionEvents(request, store, env, providers, sessionID, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
   const deviceID = requiredString(url.searchParams.get("device_id") ?? "", "device_id");
   const session = await store.getSession(user.user_id, deviceID, sessionID);
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
-  return jsonResponse(await sessionEventsResponse(store, user.user_id, deviceID, sessionID, {
+  return jsonResponse(await sessionEventsResponse(store, providers, user.user_id, deviceID, sessionID, {
     after: url.searchParams.get("after") ?? "",
     after_seq: url.searchParams.get("after_seq") ?? "",
     request_id: url.searchParams.get("request_id") ?? "",
@@ -1431,17 +1522,17 @@ async function listSessionEvents(request, store, sessionID, url) {
   }));
 }
 
-async function listInjectEvents(request, store, requestID, url) {
+async function listInjectEvents(request, store, env, providers, requestID, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
-  return jsonResponse(await sessionEventsResponse(store, user.user_id, "", "", {
+  return jsonResponse(await sessionEventsResponse(store, providers, user.user_id, "", "", {
     after: url.searchParams.get("after") ?? "",
     request_id: requestID,
     limit: url.searchParams.get("limit") ?? "",
   }));
 }
 
-async function sessionEventsResponse(store, userID, deviceID, sessionID, options = {}) {
+async function sessionEventsResponse(store, providers, userID, deviceID, sessionID, options = {}) {
   const events = await store.listSessionEvents(userID, deviceID, sessionID, options);
   const publicEvents = events.map(publicSessionEvent);
   const response = {
@@ -1454,7 +1545,7 @@ async function sessionEventsResponse(store, userID, deviceID, sessionID, options
   if (deviceID && sessionID && options.after_seq !== undefined && options.after_seq !== "") {
     const afterSeq = Number(options.after_seq) || 0;
     const turns = await store.listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, options.limit);
-    response.turns = turns.map(publicTurn);
+    response.turns = await publicTurns(turns, providers);
     response.next_seq = turns.length > 0 ? Number(turns[turns.length - 1].seq) : afterSeq;
   }
   return response;
@@ -1634,6 +1725,7 @@ function createRequestRuntime(env = {}, ctx = {}) {
     store: provided.store || env.POCKLY_NEXUS_STORE || env.POCKLY_RELAY_STORE || createStore(env),
     controlHub: provided.controlHub || env.POCKLY_CONTROL_HUB || null,
     blobStore: provided.blobStore || env.RELEASES || null,
+    historyBlobStore: provided.historyBlobStore || env.HISTORY_BLOBS || env.POCKLY_HISTORY_BLOBS || null,
     emailProvider: provided.emailProvider || env.POCKLY_EMAIL_PROVIDER || null,
     sttProvider: provided.sttProvider || env.POCKLY_STT_PROVIDER || null,
     pushProvider: provided.pushProvider || env.POCKLY_PUSH_PROVIDER || null,
@@ -1644,8 +1736,11 @@ function createRequestRuntime(env = {}, ctx = {}) {
     ...(providers.controlHub ? { POCKLY_CONTROL_HUB: providers.controlHub } : {}),
     POCKLY_CONTROL_EVENT_SINK: createSessionEventSink(requireNexusProvider(providers, "store"), {
       persistTerminalEvents: terminalEventCacheEnabled(env),
+      env,
+      providers,
     }),
     ...(providers.blobStore ? { RELEASES: providers.blobStore } : {}),
+    ...(providers.historyBlobStore ? { HISTORY_BLOBS: providers.historyBlobStore } : {}),
     ...(providers.sttProvider ? { POCKLY_STT_PROVIDER: providers.sttProvider } : {}),
     ...(providers.pushProvider ? { POCKLY_PUSH_PROVIDER: providers.pushProvider } : {}),
   };
@@ -1658,6 +1753,8 @@ function createRequestRuntime(env = {}, ctx = {}) {
 
 export function createSessionEventSink(store, options = {}) {
   const persistTerminalEvents = options.persistTerminalEvents !== false;
+  const env = options.env || {};
+  const providers = options.providers || {};
   return {
     async onControlEvent(payload, meta = {}) {
       // Turn content goes straight into session_turns — the same row the
@@ -1669,7 +1766,7 @@ export function createSessionEventSink(store, options = {}) {
       const turnRow = sessionTurnRecord(payload, meta);
       if (turnRow) {
         try {
-          await store.upsertTurns([turnRow]);
+          await store.upsertTurns(await externalizeTurnPayloads([turnRow], env, providers));
         } catch {
           // The daemon window sync re-uploads the same turns from the local
           // jsonl, so a failed live write only delays content, never loses it.
@@ -1852,7 +1949,7 @@ async function agentDefaults(request, store, env, url) {
   });
 }
 
-async function sessionControlAction(request, store, env, sessionID, action, url) {
+async function sessionControlAction(request, store, env, providers, sessionID, action, url) {
   switch (action) {
     case "inject":
       return await sessionInject(request, store, env, sessionID, url);
@@ -1863,7 +1960,7 @@ async function sessionControlAction(request, store, env, sessionID, action, url)
     case "diff":
       return await sessionDiff(request, store, env, sessionID, url);
     case "delete":
-      return await sessionDelete(request, store, env, sessionID, url);
+      return await sessionDelete(request, store, env, providers, sessionID, url);
     case "reveal":
       return await sessionReveal(request, store, env, sessionID, url);
     default:
@@ -1874,7 +1971,7 @@ async function sessionControlAction(request, store, env, sessionID, action, url)
 // sessionDelete PERMANENTLY deletes a session: the daemon removes the local
 // transcript file first; only on success does Nexus drop its own copy
 // (session row + turns + prefs). The web gates this behind a confirm dialog.
-async function sessionDelete(request, store, env, sessionID, url) {
+async function sessionDelete(request, store, env, providers, sessionID, url) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
   const control = createControlHubForUser(env, user.user_id);
@@ -1889,7 +1986,9 @@ async function sessionDelete(request, store, env, sessionID, url) {
     if (result.status !== "ok") {
       return errorResponse(result.error || "session delete failed", ErrorCode.BadRequest, { status: result.error === "session_not_found" ? 404 : 400 });
     }
+    const historyBlobKeys = await collectSessionHistoryBlobKeys(store, providers, user.user_id, daemon.device_id, sessionID);
     await store.deleteSessionData(user.user_id, daemon.device_id, sessionID);
+    await deleteHistoryBlobsBestEffort(providers, historyBlobKeys);
     return jsonResponse({ status: "ok", deleted: result.deleted || [] });
   } catch (error) {
     return mapControlError(error);
@@ -2683,7 +2782,7 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
     runner_alias: session.runner_alias || "",
     cwd: session.cwd || "",
     snippet: session.snippet || session.first_message || "",
-    first_message: session.first_message || "",
+    first_message: session.first_message ?? existing?.first_message ?? "",
     title: session.title || "",
     last_seq: Number(session.last_seq ?? maxSeq),
     last_timestamp: session.last_timestamp || now,
@@ -3069,7 +3168,13 @@ function publicSession(session, device, controlOnline = false) {
   };
 }
 
-function publicTurn(turn) {
+async function publicTurns(turns, providers = {}) {
+  const blobCache = new Map();
+  return await Promise.all(turns.map((turn) => publicTurn(turn, providers, blobCache)));
+}
+
+async function publicTurn(turn, providers = {}, blobCache = new Map()) {
+  const payload = await resolveTurnPayload(turn.payload, providers, blobCache, turn);
   return {
     device_id: turn.device_id,
     session_id: turn.session_id,
@@ -3077,7 +3182,7 @@ function publicTurn(turn) {
     agent: turn.agent,
     kind: turn.kind,
     timestamp: turn.timestamp,
-    ...(turn.payload ? { payload: parsePayload(turn.payload) } : {}),
+    ...(payload !== undefined ? { payload } : {}),
   };
 }
 
@@ -3112,6 +3217,159 @@ function publicHost(device, activeSessionCount, controlOnline = false) {
     active_session_count: activeSessionCount,
     connected: online,
   };
+}
+
+async function externalizeTurnPayloads(turns, env = {}, providers = {}) {
+  const threshold = turnPayloadBlobThreshold(env);
+  const blobStore = providers.historyBlobStore;
+  if (!blobStore || threshold <= 0 || !turns.length) return turns;
+  return await Promise.all(turns.map((turn) => externalizeTurnPayload(turn, blobStore, threshold)));
+}
+
+async function externalizeTurnPayload(turn, blobStore, threshold) {
+  if (!turn?.payload) return turn;
+  const payload = String(turn.payload);
+  if (utf8ByteLength(payload) < threshold && !isTurnPayloadPointerObject(parsePayload(payload))) return turn;
+  const hash = await sha256Base64URL(payload);
+  const key = turnPayloadBlobKey(turn, hash);
+  await blobStore.put(key, payload, {
+    httpMetadata: { contentType: "application/json; charset=utf-8" },
+  });
+  return {
+    ...turn,
+    payload: JSON.stringify({
+      pockly_payload_ref: "blob",
+      version: turnPayloadBlobPointerVersion,
+      key,
+      sha256: hash,
+      bytes: utf8ByteLength(payload),
+    }),
+  };
+}
+
+async function resolveTurnPayload(payload, providers = {}, blobCache = new Map(), turn = null) {
+  if (!payload) return undefined;
+  const parsed = parsePayload(payload);
+  if (!isTurnPayloadPointerObject(parsed)) return parsed;
+  if (turn && !isCurrentTurnPayloadPointer(parsed, turn)) return { payload_ref_invalid: true };
+  const blobStore = providers.historyBlobStore;
+  if (!blobStore) return { payload_ref_unavailable: true };
+  try {
+    const object = blobCache.has(parsed.key)
+      ? await blobCache.get(parsed.key)
+      : await cacheBlobGet(blobCache, parsed.key, blobStore.get(parsed.key));
+    if (!object) return { payload_ref_missing: true };
+    const text = typeof object.text === "function" ? await object.text() : String(object);
+    if (parsed.sha256 && await sha256Base64URL(text) !== parsed.sha256) {
+      return { payload_ref_invalid: true };
+    }
+    return parsePayload(text);
+  } catch {
+    return { payload_ref_unavailable: true };
+  }
+}
+
+async function cacheBlobGet(blobCache, key, promise) {
+  blobCache.set(key, promise);
+  try {
+    return await promise;
+  } catch (error) {
+    blobCache.delete(key);
+    throw error;
+  }
+}
+
+function turnPayloadBlobThreshold(env = {}) {
+  const value = Number(env.POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES ?? 0);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
+}
+
+function turnPayloadBlobKey(turn, hash) {
+  return `${turnPayloadBlobKeyPrefix(turn)}/${hash}.json`;
+}
+
+function turnPayloadBlobKeyPrefix(turn) {
+  return [
+    "session-turns",
+    encodeBlobKeyPart(turn.user_id),
+    encodeBlobKeyPart(turn.device_id),
+    encodeBlobKeyPart(turn.session_id),
+    String(Number(turn.seq) || 0).padStart(12, "0"),
+  ].join("/");
+}
+
+function encodeBlobKeyPart(value) {
+  return encodeURIComponent(String(value || "").replace(/%/g, "%25"));
+}
+
+function isTurnPayloadPointerObject(value, turn = null) {
+  const validShape = Boolean(
+    value &&
+    typeof value === "object" &&
+    value.pockly_payload_ref === "blob" &&
+    value.version === turnPayloadBlobPointerVersion &&
+    typeof value.key === "string" &&
+    value.key.startsWith("session-turns/") &&
+    value.key.endsWith(".json")
+  );
+  if (!validShape) return false;
+  if (!turn) return true;
+  return value.key.startsWith(`${turnPayloadBlobKeyPrefix(turn)}/`);
+}
+
+function isCurrentTurnPayloadPointer(value, turn) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    value.pockly_payload_ref === "blob" &&
+    value.version === turnPayloadBlobPointerVersion &&
+    isTurnPayloadPointerObject(value, turn),
+  );
+}
+
+async function collectMissingSessionHistoryBlobKeys(store, providers = {}, userID, deviceID, keepSessionIDs = [], existingSessions = []) {
+  if (!providers.historyBlobStore) return [];
+  const keep = new Set(keepSessionIDs.map((id) => String(id)));
+  const staleSessionIDs = existingSessions
+    .map((session) => String(session.session_id || ""))
+    .filter((sessionID) => sessionID && !keep.has(sessionID));
+  return await collectHistoryBlobKeysForSessions(store, userID, deviceID, staleSessionIDs);
+}
+
+async function collectSessionHistoryBlobKeys(store, providers = {}, userID, deviceID, sessionID) {
+  if (!providers.historyBlobStore) return [];
+  return await collectHistoryBlobKeysForSessions(store, userID, deviceID, [sessionID]);
+}
+
+async function collectHistoryBlobKeysForSessions(store, userID, deviceID, sessionIDs = []) {
+  const keys = new Set();
+  for (const sessionID of sessionIDs) {
+    const turns = await store.listTurns(userID, deviceID, sessionID);
+    for (const turn of turns) {
+      const pointer = parsePayload(turn.payload);
+      if (isCurrentTurnPayloadPointer(pointer, turn)) keys.add(pointer.key);
+    }
+  }
+  return [...keys];
+}
+
+async function deleteHistoryBlobsBestEffort(providers = {}, keys = []) {
+  const blobStore = providers.historyBlobStore;
+  if (!blobStore || typeof blobStore.delete !== "function" || !keys.length) return;
+  await Promise.all([...new Set(keys)].map(async (key) => {
+    try {
+      await blobStore.delete(key);
+    } catch {
+      // History blob GC is best-effort: stale objects are cheaper than making a
+      // successful session deletion or reconcile fail because R2 is transiently
+      // unavailable.
+    }
+  }));
+}
+
+function utf8ByteLength(value) {
+  return new TextEncoder().encode(String(value)).byteLength;
 }
 
 function isOnline(lastSeenAt) {

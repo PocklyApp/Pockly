@@ -5,6 +5,7 @@ package telemetry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -93,6 +94,46 @@ func TestSendPostsWhenExplicitEndpointConfigured(t *testing.T) {
 	Send(context.Background(), "https://unused.example", device.Identity{DeviceID: "dd_test"}, Event{Name: "sync_completed"})
 	if hits != 1 {
 		t.Fatalf("Send() posted %d requests with explicit endpoint", hits)
+	}
+}
+
+func TestSendSerializesSanitizedMetrics(t *testing.T) {
+	t.Setenv("POCKLY_TELEMETRY", "on")
+	var body map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode telemetry body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	t.Setenv("POCKLY_TELEMETRY_ENDPOINT", server.URL+"/diagnostics")
+
+	Send(context.Background(), "https://unused.example", device.Identity{DeviceID: "dd_test"}, Event{
+		Name:   "sync_completed",
+		Status: "ok",
+		Metrics: map[string]int64{
+			"session_count": 344,
+			"Total MS":      50,
+			"":              999,
+		},
+	})
+
+	events, ok := body["events"].([]any)
+	if !ok || len(events) != 1 {
+		t.Fatalf("events = %#v", body["events"])
+	}
+	evt := events[0].(map[string]any)
+	metrics := evt["metrics"].(map[string]any)
+	if got := int64(metrics["session_count"].(float64)); got != 344 {
+		t.Fatalf("session_count metric = %d", got)
+	}
+	if got := int64(metrics["total_ms"].(float64)); got != 50 {
+		t.Fatalf("total_ms metric = %d", got)
+	}
+	if _, ok := metrics[""]; ok {
+		t.Fatalf("empty metric key should be dropped: %#v", metrics)
 	}
 }
 

@@ -30,16 +30,20 @@ type Event struct {
 	// diagnostics. Empty for events that are not per-session.
 	SessionID  string        `json:"session_id,omitempty"`
 	DurationMS time.Duration `json:"-"`
+	// Metrics carries low-cardinality numeric diagnostics for opt-in telemetry.
+	// It must never include paths, prompts, commands, tokens, or user content.
+	Metrics map[string]int64 `json:"-"`
 }
 
 type wireEvent struct {
-	Name       string `json:"name"`
-	Command    string `json:"command,omitempty"`
-	Status     string `json:"status,omitempty"`
-	ErrorCode  string `json:"error_code,omitempty"`
-	SessionID  string `json:"session_id,omitempty"`
-	DurationMS int64  `json:"duration_ms,omitempty"`
-	Timestamp  string `json:"timestamp,omitempty"`
+	Name       string           `json:"name"`
+	Command    string           `json:"command,omitempty"`
+	Status     string           `json:"status,omitempty"`
+	ErrorCode  string           `json:"error_code,omitempty"`
+	SessionID  string           `json:"session_id,omitempty"`
+	DurationMS int64            `json:"duration_ms,omitempty"`
+	Timestamp  string           `json:"timestamp,omitempty"`
+	Metrics    map[string]int64 `json:"metrics,omitempty"`
 }
 
 type wireRequest struct {
@@ -95,6 +99,7 @@ func Send(ctx context.Context, relayURL string, id device.Identity, events ...Ev
 			SessionID:  clean(evt.SessionID, 80),
 			DurationMS: evt.DurationMS.Milliseconds(),
 			Timestamp:  now,
+			Metrics:    cleanMetrics(evt.Metrics),
 		})
 	}
 	raw, err := json.Marshal(body)
@@ -111,6 +116,24 @@ func Send(ctx context.Context, relayURL string, id device.Identity, events ...Ev
 	if err == nil && resp != nil {
 		_ = resp.Body.Close()
 	}
+}
+
+func cleanMetrics(metrics map[string]int64) map[string]int64 {
+	if len(metrics) == 0 {
+		return nil
+	}
+	out := make(map[string]int64, len(metrics))
+	for key, value := range metrics {
+		key = normalizeCode(key)
+		if key == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func CommandFinished(command string, started time.Time, err error) Event {

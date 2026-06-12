@@ -100,8 +100,11 @@ func TestBuildCatalogSyncRequestCarriesMetadataOnlyForOldHistory(t *testing.T) {
 	if session.LastSeq != 0 || session.MinSeq != 0 || session.MaxSeq != 0 || session.HasOlder {
 		t.Fatalf("catalog session should not claim a turn window: %+v", session)
 	}
-	if session.Title == "" || session.Snippet == "" || session.FirstMessage == "" || session.LastTimestamp == "" {
+	if session.Title == "" || session.Snippet == "" || session.LastTimestamp == "" {
 		t.Fatalf("catalog session missing required metadata: %+v", session)
+	}
+	if session.FirstMessage != "" {
+		t.Fatalf("catalog session should not duplicate first_message; got %q", session.FirstMessage)
 	}
 	if len(req.Turns) != 0 {
 		t.Fatalf("catalog sync included %d turns, want metadata only", len(req.Turns))

@@ -19,10 +19,12 @@ describe("Nexus core provider bundle", () => {
       store,
       controlHub: { kind: "in-process" },
       blobStore: { kind: "local-fs" },
+      historyBlobStore: { kind: "history-fs" },
       clock,
     });
 
     assert.equal(requireNexusProvider(bundle, "store"), store);
+    assert.equal(bundle.historyBlobStore.kind, "history-fs");
     assert.equal(bundle.clock.isoNow(), "2026-06-06T00:00:00.000Z");
     assert.equal(bundle.sttProvider, null);
     assert.throws(() => {

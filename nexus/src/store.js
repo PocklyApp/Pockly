@@ -271,15 +271,17 @@ export class InMemoryNexusStore {
   }
 
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
-    await this.deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, await this.listDeviceSessions(userID, deviceID));
+    return await this.deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, await this.listDeviceSessions(userID, deviceID));
   }
 
   async deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, existingSessions) {
     const keep = new Set(keepSessionIDs.map((id) => String(id)));
+    let deleted = 0;
     for (const session of existingSessions) {
       if (!keep.has(String(session.session_id))) {
         const key = sessionKey(userID, deviceID, session.session_id);
         this.sessions.delete(key);
+        deleted += 1;
         for (const [turnKey, turn] of [...this.turns.entries()]) {
           if (turn.user_id === userID && turn.device_id === deviceID && turn.session_id === session.session_id) {
             this.turns.delete(turnKey);
@@ -287,6 +289,7 @@ export class InMemoryNexusStore {
         }
       }
     }
+    return deleted;
   }
 
   async listSessionsForUser(userID) {
@@ -301,6 +304,16 @@ export class InMemoryNexusStore {
       .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   }
 
+  async listDeviceSessionSyncSnapshots(userID, deviceID) {
+    return [...this.sessions.values()]
+      .filter((session) => session.user_id === userID && session.device_id === deviceID)
+      .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  }
+
+  async listDeviceSessionHintSnapshots(userID, deviceID) {
+    return await this.listDeviceSessionSyncSnapshots(userID, deviceID);
+  }
+
   async getSession(userID, deviceID, sessionID) {
     return this.sessions.get(sessionKey(userID, deviceID, sessionID)) ?? null;
   }
@@ -310,6 +323,10 @@ export class InMemoryNexusStore {
 
   async listSessionPrefsForUser(userID) {
     return [...this.sessionPrefs.values()].filter((pref) => pref.user_id === userID);
+  }
+
+  async listSessionPrefsForDevice(userID, deviceID) {
+    return [...this.sessionPrefs.values()].filter((pref) => pref.user_id === userID && pref.device_id === deviceID);
   }
 
   async upsertSessionPref(pref) {
@@ -326,6 +343,10 @@ export class InMemoryNexusStore {
 
   async listSessionOpenHintsForUser(userID) {
     return [...this.sessionOpenHints.values()].filter((hint) => hint.user_id === userID);
+  }
+
+  async listSessionOpenHintsForDevice(userID, deviceID) {
+    return [...this.sessionOpenHints.values()].filter((hint) => hint.user_id === userID && hint.device_id === deviceID);
   }
 
   async upsertSessionOpenHint(hint) {
@@ -470,9 +491,11 @@ export class InMemoryNexusStore {
 }
 
 export class SQLNexusStore {
-  constructor(db) {
+  constructor(db, options = {}) {
     this.db = db;
     this.sessionEventPruneByUser = new Map();
+    this.sessionUpsertBatchSize = positiveInteger(options.sessionUpsertBatchSize, 40);
+    this.turnUpsertBatchSize = positiveInteger(options.turnUpsertBatchSize, 100);
   }
 
   async upsertUser(user) {
@@ -978,31 +1001,87 @@ export class SQLNexusStore {
   }
 
   async upsertSessions(sessions) {
-    if (!sessions.length) return;
-    if (typeof this.db.batch === "function") {
-      const CHUNK = 50;
-      for (let i = 0; i < sessions.length; i += CHUNK) {
-        await this.db.batch(sessions.slice(i, i + CHUNK).map((session) => this._upsertSessionStatement(session)));
-      }
-      return;
+    const deduped = dedupeSessionRows(sessions);
+    if (!deduped.length) return;
+    // The default keeps the batch below SQLite's conservative 999
+    // bind-parameter floor: sessions has 21 columns, so 40 rows => 840
+    // parameters. Managed runtimes with stricter limits can lower this via
+    // the constructor without changing the sync path.
+    const CHUNK = this.sessionUpsertBatchSize;
+    for (let i = 0; i < deduped.length; i += CHUNK) {
+      await this._upsertSessionsStatement(deduped.slice(i, i + CHUNK)).run();
     }
-    for (const session of sessions) await this._upsertSessionStatement(session).run();
+  }
+
+  _upsertSessionsStatement(sessions) {
+    if (sessions.length === 1) return this._upsertSessionStatement(sessions[0]);
+    const placeholders = sessions
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .join(", ");
+    return this.db.prepare(`
+      INSERT INTO sessions (
+        user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
+        snippet, first_message, title, last_seq, last_timestamp,
+        channel_last_seen_at, sync_state, turn_count, last_sync_error,
+        synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+        updated_at
+      )
+      VALUES ${placeholders}
+      ON CONFLICT(user_id, device_id, session_id) DO UPDATE SET
+        computer_id = excluded.computer_id,
+        agent = excluded.agent,
+        runner_alias = excluded.runner_alias,
+        cwd = excluded.cwd,
+        snippet = excluded.snippet,
+        first_message = excluded.first_message,
+        title = excluded.title,
+        last_seq = excluded.last_seq,
+        last_timestamp = excluded.last_timestamp,
+        channel_last_seen_at = excluded.channel_last_seen_at,
+        sync_state = excluded.sync_state,
+        turn_count = excluded.turn_count,
+        last_sync_error = excluded.last_sync_error,
+        synced_turn_count = excluded.synced_turn_count,
+        synced_min_seq = excluded.synced_min_seq,
+        synced_max_seq = excluded.synced_max_seq,
+        has_older_turns = excluded.has_older_turns,
+        updated_at = excluded.updated_at
+      WHERE
+        sessions.computer_id IS DISTINCT FROM excluded.computer_id OR
+        sessions.agent IS DISTINCT FROM excluded.agent OR
+        sessions.runner_alias IS DISTINCT FROM excluded.runner_alias OR
+        sessions.cwd IS DISTINCT FROM excluded.cwd OR
+        sessions.snippet IS DISTINCT FROM excluded.snippet OR
+        sessions.first_message IS DISTINCT FROM excluded.first_message OR
+        sessions.title IS DISTINCT FROM excluded.title OR
+        sessions.last_seq IS DISTINCT FROM excluded.last_seq OR
+        sessions.last_timestamp IS DISTINCT FROM excluded.last_timestamp OR
+        sessions.channel_last_seen_at IS DISTINCT FROM excluded.channel_last_seen_at OR
+        sessions.sync_state IS DISTINCT FROM excluded.sync_state OR
+        sessions.turn_count IS DISTINCT FROM excluded.turn_count OR
+        sessions.last_sync_error IS DISTINCT FROM excluded.last_sync_error OR
+        sessions.synced_turn_count IS DISTINCT FROM excluded.synced_turn_count OR
+        sessions.synced_min_seq IS DISTINCT FROM excluded.synced_min_seq OR
+        sessions.synced_max_seq IS DISTINCT FROM excluded.synced_max_seq OR
+        sessions.has_older_turns IS DISTINCT FROM excluded.has_older_turns
+    `).bind(...sessions.flatMap(sessionUpsertValues));
   }
 
   async deleteMissingDeviceSessions(userID, deviceID, keepSessionIDs) {
-    await this.deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, await this.listDeviceSessions(userID, deviceID));
+    return await this.deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, await this.listDeviceSessions(userID, deviceID));
   }
 
   async deleteMissingDeviceSessionsFromExisting(userID, deviceID, keepSessionIDs, existingSessions) {
     if (keepSessionIDs.length === 0) {
       await this.db.prepare(`DELETE FROM session_turns WHERE user_id = ? AND device_id = ?`).bind(userID, deviceID).run();
       await this.db.prepare(`DELETE FROM sessions WHERE user_id = ? AND device_id = ?`).bind(userID, deviceID).run();
-      return;
+      return existingSessions.length;
     }
     const keep = new Set(keepSessionIDs.map((id) => String(id)));
     const stale = existingSessions
       .map((row) => String(row.session_id))
       .filter((id) => !keep.has(id));
+    if (stale.length === 0) return 0;
     const CHUNK = 50;
     for (let i = 0; i < stale.length; i += CHUNK) {
       const batch = stale.slice(i, i + CHUNK);
@@ -1016,6 +1095,7 @@ export class SQLNexusStore {
         WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
       `).bind(userID, deviceID, ...batch).run();
     }
+    return stale.length;
   }
 
   async listSessionsForUser(userID) {
@@ -1028,6 +1108,32 @@ export class SQLNexusStore {
   async listDeviceSessions(userID, deviceID) {
     const result = await this.db.prepare(`
       SELECT * FROM sessions WHERE user_id = ? AND device_id = ? ORDER BY updated_at DESC
+    `).bind(userID, deviceID).all();
+    return (result.results ?? []).map(normalizeSessionRow);
+  }
+
+  async listDeviceSessionSyncSnapshots(userID, deviceID) {
+    const result = await this.db.prepare(`
+      SELECT
+        user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
+        snippet, first_message, title, last_seq, last_timestamp,
+        channel_last_seen_at, sync_state, turn_count, last_sync_error,
+        synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+        updated_at
+      FROM sessions
+      WHERE user_id = ? AND device_id = ?
+      ORDER BY updated_at DESC
+    `).bind(userID, deviceID).all();
+    return (result.results ?? []).map(normalizeSessionRow);
+  }
+
+  async listDeviceSessionHintSnapshots(userID, deviceID) {
+    const result = await this.db.prepare(`
+      SELECT
+        user_id, device_id, session_id, turn_count, synced_turn_count,
+        synced_min_seq, synced_max_seq, has_older_turns
+      FROM sessions
+      WHERE user_id = ? AND device_id = ?
     `).bind(userID, deviceID).all();
     return (result.results ?? []).map(normalizeSessionRow);
   }
@@ -1046,6 +1152,13 @@ export class SQLNexusStore {
     const result = await this.db.prepare(`
       SELECT * FROM session_prefs WHERE user_id = ?
     `).bind(userID).all();
+    return result.results ?? [];
+  }
+
+  async listSessionPrefsForDevice(userID, deviceID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM session_prefs WHERE user_id = ? AND device_id = ?
+    `).bind(userID, deviceID).all();
     return result.results ?? [];
   }
 
@@ -1088,6 +1201,13 @@ export class SQLNexusStore {
     const result = await this.db.prepare(`
       SELECT * FROM session_open_hints WHERE user_id = ?
     `).bind(userID).all();
+    return result.results ?? [];
+  }
+
+  async listSessionOpenHintsForDevice(userID, deviceID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM session_open_hints WHERE user_id = ? AND device_id = ?
+    `).bind(userID, deviceID).all();
     return result.results ?? [];
   }
 
@@ -1190,15 +1310,35 @@ export class SQLNexusStore {
   }
 
   async upsertTurns(turns) {
-    if (!turns.length) return;
-    if (typeof this.db.batch === "function") {
-      const CHUNK = 50;
-      for (let i = 0; i < turns.length; i += CHUNK) {
-        await this.db.batch(turns.slice(i, i + CHUNK).map((turn) => this._upsertTurnStatement(turn)));
-      }
-      return;
+    const deduped = dedupeTurnRows(turns);
+    if (!deduped.length) return;
+    // 100 rows x 9 columns stays below SQLite's conservative bind limit.
+    const CHUNK = this.turnUpsertBatchSize;
+    for (let i = 0; i < deduped.length; i += CHUNK) {
+      await this._upsertTurnsStatement(deduped.slice(i, i + CHUNK)).run();
     }
-    for (const turn of turns) await this._upsertTurnStatement(turn).run();
+  }
+
+  _upsertTurnsStatement(turns) {
+    if (turns.length === 1) return this._upsertTurnStatement(turns[0]);
+    const placeholders = turns
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .join(", ");
+    return this.db.prepare(`
+      INSERT INTO session_turns (user_id, device_id, session_id, seq, agent, kind, timestamp, payload, updated_at)
+      VALUES ${placeholders}
+      ON CONFLICT(user_id, device_id, session_id, seq) DO UPDATE SET
+        agent = excluded.agent,
+        kind = excluded.kind,
+        timestamp = excluded.timestamp,
+        payload = excluded.payload,
+        updated_at = excluded.updated_at
+      WHERE
+        session_turns.agent IS DISTINCT FROM excluded.agent OR
+        session_turns.kind IS DISTINCT FROM excluded.kind OR
+        session_turns.timestamp IS DISTINCT FROM excluded.timestamp OR
+        session_turns.payload IS DISTINCT FROM excluded.payload
+    `).bind(...turns.flatMap(turnUpsertValues));
   }
 
   async listTurns(userID, deviceID, sessionID) {
@@ -1433,6 +1573,12 @@ function shouldPersistDeviceTouch(previous, next) {
   return nextMs - previousMs >= 60_000;
 }
 
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.floor(parsed));
+}
+
 function clampLimit(value, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -1452,6 +1598,62 @@ function normalizeSessionRow(row) {
     ...row,
     has_older_turns: Boolean(row.has_older_turns),
   };
+}
+
+function dedupeSessionRows(sessions = []) {
+  const byKey = new Map();
+  for (const session of sessions) {
+    byKey.set(sessionKey(session.user_id, session.device_id, session.session_id), session);
+  }
+  return [...byKey.values()];
+}
+
+function dedupeTurnRows(turns = []) {
+  const byKey = new Map();
+  for (const turn of turns) {
+    byKey.set(turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq), turn);
+  }
+  return [...byKey.values()];
+}
+
+function sessionUpsertValues(session) {
+  return [
+    session.user_id,
+    session.computer_id ?? null,
+    session.device_id,
+    session.session_id,
+    session.agent,
+    session.runner_alias ?? null,
+    session.cwd ?? "",
+    session.snippet ?? "",
+    session.first_message ?? "",
+    session.title ?? null,
+    session.last_seq ?? 0,
+    session.last_timestamp ?? null,
+    session.channel_last_seen_at ?? null,
+    session.sync_state ?? null,
+    session.turn_count ?? 0,
+    session.last_sync_error ?? null,
+    session.synced_turn_count ?? 0,
+    session.synced_min_seq ?? 0,
+    session.synced_max_seq ?? 0,
+    session.has_older_turns ? 1 : 0,
+    session.updated_at,
+  ];
+}
+
+function turnUpsertValues(turn) {
+  return [
+    turn.user_id,
+    turn.device_id,
+    turn.session_id,
+    turn.seq,
+    turn.agent,
+    turn.kind,
+    turn.timestamp ?? null,
+    turn.payload ?? null,
+    turn.updated_at,
+  ];
 }
 
 function withoutUndefined(value) {

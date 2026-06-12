@@ -2297,6 +2297,7 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		signature := catalogSyncSignature(req)
 		membership := catalogMembershipSignature(req.Sessions)
 		now := time.Now()
+		var syncMetrics map[string]int64
 		if (signature == "" || signature != lastCatalogSyncSignature) &&
 			shouldPushCatalog(now, lastCatalogPushAt, catalogMinInterval, membership != lastCatalogMembership) {
 			res, err := client.SyncHistory(id, req)
@@ -2312,11 +2313,21 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 			// logging every tick buries real signal. Only log when something
 			// changed (new turns pushed or session count differs from the
 			// previous push), or once every 5 minutes as a still-alive line.
-			if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || res.SessionUpsertCount > 0 || time.Since(lastLoggedAt) > 5*time.Minute {
-				log.Printf("Nexus sync ok: sessions=%d upserts=%d turns=%d device=%s timings=%s", res.SessionCount, res.SessionUpsertCount, res.TurnCount, res.DaemonDevice, formatSyncTimings(res.TimingsMS))
+			if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || res.SessionUpsertCount > 0 || res.SessionDeleteCount > 0 || time.Since(lastLoggedAt) > 5*time.Minute {
+				log.Printf(
+					"Nexus sync ok: sessions=%d upserts=%d fast_path=%d deletes=%d turns=%d device=%s timings=%s",
+					res.SessionCount,
+					res.SessionUpsertCount,
+					res.SessionFastPathCount,
+					res.SessionDeleteCount,
+					res.TurnCount,
+					res.DaemonDevice,
+					formatSyncTimings(res.TimingsMS),
+				)
 				lastLoggedSessions = res.SessionCount
 				lastLoggedAt = time.Now()
 			}
+			syncMetrics = syncTelemetryMetrics(res)
 		}
 		// Push the default lazy window for changed recent sessions. The
 		// catalog above carries metadata + snippets for every session; this
@@ -2330,7 +2341,12 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		// keeps a day of fleet data at 48 events/daemon instead of 144.
 		if time.Since(lastSyncSuccessTelemetry) > 30*time.Minute {
 			lastSyncSuccessTelemetry = time.Now()
-			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{Name: "sync_completed", Command: "serve", Status: "ok"})
+			telemetry.Send(context.Background(), client.BaseURL, id, telemetry.Event{
+				Name:    "sync_completed",
+				Command: "serve",
+				Status:  "ok",
+				Metrics: syncMetrics,
+			})
 		}
 	}
 
@@ -2358,6 +2374,20 @@ func historySyncCatalogSessions(idx *index.Index, profile runner.Profile, catalo
 		return catalogReq.Sessions
 	}
 	return relay.BuildCatalogSyncSessions(idx, profile)
+}
+
+func syncTelemetryMetrics(res pair.SyncResponse) map[string]int64 {
+	metrics := map[string]int64{
+		"session_count":           int64(res.SessionCount),
+		"session_upsert_count":    int64(res.SessionUpsertCount),
+		"session_fast_path_count": int64(res.SessionFastPathCount),
+		"session_delete_count":    int64(res.SessionDeleteCount),
+		"turn_count":              int64(res.TurnCount),
+	}
+	if total, ok := res.TimingsMS["total"]; ok {
+		metrics["total_ms"] = int64(total + 0.5)
+	}
+	return metrics
 }
 
 func formatSyncTimings(timings map[string]float64) string {

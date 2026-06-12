@@ -13,6 +13,7 @@ export function createNexusProviderBundle(input = {}) {
     store: input.store ?? null,
     controlHub: input.controlHub ?? null,
     blobStore: input.blobStore ?? null,
+    historyBlobStore: input.historyBlobStore ?? null,
     emailProvider: input.emailProvider ?? null,
     sttProvider: input.sttProvider ?? null,
     pushProvider: input.pushProvider ?? null,

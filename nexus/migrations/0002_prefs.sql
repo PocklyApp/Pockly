@@ -30,5 +30,8 @@ CREATE TABLE IF NOT EXISTS project_prefs (
 CREATE INDEX IF NOT EXISTS idx_session_prefs_user
   ON session_prefs(user_id);
 
+CREATE INDEX IF NOT EXISTS idx_session_prefs_user_device
+  ON session_prefs(user_id, device_id);
+
 CREATE INDEX IF NOT EXISTS idx_project_prefs_user
   ON project_prefs(user_id);

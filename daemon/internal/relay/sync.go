@@ -92,18 +92,17 @@ func BuildCatalogSyncSessions(idx *index.Index, profile runner.Profile) []pair.S
 		session := entry.session
 		title := firstNonEmpty(session.FirstMessageForTitle, session.FirstMessage, session.Snippet)
 		snippet := firstNonEmpty(session.FirstMessage, session.Snippet, title)
-		sessions = append(sessions, pair.SyncSession{
-			SessionID:         session.SessionID,
-			Agent:             entry.agentName,
-			RunnerAlias:       profile.AliasFor(entry.agentName),
-			Cwd:               safeCwdLabel(entry.cwd),
-			Title:             title,
-			Snippet:           snippet,
-			FirstMessage:      session.FirstMessageForTitle,
-			LastSeq:           0,
-			LastTimestamp:     session.Timestamp,
-			ChannelLastSeenAt: session.Timestamp,
-			SyncState:         "catalog_only",
+			sessions = append(sessions, pair.SyncSession{
+				SessionID:         session.SessionID,
+				Agent:             entry.agentName,
+				RunnerAlias:       profile.AliasFor(entry.agentName),
+				Cwd:               safeCwdLabel(entry.cwd),
+				Title:             title,
+				Snippet:           snippet,
+				LastSeq:           0,
+				LastTimestamp:     session.Timestamp,
+				ChannelLastSeenAt: session.Timestamp,
+				SyncState:         "catalog_only",
 			TurnCount:         session.TurnCount,
 		})
 	}

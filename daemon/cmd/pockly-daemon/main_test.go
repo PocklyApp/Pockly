@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,28 @@ func TestShouldOpenBrowser(t *testing.T) {
 				t.Fatalf("shouldOpenBrowser() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSyncTelemetryMetricsCarriesLowCardinalityCounters(t *testing.T) {
+	got := syncTelemetryMetrics(pair.SyncResponse{
+		SessionCount:         344,
+		SessionUpsertCount:   1,
+		SessionFastPathCount: 343,
+		SessionDeleteCount:   2,
+		TurnCount:            20,
+		TimingsMS:            map[string]float64{"total": 49.6},
+	})
+	want := map[string]int64{
+		"session_count":           344,
+		"session_upsert_count":    1,
+		"session_fast_path_count": 343,
+		"session_delete_count":    2,
+		"turn_count":              20,
+		"total_ms":                50,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("syncTelemetryMetrics() = %#v, want %#v", got, want)
 	}
 }
 

@@ -375,6 +375,324 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(body.turns[0].payload, { text: "plaintext history" });
   });
 
+  it("tiers large turn payloads to object storage without changing the read API", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        RELEASES: objectStore,
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const largePayload = { text: "this payload is intentionally larger than the test threshold" };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_blob_payload",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_blob_payload",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: largePayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const storedTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_blob_payload");
+    assert.equal(storedTurns.length, 1);
+    const pointer = JSON.parse(storedTurns[0].payload);
+    assert.equal(pointer.pockly_payload_ref, "blob");
+    assert.equal(Object.keys(objectStore.objects).length, 1);
+    assert.equal(await objectStore.get(pointer.key).then((object) => object.text()), JSON.stringify(largePayload));
+
+    const turns = await call(env, "GET", `/api/sessions/sess_blob_payload/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const body = await turns.json();
+    assert.deepEqual(body.turns[0].payload, largePayload);
+  });
+
+  it("treats daemon-uploaded blob pointer shaped payloads as ordinary content", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "1024",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const pointerShapedPayload = {
+      pockly_payload_ref: "blob",
+      version: 1,
+      key: "session-turns/other/user/session/000000000001/hash.json",
+      sha256: "",
+      bytes: 2,
+    };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_pointer_payload",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "pointer",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_pointer_payload",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: pointerShapedPayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const storedTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_pointer_payload");
+    const storedPointer = JSON.parse(storedTurns[0].payload);
+    assert.equal(storedPointer.pockly_payload_ref, "blob");
+    assert.match(storedPointer.key, /^session-turns\/usr_test\/dd_test\/sess_pointer_payload\/000000000001\//);
+    assert.equal(Object.keys(objectStore.objects).length, 1);
+
+    const turns = await call(env, "GET", `/api/sessions/sess_pointer_payload/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(turns.status, 200);
+    const body = await turns.json();
+    assert.deepEqual(body.turns[0].payload, pointerShapedPayload);
+  });
+
+  it("reads scoped history blobs within a turns response", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const firstPayload = JSON.stringify({ text: "first blob payload" });
+    const secondPayload = JSON.stringify({ text: "second blob payload" });
+    const firstKey = "session-turns/usr_test/dd_test/sess_blob_cache/000000000001/first.json";
+    const secondKey = "session-turns/usr_test/dd_test/sess_blob_cache/000000000002/second.json";
+    await objectStore.put(firstKey, firstPayload);
+    await objectStore.put(secondKey, secondPayload);
+    const firstPointer = JSON.stringify({
+      pockly_payload_ref: "blob",
+      version: 1,
+      key: firstKey,
+      sha256: "",
+      bytes: firstPayload.length,
+    });
+    const secondPointer = JSON.stringify({
+      pockly_payload_ref: "blob",
+      version: 1,
+      key: secondKey,
+      sha256: "",
+      bytes: secondPayload.length,
+    });
+    await env.POCKLY_NEXUS_STORE.upsertSession({
+      user_id: "usr_test",
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_blob_cache",
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: "cache",
+      first_message: "",
+      title: "",
+      last_seq: 2,
+      last_timestamp: "2026-06-06T04:00:01.000Z",
+      sync_state: "ready",
+      turn_count: 2,
+      synced_turn_count: 2,
+      synced_min_seq: 1,
+      synced_max_seq: 2,
+      has_older_turns: false,
+      updated_at: "2026-06-06T04:00:01.000Z",
+    });
+    await env.POCKLY_NEXUS_STORE.upsertTurns([
+      { user_id: "usr_test", device_id: daemon.daemon_device_id, session_id: "sess_blob_cache", seq: 1, agent: "claude-code", kind: "assistant_text", timestamp: "2026-06-06T04:00:00.000Z", payload: firstPointer },
+      { user_id: "usr_test", device_id: daemon.daemon_device_id, session_id: "sess_blob_cache", seq: 2, agent: "claude-code", kind: "assistant_text", timestamp: "2026-06-06T04:00:01.000Z", payload: secondPointer },
+    ]);
+    objectStore.getCalls = [];
+
+    const turns = await call(env, "GET", `/api/sessions/sess_blob_cache/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(turns.status, 200);
+    const body = await turns.json();
+    assert.deepEqual(body.turns.map((turn) => turn.payload), [{ text: "first blob payload" }, { text: "second blob payload" }]);
+    assert.deepEqual(objectStore.getCalls, [firstKey, secondKey]);
+  });
+
+  it("rejects blob pointers that do not belong to the current turn", async () => {
+    const objectStore = new FakeObjectStore({
+      "session-turns/usr_test/dd_test/other_session/000000000001/hash.json": JSON.stringify({ text: "wrong session" }),
+    });
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const pointer = JSON.stringify({
+      pockly_payload_ref: "blob",
+      version: 1,
+      key: "session-turns/usr_test/dd_test/other_session/000000000001/hash.json",
+      sha256: "",
+      bytes: 24,
+    });
+    await env.POCKLY_NEXUS_STORE.upsertSession({
+      user_id: "usr_test",
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_blob_scope",
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: "scope",
+      first_message: "",
+      title: "",
+      last_seq: 1,
+      last_timestamp: "2026-06-06T04:00:00.000Z",
+      sync_state: "ready",
+      turn_count: 1,
+      synced_turn_count: 1,
+      synced_min_seq: 1,
+      synced_max_seq: 1,
+      has_older_turns: false,
+      updated_at: "2026-06-06T04:00:00.000Z",
+    });
+    await env.POCKLY_NEXUS_STORE.upsertTurns([
+      { user_id: "usr_test", device_id: daemon.daemon_device_id, session_id: "sess_blob_scope", seq: 1, agent: "claude-code", kind: "assistant_text", timestamp: "2026-06-06T04:00:00.000Z", payload: pointer },
+    ]);
+
+    const turns = await call(env, "GET", `/api/sessions/sess_blob_scope/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(turns.status, 200);
+    const body = await turns.json();
+    assert.deepEqual(body.turns[0].payload, { payload_ref_invalid: true });
+    assert.deepEqual(objectStore.getCalls, []);
+  });
+
+  it("does not store large turn payloads in the release object store", async () => {
+    const releaseStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        RELEASES: releaseStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_release_bucket_guard",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_release_bucket_guard",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: { text: "this payload is intentionally larger than the test threshold" },
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const storedTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_release_bucket_guard");
+    assert.deepEqual(JSON.parse(storedTurns[0].payload), { text: "this payload is intentionally larger than the test threshold" });
+    assert.equal(Object.keys(releaseStore.objects).length, 0);
+  });
+
+  it("garbage-collects history blobs when full reconcile removes sessions", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [{
+        session_id: "sess_blob_gc",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "gc",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_blob_gc",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: { text: "this payload should be externalized and later deleted" },
+      }],
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+    assert.equal(Object.keys(objectStore.objects).length, 1);
+
+    const reconcile = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [],
+      turns: [],
+    }, daemonAuth);
+    assert.equal(reconcile.status, 200);
+    assert.equal((await reconcile.json()).session_delete_count, 1);
+    assert.deepEqual(Object.keys(objectStore.objects), []);
+    assert.equal(objectStore.deleteCalls.length, 1);
+  });
+
   it("merges lazy backfill windows instead of replacing the latest synced range", async () => {
     const env = testEnv();
     const cookie = await loginCookie(env);
@@ -686,7 +1004,10 @@ describe("worker-native Nexus api", () => {
       turns: [],
     }, daemonAuth);
     assert.equal(reconcile.status, 200);
-    assert.equal(store.counts.listDeviceSessions, 1);
+    const reconcileBody = await reconcile.json();
+    assert.equal(reconcileBody.session_delete_count, 1);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshots, 1);
+    assert.equal(store.counts.listDeviceSessions, 0);
     assert.equal(store.counts.deleteMissingDeviceSessionsFromExisting, 1);
     assert.equal(store.counts.deleteMissingDeviceSessions, 0);
     assert.equal(store.counts.getSession, 0);
@@ -698,6 +1019,11 @@ describe("worker-native Nexus api", () => {
     const body = await listed.json();
     assert.equal(body.sessions.some((session) => session.session_id === "sess_reconcile_000"), false);
     assert.equal(body.sessions.length, 335);
+    const existing = await store.getSession("usr_test", daemon.daemon_device_id, "sess_reconcile_001");
+    await store.upsertSession({
+      ...existing,
+      first_message: "existing long first message should survive catalog-only sync",
+    });
 
     store.resetCounts();
     const repeat = await call(env, "POST", "/api/daemon/sync", {
@@ -710,10 +1036,27 @@ describe("worker-native Nexus api", () => {
     const repeatBody = await repeat.json();
     assert.equal(repeatBody.session_count, 335);
     assert.equal(repeatBody.session_upsert_count, 0);
-    assert.equal(store.counts.listDeviceSessions, 1);
-    assert.equal(store.counts.upsertSessions, 1);
+    assert.equal(repeatBody.session_delete_count, 0);
+    assert.equal(repeatBody.session_fast_path_count, 335);
+    assertSyncTimings(repeatBody.timings_ms, [
+      "auth",
+      "read_json",
+      "touch_device",
+      "upsert_turns",
+      "reconcile",
+      "load_existing_sessions",
+      "build_session_records",
+      "filter_unchanged_sessions",
+      "upsert_sessions",
+      "total",
+    ]);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshots, 1);
+    assert.equal(store.counts.listDeviceSessions, 0);
+    assert.equal(store.counts.upsertSessions, 0);
     assert.equal(store.counts.upsertSessionRows, 0);
     assert.equal(store.counts.getSessionTurnStats, 0);
+    const preserved = await store.getSession("usr_test", daemon.daemon_device_id, "sess_reconcile_001");
+    assert.equal(preserved.first_message, "existing long first message should survive catalog-only sync");
   });
 
   it("uses batch presence for host lists", async () => {
@@ -1115,6 +1458,65 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(envelopes.map((envelope) => envelope.type), ["INJECT_REQUEST", "CANCEL_INJECT"]);
     assert.equal(envelopes[1].cancel_inject.request_id, event.request_id);
     await reader.cancel();
+  });
+
+  it("garbage-collects history blobs after daemon-confirmed session delete", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_delete_gc",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "delete gc",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_delete_gc",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: { text: "this manually deleted session payload should leave R2" },
+      }],
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+    assert.equal(Object.keys(objectStore.objects).length, 1);
+
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      assert.equal(envelope.type, "SESSION_DELETE");
+      reply({
+        type: "SESSION_DELETE_RESULT",
+        session_delete_result: {
+          request_id: envelope.session_delete.request_id,
+          status: "ok",
+          deleted: ["transcript"],
+        },
+      });
+    });
+
+    const deleted = await call(env, "POST", `/api/sessions/sess_delete_gc/delete?device_id=${daemon.daemon_device_id}`, null, browserAuth);
+    const deletedBody = await deleted.json();
+    assert.equal(deleted.status, 200, JSON.stringify(deletedBody));
+    assert.deepEqual(Object.keys(objectStore.objects), []);
+    assert.equal(objectStore.deleteCalls.length, 1);
   });
 
   it("does not let setup claim reassign an already-linked daemon to another user", async () => {
@@ -2011,7 +2413,8 @@ describe("worker-native Nexus api", () => {
   });
 
   it("returns daemon sync hints for pinned and recently opened sessions only on that daemon", async () => {
-    const env = testEnv();
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
     const cookie = await loginCookie(env);
     const keys = await generateSigningKeyPair();
     const browser = await registerBrowser(env, cookie, keys.publicKey);
@@ -2047,6 +2450,7 @@ describe("worker-native Nexus api", () => {
       opened_at: now,
     }, auth);
 
+    store.resetCounts();
     const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
     assert.equal(hints.status, 200);
     assert.deepEqual(await hints.json(), {
@@ -2077,6 +2481,12 @@ describe("worker-native Nexus api", () => {
         },
       ],
     });
+    assert.equal(store.counts.listDeviceSessionHintSnapshots, 1);
+    assert.equal(store.counts.listDeviceSessions, 0);
+    assert.equal(store.counts.listSessionPrefsForDevice, 1);
+    assert.equal(store.counts.listSessionOpenHintsForDevice, 1);
+    assert.equal(store.counts.listSessionPrefsForUser, 0);
+    assert.equal(store.counts.listSessionOpenHintsForUser, 0);
   });
 
   it("returns sync hint range metadata so daemon can backfill older windows", async () => {
@@ -2287,10 +2697,11 @@ describe("worker-native Nexus api", () => {
 
 function testEnv(options = {}) {
   return {
-    POCKLY_NEXUS_STORE: new InMemoryNexusStore(),
+    POCKLY_NEXUS_STORE: options.store || new InMemoryNexusStore(),
     POCKLY_CONTROL_HUB: new InMemoryControlHub(),
     POCKLY_HOSTS_ONLINE_CACHE_SCOPE: randomIDForTest("cache"),
     ...(options.devLogin === false ? {} : { POCKLY_NEXUS_DEV_LOGIN_ENABLED: "1" }),
+    ...(options.extra || {}),
   };
 }
 
@@ -2432,6 +2843,13 @@ function sessionCookie(response) {
   return cookie.split(";")[0];
 }
 
+function assertSyncTimings(timings, keys) {
+  assert.ok(timings && typeof timings === "object", "sync response should include timings_ms");
+  for (const key of keys) {
+    assert.equal(typeof timings[key], "number", `timings_ms.${key} should be numeric`);
+  }
+}
+
 function randomIDForTest(prefix) {
   return `${prefix}_${Math.random().toString(36).slice(2)}`;
 }
@@ -2439,12 +2857,25 @@ function randomIDForTest(prefix) {
 class FakeObjectStore {
   constructor(objects) {
     this.objects = objects;
+    this.getCalls = [];
+    this.deleteCalls = [];
   }
 
   async get(key) {
+    this.getCalls.push(key);
     const value = this.objects[key];
     if (value == null) return null;
     return { text: async () => value };
+  }
+
+  async put(key, value) {
+    this.objects[key] = String(value);
+    return { key };
+  }
+
+  async delete(key) {
+    this.deleteCalls.push(key);
+    delete this.objects[key];
   }
 }
 
@@ -2478,6 +2909,8 @@ class CountingNexusStore extends InMemoryNexusStore {
   resetCounts() {
     this.counts = {
       listDeviceSessions: 0,
+      listDeviceSessionSyncSnapshots: 0,
+      listDeviceSessionHintSnapshots: 0,
       deleteMissingDeviceSessions: 0,
       deleteMissingDeviceSessionsFromExisting: 0,
       getSession: 0,
@@ -2485,6 +2918,10 @@ class CountingNexusStore extends InMemoryNexusStore {
       listTurns: 0,
       upsertSessions: 0,
       upsertSessionRows: 0,
+      listSessionPrefsForUser: 0,
+      listSessionPrefsForDevice: 0,
+      listSessionOpenHintsForUser: 0,
+      listSessionOpenHintsForDevice: 0,
     };
   }
 
@@ -2497,6 +2934,16 @@ class CountingNexusStore extends InMemoryNexusStore {
   async listDeviceSessions(...args) {
     this.counts.listDeviceSessions += 1;
     return await super.listDeviceSessions(...args);
+  }
+
+  async listDeviceSessionSyncSnapshots(...args) {
+    this.counts.listDeviceSessionSyncSnapshots += 1;
+    return await super.listDeviceSessionSyncSnapshots(...args);
+  }
+
+  async listDeviceSessionHintSnapshots(...args) {
+    this.counts.listDeviceSessionHintSnapshots += 1;
+    return await super.listDeviceSessionHintSnapshots(...args);
   }
 
   async deleteMissingDeviceSessions(...args) {
@@ -2522,6 +2969,26 @@ class CountingNexusStore extends InMemoryNexusStore {
   async listTurns(...args) {
     this.counts.listTurns += 1;
     return await super.listTurns(...args);
+  }
+
+  async listSessionPrefsForUser(...args) {
+    this.counts.listSessionPrefsForUser += 1;
+    return await super.listSessionPrefsForUser(...args);
+  }
+
+  async listSessionPrefsForDevice(...args) {
+    this.counts.listSessionPrefsForDevice += 1;
+    return await super.listSessionPrefsForDevice(...args);
+  }
+
+  async listSessionOpenHintsForUser(...args) {
+    this.counts.listSessionOpenHintsForUser += 1;
+    return await super.listSessionOpenHintsForUser(...args);
+  }
+
+  async listSessionOpenHintsForDevice(...args) {
+    this.counts.listSessionOpenHintsForDevice += 1;
+    return await super.listSessionOpenHintsForDevice(...args);
   }
 }
 
