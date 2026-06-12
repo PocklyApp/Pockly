@@ -251,6 +251,23 @@ func TestExtractFirstUserMessage_Fixture(t *testing.T) {
 	}
 }
 
+func TestExtractFirstUserMessageStreamsUntilFirstHumanPrompt(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rollout.jsonl")
+	var b strings.Builder
+	b.WriteString(`{"timestamp":"2026-05-13T15:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>noise</environment_context>"}]}}` + "\n")
+	b.WriteString(`{"timestamp":"2026-05-13T15:01:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real prompt"}]}}` + "\n")
+	for i := 0; i < 1000; i++ {
+		b.WriteString("not-json-after-first-prompt\n")
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := ExtractFirstUserMessage(path); got != "real prompt" {
+		t.Fatalf("ExtractFirstUserMessage() = %q, want real prompt", got)
+	}
+}
+
 func TestNoisePrefixesAreDropped(t *testing.T) {
 	cases := map[string]bool{
 		"<environment_context>...":         false, // dropped

@@ -30,9 +30,18 @@ var noisePrefixes = []string{
 // rollout at path, with the auto-injected boilerplate prefixes already
 // dropped (see ExtractBlocks). Returns "" when no usable message is found.
 func ExtractFirstUserMessage(path string) string {
-	blocks, _ := ExtractBlocks(path)
-	for _, b := range blocks.Blocks {
-		if b.Kind == agent.BlockUserMessage && strings.TrimSpace(b.Text) != "" {
+	for rec, decErr := range ParseRecords(path) {
+		if decErr != nil || rec.Type != "response_item" {
+			continue
+		}
+		var head struct {
+			Type string `json:"type"`
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(rec.Payload, &head); err != nil || head.Type != "message" || head.Role != "user" {
+			continue
+		}
+		if b, ok := messageBlock(rec); ok && b.Kind == agent.BlockUserMessage && strings.TrimSpace(b.Text) != "" {
 			return b.Text
 		}
 	}
