@@ -2312,8 +2312,8 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 			// logging every tick buries real signal. Only log when something
 			// changed (new turns pushed or session count differs from the
 			// previous push), or once every 5 minutes as a still-alive line.
-			if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || time.Since(lastLoggedAt) > 5*time.Minute {
-				log.Printf("Nexus sync ok: sessions=%d turns=%d device=%s", res.SessionCount, res.TurnCount, res.DaemonDevice)
+			if res.TurnCount > 0 || res.SessionCount != lastLoggedSessions || res.SessionUpsertCount > 0 || time.Since(lastLoggedAt) > 5*time.Minute {
+				log.Printf("Nexus sync ok: sessions=%d upserts=%d turns=%d device=%s timings=%s", res.SessionCount, res.SessionUpsertCount, res.TurnCount, res.DaemonDevice, formatSyncTimings(res.TimingsMS))
 				lastLoggedSessions = res.SessionCount
 				lastLoggedAt = time.Now()
 			}
@@ -2358,6 +2358,43 @@ func historySyncCatalogSessions(idx *index.Index, profile runner.Profile, catalo
 		return catalogReq.Sessions
 	}
 	return relay.BuildCatalogSyncSessions(idx, profile)
+}
+
+func formatSyncTimings(timings map[string]float64) string {
+	if len(timings) == 0 {
+		return "-"
+	}
+	keys := []string{
+		"total",
+		"auth",
+		"read_json",
+		"touch_device",
+		"upsert_turns",
+		"reconcile",
+		"load_existing_sessions",
+		"build_session_records",
+		"filter_unchanged_sessions",
+		"upsert_sessions",
+	}
+	parts := make([]string, 0, len(timings))
+	seen := map[string]struct{}{}
+	for _, key := range keys {
+		if value, ok := timings[key]; ok {
+			parts = append(parts, fmt.Sprintf("%s=%.1fms", key, value))
+			seen[key] = struct{}{}
+		}
+	}
+	extra := make([]string, 0, len(timings))
+	for key := range timings {
+		if _, ok := seen[key]; !ok {
+			extra = append(extra, key)
+		}
+	}
+	sort.Strings(extra)
+	for _, key := range extra {
+		parts = append(parts, fmt.Sprintf("%s=%.1fms", key, timings[key]))
+	}
+	return strings.Join(parts, ",")
 }
 
 const (

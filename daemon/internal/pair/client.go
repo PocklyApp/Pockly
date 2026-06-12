@@ -188,11 +188,13 @@ type HelloMessage struct {
 }
 
 type SyncResponse struct {
-	OK            bool   `json:"ok"`
-	SessionCount  int    `json:"session_count"`
-	TurnCount     int    `json:"turn_count"`
-	DaemonDevice  string `json:"daemon_device"`
-	DaemonVersion string `json:"daemon_version"`
+	OK                 bool               `json:"ok"`
+	SessionCount       int                `json:"session_count"`
+	SessionUpsertCount int                `json:"session_upsert_count"`
+	TurnCount          int                `json:"turn_count"`
+	DaemonDevice       string             `json:"daemon_device"`
+	DaemonVersion      string             `json:"daemon_version"`
+	TimingsMS          map[string]float64 `json:"timings_ms,omitempty"`
 }
 
 type SyncHintsResponse struct {
