@@ -391,10 +391,13 @@ export class InMemoryNexusStore {
     for (const turn of turns) await this.upsertTurn(turn);
   }
 
-  async listTurns(userID, deviceID, sessionID) {
-    return [...this.turns.values()]
-      .filter((turn) => turn.user_id === userID && turn.device_id === deviceID && turn.session_id === sessionID)
-      .sort((left, right) => Number(left.seq) - Number(right.seq));
+  async listTurns(userID, deviceID, sessionID, options = {}) {
+    return filterTurnWindow(
+      [...this.turns.values()]
+        .filter((turn) => turn.user_id === userID && turn.device_id === deviceID && turn.session_id === sessionID)
+        .sort((left, right) => Number(left.seq) - Number(right.seq)),
+      options,
+    );
   }
 
   async getSessionTurnStats(userID, deviceID, sessionID) {
@@ -1341,7 +1344,31 @@ export class SQLNexusStore {
     `).bind(...turns.flatMap(turnUpsertValues));
   }
 
-  async listTurns(userID, deviceID, sessionID) {
+  async listTurns(userID, deviceID, sessionID, options = {}) {
+    const limit = Number(options.limit ?? 0) || 0;
+    const beforeSeq = Number(options.beforeSeq ?? options.before_seq ?? 0) || 0;
+    if (limit > 0) {
+      const result = beforeSeq > 0
+        ? await this.db.prepare(`
+            SELECT * FROM (
+              SELECT * FROM session_turns
+              WHERE user_id = ? AND device_id = ? AND session_id = ? AND seq < ?
+              ORDER BY seq DESC
+              LIMIT ?
+            )
+            ORDER BY seq ASC
+          `).bind(userID, deviceID, sessionID, beforeSeq, clampLimit(limit, 100)).all()
+        : await this.db.prepare(`
+            SELECT * FROM (
+              SELECT * FROM session_turns
+              WHERE user_id = ? AND device_id = ? AND session_id = ?
+              ORDER BY seq DESC
+              LIMIT ?
+            )
+            ORDER BY seq ASC
+          `).bind(userID, deviceID, sessionID, clampLimit(limit, 100)).all();
+      return result.results ?? [];
+    }
     const result = await this.db.prepare(`
       SELECT * FROM session_turns
       WHERE user_id = ? AND device_id = ? AND session_id = ?
@@ -1614,6 +1641,19 @@ function dedupeTurnRows(turns = []) {
     byKey.set(turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq), turn);
   }
   return [...byKey.values()];
+}
+
+function filterTurnWindow(turns, options = {}) {
+  const limit = Number(options.limit ?? 0) || 0;
+  const beforeSeq = Number(options.beforeSeq ?? options.before_seq ?? 0) || 0;
+  let out = turns;
+  if (beforeSeq > 0) {
+    out = out.filter((turn) => Number(turn.seq ?? 0) < beforeSeq);
+  }
+  if (limit > 0 && out.length > limit) {
+    out = out.slice(-clampLimit(limit, 100));
+  }
+  return out;
 }
 
 function sessionUpsertValues(session) {

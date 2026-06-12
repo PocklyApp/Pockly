@@ -9,6 +9,7 @@ import { configuredNexusURL } from "./runtime-config";
 
 export const CONTROL_EVENT_POLL_MAX_MS = 35 * 60 * 1000;
 export const DEFAULT_INITIAL_TURN_LIMIT = 20;
+export const SESSION_TURNS_WINDOW_LIMIT = 100;
 export const CONTROL_EVENT_POLL_INITIAL_DELAY_MS = 300;
 export const CONTROL_EVENT_POLL_INTERVAL_MS = 2000;
 // Steady cadence when a live realtime subscription already delivers turns and
@@ -250,6 +251,8 @@ export type SessionTurnsResponse = {
   turns: SessionTurn[];
   oldest_seq?: number;
   latest_seq?: number;
+  window_limit?: number;
+  next_loaded_before_seq?: number;
   synced_turn_count?: number;
   synced_min_seq?: number;
   synced_max_seq?: number;
@@ -789,10 +792,14 @@ export async function registerCurrentBrowserDevice() {
   return registered;
 }
 
-export async function getSessionTurns(sessionId: string, deviceId: string) {
+export async function getSessionTurns(sessionId: string, deviceId: string, options: { limit?: number; beforeSeq?: number } = {}) {
   return await fetchWithBrowserDevice<SessionTurnsResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/turns`,
-    { device_id: deviceId },
+    {
+      device_id: deviceId,
+      ...(options.limit !== undefined ? { limit: options.limit } : {}),
+      ...(options.beforeSeq !== undefined ? { before_seq: options.beforeSeq } : {}),
+    },
   );
 }
 
@@ -1719,12 +1726,12 @@ export async function decidePermissionRequest(
   );
 }
 
-async function fetchWithBrowserDevice<T>(url: string, query?: Record<string, string>): Promise<T> {
+async function fetchWithBrowserDevice<T>(url: string, query?: Record<string, string | number | boolean>): Promise<T> {
   const auth = await authenticateBrowserDevice();
   const finalURL = new URL(url, window.location.origin);
   if (query) {
     for (const [key, value] of Object.entries(query)) {
-      finalURL.searchParams.set(key, value);
+      finalURL.searchParams.set(key, String(value));
     }
   }
   return fetchJSON<T>(finalURL.toString(), {

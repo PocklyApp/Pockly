@@ -44,6 +44,7 @@ import {
   revokeDevice,
   cancelInject,
   CONTROL_EVENT_POLL_RELAXED_MS,
+  SESSION_TURNS_WINDOW_LIMIT,
   getAgentSettings,
   getSessionDiff,
   getRuntimeCapabilities,
@@ -1784,7 +1785,7 @@ export function App() {
       });
     try {
       setTurnsStatus("loading");
-      const data = await getSessionTurns(next.sessionId, next.deviceId);
+      const data = await getSessionTurns(next.sessionId, next.deviceId, { limit: SESSION_TURNS_WINDOW_LIMIT });
       if (requestID !== loadRequestRef.current) return;
       const hydrated = data.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
       setTurns(hydrated);
@@ -1897,12 +1898,12 @@ export function App() {
         const session = listedSessions.find((item) => item.session_id === selection.sessionId && item.device_id === selection.deviceId);
         const knownLastSeq = session?.last_seq ?? baselineSeq;
         try {
-          const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId);
+          const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, { limit: SESSION_TURNS_WINDOW_LIMIT });
           const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
           const hydratedLastSeq = hydrated.at(-1)?.seq ?? 0;
           const hasAgentResponse = hydrated.some((turn) => isAgentResponseTurnAfter(turn, baselineSeq));
           if (hydratedLastSeq > baselineSeq) {
-            setTurns((current) => reconcileHydratedTurns(current, hydrated, true));
+            setTurns((current) => reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(refreshed)));
             setTurnsHydration(refreshed);
           }
           if (hasAgentResponse && (knownLastSeq <= baselineSeq || hydratedLastSeq >= knownLastSeq)) {
@@ -1956,11 +1957,11 @@ export function App() {
       const sel = selectedRef.current;
       if (!sel || sel.sessionId !== selection.sessionId || sel.deviceId !== selection.deviceId) return;
       try {
-        const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId);
+        const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, { limit: SESSION_TURNS_WINDOW_LIMIT });
         const stillOn = selectedRef.current;
         if (!stillOn || stillOn.sessionId !== selection.sessionId || stillOn.deviceId !== selection.deviceId) return;
         const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
-        setTurns((current) => reconcileHydratedTurns(current, hydrated, true));
+        setTurns((current) => reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(refreshed)));
         setTurnsHydration(refreshed);
       } catch {
         // Transient (sync still catching up / link blip) — keep retrying.
@@ -2049,12 +2050,15 @@ export function App() {
 
   async function refreshSessionTurnsWithBackoff(next: ReaderSelection, requestID: number, sessionHint?: SessionListItem | null, mergeWithCurrent = false) {
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const refreshed = await getSessionTurns(next.sessionId, next.deviceId);
+      const refreshed = await getSessionTurns(next.sessionId, next.deviceId, {
+        limit: SESSION_TURNS_WINDOW_LIMIT,
+        ...(mergeWithCurrent ? { beforeSeq: nextLazyBackfillBeforeSeq(turnsHydration, turns, sessionHint ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId) ?? null) } : {}),
+      });
       if (requestID !== loadRequestRef.current) return true;
       const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
       const session = sessionHint ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
       if (hydrated.length > 0 || session?.turn_count === 0 || attempt === 2) {
-        setTurns((current) => mergeWithCurrent ? reconcileHydratedTurns(current, hydrated, true) : hydrated);
+        setTurns((current) => mergeWithCurrent ? reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(refreshed)) : hydrated);
         setTurnsHydration(refreshed);
         setTurnsStatus(hydrated.length === 0 ? "empty" : "");
         setSyncProgress(null);
@@ -2170,16 +2174,27 @@ export function App() {
 
   async function loadEarlierTurns() {
     if (!selected || !selectedSession || loadingEarlierRef.current) return;
-    const loaded = turnsHydration?.synced_turn_count ?? selectedSession.synced_turn_count ?? turns.length;
-    const total = turnsHydration?.total_turn_count ?? selectedSession.turn_count ?? selectedSession.last_seq ?? 0;
-    if (!turnsHydration?.has_older_turns && !selectedSession.has_older_turns && total <= loaded) return;
+    if (!hasEarlierTurns(turnsHydration, turns, selectedSession)) return;
     const beforeSeq = nextLazyBackfillBeforeSeq(turnsHydration, turns, selectedSession);
     if (beforeSeq === 1) return;
     loadingEarlierRef.current = true;
     const requestID = loadRequestRef.current;
     try {
+      if (turnsHydration?.next_loaded_before_seq && turnsHydration.next_loaded_before_seq > 1) {
+        setSyncingEarlier(true);
+        const earlier = await getSessionTurns(selected.sessionId, selected.deviceId, {
+          limit: MANUAL_LAZY_BACKFILL_TURN_LIMIT,
+          beforeSeq: turnsHydration.next_loaded_before_seq,
+        });
+        if (requestID !== loadRequestRef.current) return;
+        const hydrated = earlier.turns.map((turn) => ({ ...turn, device_id: selected.deviceId }));
+        setTurns((current) => reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(earlier)));
+        setTurnsHydration(mergeTurnHydration(turnsHydration, earlier));
+        return;
+      }
       await syncSelectedSession(selected, requestID, beforeSeq);
     } finally {
+      setSyncingEarlier(false);
       loadingEarlierRef.current = false;
     }
   }
@@ -5261,9 +5276,7 @@ function SessionsPage({
   onToggleVoiceInput: () => void;
 }) {
   const visibleTurns = selectedSession ? visibleConversationTurns(turns) : [];
-  const loadedTurns = turnsHydration?.synced_turn_count ?? selectedSession?.synced_turn_count ?? visibleTurns.length;
-  const totalAvailableTurns = turnsHydration?.total_turn_count ?? selectedSession?.turn_count ?? selectedSession?.last_seq ?? 0;
-  const hasOlderTurns = Boolean(turnsHydration?.has_older_turns || selectedSession?.has_older_turns || totalAvailableTurns > loadedTurns);
+  const hasOlderTurns = hasEarlierTurns(turnsHydration, visibleTurns, selectedSession);
   // Composer mirrors the no-device home: starts in rest (single-row) and
   // expands to the focused 2-row layout only after the user taps in.
   const [composerFocused, setComposerFocused] = useState(false);
@@ -13026,6 +13039,8 @@ export function nextLazyBackfillBeforeSeq(
   turns: SessionTurn[],
   session: SessionListItem | null,
 ) {
+  const loadedBefore = Number(hydration?.next_loaded_before_seq ?? 0) || 0;
+  if (loadedBefore > 1) return loadedBefore;
   // Non-contiguous lazy history can have rows 1..40 and 141..240. In that case
   // oldest_seq is already 1, so the only valid cursor is Nexus' next gap hint.
   const hinted = Number(hydration?.next_before_seq ?? 0) || 0;
@@ -13033,6 +13048,56 @@ export function nextLazyBackfillBeforeSeq(
   const contiguous = Number(hydration?.latest_contiguous_min_seq ?? 0) || 0;
   if (contiguous > 1) return contiguous;
   return Number(hydration?.oldest_seq ?? 0) || Number(turns[0]?.seq ?? 0) || Number(session?.synced_min_seq ?? 0) || 0;
+}
+
+function loadedTurnCount(hydration: SessionTurnsResponse | null, turns: SessionTurn[]) {
+  return Math.max(
+    turns.length,
+    visibleConversationTurns(hydration?.turns ?? []).length,
+  );
+}
+
+export function hasEarlierTurns(
+  hydration: SessionTurnsResponse | null,
+  turns: SessionTurn[],
+  session: SessionListItem | null,
+) {
+  if (Number(hydration?.next_loaded_before_seq ?? 0) > 1) return true;
+  if (Boolean(hydration?.has_older_turns || session?.has_older_turns)) return true;
+  const total = Number(hydration?.total_turn_count ?? session?.turn_count ?? session?.last_seq ?? 0) || 0;
+  return total > loadedTurnCount(hydration, turns);
+}
+
+function isCompleteTurnsResponse(response: SessionTurnsResponse | null | undefined) {
+  const limit = Number(response?.window_limit ?? 0) || 0;
+  return limit <= 0;
+}
+
+function mergeTurnHydration(current: SessionTurnsResponse | null, incoming: SessionTurnsResponse): SessionTurnsResponse {
+  if (!current) return incoming;
+  const oldestSeq = Math.min(
+    positiveSeq(current.oldest_seq, incoming.oldest_seq),
+    positiveSeq(incoming.oldest_seq, current.oldest_seq),
+  );
+  const latestSeq = Math.max(Number(current.latest_seq ?? 0) || 0, Number(incoming.latest_seq ?? 0) || 0);
+  const out: SessionTurnsResponse = {
+    ...current,
+    ...incoming,
+    turns: mergeTurns(current.turns ?? [], incoming.turns ?? []),
+    next_loaded_before_seq: incoming.next_loaded_before_seq ?? 0,
+    has_older_turns: Boolean(incoming.has_older_turns || current.has_older_turns),
+  };
+  if (oldestSeq > 0) out.oldest_seq = oldestSeq;
+  if (latestSeq > 0) out.latest_seq = latestSeq;
+  const nextBeforeSeq = incoming.next_before_seq ?? current.next_before_seq;
+  if (nextBeforeSeq !== undefined) out.next_before_seq = nextBeforeSeq;
+  return out;
+}
+
+function positiveSeq(value: unknown, fallback: unknown) {
+  const parsed = Number(value ?? 0) || 0;
+  if (parsed > 0) return parsed;
+  return Number(fallback ?? 0) || 0;
 }
 
 export function offlineLazyBackfillMessage(session: SessionListItem) {

@@ -1480,9 +1480,17 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
   const { user } = await requireDeviceAuth(request, store);
   const deviceID = url.searchParams.get("device_id") ?? "";
   if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
-  const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID, { repairMetadata: true });
+  const limit = sessionTurnsWindowLimit(url.searchParams.get("limit"));
+  const beforeSeq = Number(url.searchParams.get("before_seq") ?? 0) || 0;
+  const session = limit > 0
+    ? await store.getSession(user.user_id, deviceID, sessionID)
+    : await sessionWithTurnStats(store, user.user_id, deviceID, sessionID, { repairMetadata: true });
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
-  const parsedTurns = await publicTurns(await store.listTurns(user.user_id, deviceID, sessionID), providers);
+  const turns = await store.listTurns(user.user_id, deviceID, sessionID, {
+    ...(limit > 0 ? { limit } : {}),
+    ...(beforeSeq > 0 ? { beforeSeq } : {}),
+  });
+  const parsedTurns = await publicTurns(turns, providers);
   const stats = {
     count: Number(session.actual_turn_count ?? session.synced_turn_count ?? 0) || 0,
     min_seq: Number(session.synced_min_seq ?? 0) || 0,
@@ -1493,6 +1501,7 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
   const syncedMinSeq = mergeSyncedMinSeq(session.synced_min_seq, stats.min_seq);
   const syncedMaxSeq = Math.max(Number(session.synced_max_seq ?? 0) || 0, stats.max_seq);
   const totalTurnCount = Number(session.turn_count ?? parsedTurns.length);
+  const oldestLoadedSeq = Number(parsedTurns[0]?.seq ?? 0) || 0;
   const latestContiguousMinSeq = Number(stats.latest_contiguous_min_seq ?? 0) || syncedMinSeq;
   const nextBeforeSeq = nextBackfillBeforeSeq({
     total_turn_count: totalTurnCount,
@@ -1508,6 +1517,8 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
     turns: parsedTurns,
     oldest_seq: parsedTurns[0]?.seq,
     latest_seq: parsedTurns[parsedTurns.length - 1]?.seq,
+    window_limit: limit,
+    next_loaded_before_seq: oldestLoadedSeq > syncedMinSeq ? oldestLoadedSeq : 0,
     synced_turn_count: syncedTurnCount,
     synced_min_seq: syncedMinSeq,
     synced_max_seq: syncedMaxSeq,
@@ -1517,6 +1528,13 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
     has_older_turns: Boolean(session.has_older_turns || (totalTurnCount > 0 && syncedMinSeq > 1)),
     needs_sync: parsedTurns.length === 0 && (session.turn_count ?? 0) > 0,
   });
+}
+
+function sessionTurnsWindowLimit(value) {
+  if (value === null || value === undefined || value === "") return 0;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+  return Math.min(500, Math.max(1, Math.floor(parsed)));
 }
 
 async function listSessionEvents(request, store, env, providers, sessionID, url) {

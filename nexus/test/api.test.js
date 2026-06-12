@@ -375,6 +375,63 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(body.turns[0].payload, { text: "plaintext history" });
   });
 
+  it("serves session history windows without reading the entire large session", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const turns = Array.from({ length: 150 }, (_, index) => ({
+      session_id: "sess_windowed_history",
+      seq: index + 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: `2026-06-06T04:00:${String(index % 60).padStart(2, "0")}.000Z`,
+      payload: { text: `turn ${index + 1}` },
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_windowed_history",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "windowed",
+        last_seq: 150,
+        last_timestamp: "2026-06-06T04:02:30.000Z",
+        turn_count: 150,
+        min_seq: 1,
+        max_seq: 150,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const full = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}`, null, auth);
+    assert.equal(full.status, 200);
+    const fullBody = await full.json();
+    assert.equal(fullBody.turns.length, 150);
+    assert.equal(fullBody.window_limit, 0);
+    assert.equal(fullBody.next_loaded_before_seq, 0);
+
+    const tail = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}&limit=20`, null, auth);
+    assert.equal(tail.status, 200);
+    const tailBody = await tail.json();
+    assert.deepEqual(tailBody.turns.map((turn) => turn.seq), Array.from({ length: 20 }, (_, index) => 131 + index));
+    assert.equal(tailBody.window_limit, 20);
+    assert.equal(tailBody.oldest_seq, 131);
+    assert.equal(tailBody.latest_seq, 150);
+    assert.equal(tailBody.next_loaded_before_seq, 131);
+    assert.equal(tailBody.has_older_turns, false);
+
+    const earlier = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}&limit=20&before_seq=131`, null, auth);
+    assert.equal(earlier.status, 200);
+    const earlierBody = await earlier.json();
+    assert.deepEqual(earlierBody.turns.map((turn) => turn.seq), Array.from({ length: 20 }, (_, index) => 111 + index));
+    assert.equal(earlierBody.next_loaded_before_seq, 111);
+  });
+
   it("tiers large turn payloads to object storage without changing the read API", async () => {
     const objectStore = new FakeObjectStore({});
     const env = testEnv({

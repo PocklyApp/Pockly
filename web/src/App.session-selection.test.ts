@@ -14,6 +14,7 @@ import {
   devicePresenceStatus,
   findCreatedSessionForDraft,
   groupSessions,
+  hasEarlierTurns,
   isLargeSessionForAutomaticBackfill,
   mergeHostPresenceIntoSessions,
   nextLazyBackfillBeforeSeq,
@@ -607,6 +608,70 @@ test("load-earlier cursor prefers Nexus next_before_seq for non-contiguous histo
     total_turn_count: 240,
     has_older_turns: true,
   }, [], selected), 141);
+});
+
+test("load-earlier cursor prefers already-persisted window before daemon sync", () => {
+  const selected = session("sess_windowed", "dd_a", {
+    sync_state: "fully_synced",
+    turn_count: 240,
+    synced_turn_count: 240,
+    synced_min_seq: 1,
+    synced_max_seq: 240,
+    has_older_turns: false,
+  });
+
+  const hydration = {
+    session_id: "sess_windowed",
+    turns: [],
+    oldest_seq: 141,
+    latest_seq: 240,
+    window_limit: 100,
+    next_loaded_before_seq: 141,
+    synced_turn_count: 240,
+    synced_min_seq: 1,
+    synced_max_seq: 240,
+    latest_contiguous_min_seq: 1,
+    next_before_seq: 0,
+    total_turn_count: 240,
+    has_older_turns: false,
+  };
+
+  assert.equal(nextLazyBackfillBeforeSeq(hydration, [], selected), 141);
+  assert.equal(hasEarlierTurns(hydration, [], selected), true);
+});
+
+test("windowed fully-synced session has no earlier turns at the beginning", () => {
+  const selected = session("sess_windowed_start", "dd_a", {
+    sync_state: "fully_synced",
+    turn_count: 20,
+    synced_turn_count: 20,
+    synced_min_seq: 1,
+    synced_max_seq: 20,
+    has_older_turns: false,
+  });
+
+  assert.equal(hasEarlierTurns({
+    session_id: "sess_windowed_start",
+    turns: [],
+    oldest_seq: 1,
+    latest_seq: 20,
+    window_limit: 100,
+    next_loaded_before_seq: 0,
+    synced_turn_count: 20,
+    synced_min_seq: 1,
+    synced_max_seq: 20,
+    latest_contiguous_min_seq: 1,
+    total_turn_count: 20,
+    has_older_turns: false,
+  }, Array.from({ length: 20 }, (_, index) => ({
+    session_id: "sess_windowed_start",
+    device_id: "dd_a",
+    seq: index + 1,
+    agent: "claude-code",
+    kind: "assistant_text",
+    timestamp: "",
+    payload: { text: `turn ${index + 1}` },
+  })), selected), false);
 });
 
 test("load-earlier cursor falls back to oldest loaded seq for contiguous partial history", () => {
