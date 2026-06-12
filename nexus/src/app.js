@@ -1021,13 +1021,17 @@ async function verifyDeviceChallenge(request, store) {
 
 async function daemonSync(request, store) {
   if (request.method !== "POST") return methodNotAllowed("POST");
+  const timings = syncTimings();
   const { user, device } = await requireDeviceAuth(request, store, "daemon");
+  timings.mark("auth");
   const body = await readJSON(request);
+  timings.mark("read_json");
   if (body.hello?.device_id && body.hello.device_id !== device.device_id) {
     return errorResponse("daemon device mismatch", ErrorCode.Forbidden, { status: 403 });
   }
   const now = new Date().toISOString();
   await store.touchDevice(device.device_id, now);
+  timings.mark("touch_device");
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
   const turns = Array.isArray(body.turns) ? body.turns : [];
   const uploadedTurnStatsBySession = new Map();
@@ -1043,6 +1047,7 @@ async function daemonSync(request, store) {
     uploadedTurnStatsBySession.set(sessionID, stats);
   }
   await store.upsertTurns(turns.map((turn) => syncTurnRecord(user, device, turn, now)));
+  timings.mark("upsert_turns");
   let existingSessions = null;
   const getExistingSessions = async () => {
     existingSessions ??= await listDeviceSessions(store, user.user_id, device.device_id);
@@ -1057,10 +1062,12 @@ async function daemonSync(request, store) {
       await store.deleteMissingDeviceSessions(user.user_id, device.device_id, keepSessionIDs);
     }
   }
+  timings.mark("reconcile");
   const existingBySessionID = sessions.length > 0
     ? new Map((await getExistingSessions()).map((session) => [String(session.session_id), session]))
     : new Map();
-  await store.upsertSessions(await Promise.all(sessions.map((session) => syncSessionRecord(
+  timings.mark("load_existing_sessions");
+  const sessionRecords = await Promise.all(sessions.map((session) => syncSessionRecord(
     store,
     user,
     device,
@@ -1068,14 +1075,79 @@ async function daemonSync(request, store) {
     now,
     uploadedTurnStatsBySession.get(String(session.session_id)),
     existingBySessionID.get(String(session.session_id)) ?? null,
-  ))));
+  )));
+  timings.mark("build_session_records");
+  const changedSessionRecords = sessionRecords.filter((session) => !sessionMatchesExisting(session, existingBySessionID.get(String(session.session_id))));
+  timings.mark("filter_unchanged_sessions");
+  await store.upsertSessions(changedSessionRecords);
+  timings.mark("upsert_sessions");
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
+    session_upsert_count: changedSessionRecords.length,
     turn_count: turns.length,
     daemon_device: device.device_id,
     daemon_version: body.hello?.version ?? "",
+    timings_ms: timings.finish(),
   });
+}
+
+function syncTimings() {
+  const start = performance.now();
+  let prev = start;
+  const steps = {};
+  return {
+    mark(name) {
+      const now = performance.now();
+      steps[name] = Math.round((now - prev) * 1000) / 1000;
+      prev = now;
+    },
+    finish() {
+      const now = performance.now();
+      steps.total = Math.round((now - start) * 1000) / 1000;
+      return steps;
+    },
+  };
+}
+
+function sessionMatchesExisting(session, existing) {
+  if (!existing) return false;
+  const checks = [
+    ["computer_id", stringOrNull],
+    ["agent", stringOrEmpty],
+    ["runner_alias", stringOrNull],
+    ["cwd", stringOrEmpty],
+    ["snippet", stringOrEmpty],
+    ["first_message", stringOrEmpty],
+    ["title", stringOrNull],
+    ["last_seq", numberValue],
+    ["last_timestamp", stringOrNull],
+    ["channel_last_seen_at", stringOrNull],
+    ["sync_state", stringOrNull],
+    ["turn_count", numberValue],
+    ["last_sync_error", stringOrNull],
+    ["synced_turn_count", numberValue],
+    ["synced_min_seq", numberValue],
+    ["synced_max_seq", numberValue],
+    ["has_older_turns", boolIntValue],
+  ];
+  return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
+}
+
+function stringOrEmpty(value) {
+  return value == null ? "" : String(value);
+}
+
+function stringOrNull(value) {
+  return value == null ? null : String(value);
+}
+
+function numberValue(value) {
+  return Number(value ?? 0) || 0;
+}
+
+function boolIntValue(value) {
+  return value ? 1 : 0;
 }
 
 async function listDeviceSessions(store, userID, deviceID) {
@@ -2615,7 +2687,7 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
     title: session.title || "",
     last_seq: Number(session.last_seq ?? maxSeq),
     last_timestamp: session.last_timestamp || now,
-    channel_last_seen_at: session.channel_last_seen_at || device.last_seen_at || now,
+    channel_last_seen_at: session.channel_last_seen_at || existing?.channel_last_seen_at || session.last_timestamp || now,
     sync_state: mergedSyncState(existing, session, uploadedTurnCount, {
       persistedTurnCount,
       syncedMinSeq,

@@ -206,13 +206,23 @@ describe("worker-native Nexus api", () => {
         },
       ],
     }, { authorization: `Bearer ${daemon.device_access_token}` });
-    assert.deepEqual(await sync.json(), {
+    const syncBody = await sync.json();
+    assert.deepEqual({
+      ok: syncBody.ok,
+      session_count: syncBody.session_count,
+      turn_count: syncBody.turn_count,
+      session_upsert_count: syncBody.session_upsert_count,
+      daemon_device: syncBody.daemon_device,
+      daemon_version: syncBody.daemon_version,
+    }, {
       ok: true,
       session_count: 2,
       turn_count: 2,
+      session_upsert_count: 2,
       daemon_device: daemon.daemon_device_id,
       daemon_version: "0.1.0-test",
     });
+    assert.equal(typeof syncBody.timings_ms?.total, "number");
 
     const listed = await call(env, "GET", "/api/sessions", null, {
       authorization: `Bearer ${browser.device_access_token}`,
@@ -688,6 +698,22 @@ describe("worker-native Nexus api", () => {
     const body = await listed.json();
     assert.equal(body.sessions.some((session) => session.session_id === "sess_reconcile_000"), false);
     assert.equal(body.sessions.length, 335);
+
+    store.resetCounts();
+    const repeat = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: sessions.slice(1),
+      turns: [],
+    }, daemonAuth);
+    assert.equal(repeat.status, 200);
+    const repeatBody = await repeat.json();
+    assert.equal(repeatBody.session_count, 335);
+    assert.equal(repeatBody.session_upsert_count, 0);
+    assert.equal(store.counts.listDeviceSessions, 1);
+    assert.equal(store.counts.upsertSessions, 1);
+    assert.equal(store.counts.upsertSessionRows, 0);
+    assert.equal(store.counts.getSessionTurnStats, 0);
   });
 
   it("uses batch presence for host lists", async () => {
@@ -2457,7 +2483,15 @@ class CountingNexusStore extends InMemoryNexusStore {
       getSession: 0,
       getSessionTurnStats: 0,
       listTurns: 0,
+      upsertSessions: 0,
+      upsertSessionRows: 0,
     };
+  }
+
+  async upsertSessions(sessions) {
+    this.counts.upsertSessions += 1;
+    this.counts.upsertSessionRows += sessions.length;
+    return await super.upsertSessions(sessions);
   }
 
   async listDeviceSessions(...args) {

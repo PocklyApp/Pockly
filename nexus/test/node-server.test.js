@@ -349,13 +349,21 @@ describe("Node self-hosted Nexus server", () => {
           ],
         }),
       });
-      assert.deepEqual(syncResult, {
+      assert.deepEqual({
+        ok: syncResult.ok,
+        session_count: syncResult.session_count,
+        turn_count: syncResult.turn_count,
+        daemon_device: syncResult.daemon_device,
+        daemon_version: syncResult.daemon_version,
+      }, {
         ok: true,
         session_count: 1,
         turn_count: 2,
         daemon_device: daemon.daemon_device_id,
         daemon_version: "0.1.0-test",
       });
+      assert.equal(syncResult.session_upsert_count, 1);
+      assert.equal(typeof syncResult.timings_ms?.total, "number");
 
       const syncedTurns = await sessionTurns(baseURL, connectedBrowser.device_access_token, daemon.daemon_device_id, "sess_node_flow");
       assert.equal(syncedTurns.turns.length, 2);
