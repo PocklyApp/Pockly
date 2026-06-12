@@ -8,11 +8,13 @@ import assert from "node:assert/strict";
 
 import type { Device, HostSummary, SessionListItem } from "./api";
 import {
+  AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT,
   bestContinuationCandidate,
   daemonUpdateTargets,
   devicePresenceStatus,
   findCreatedSessionForDraft,
   groupSessions,
+  isLargeSessionForAutomaticBackfill,
   mergeHostPresenceIntoSessions,
   nextLazyBackfillBeforeSeq,
   offlineLazyBackfillMessage,
@@ -546,6 +548,29 @@ test("opening catalog-only or empty partial sessions triggers lazy sync", () => 
   }), []), true);
 });
 
+test("opening large catalog-only sessions does not auto backfill", () => {
+  const large = session("sess_large", "dd_a", {
+    sync_state: "catalog_only",
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT + 1,
+    synced_turn_count: 0,
+    has_older_turns: true,
+  });
+
+  assert.equal(isLargeSessionForAutomaticBackfill(large), true);
+  assert.equal(shouldSyncSessionOnOpen(large, []), false);
+});
+
+test("large session guard clears after the catalog is fully synced", () => {
+  const synced = session("sess_large_done", "dd_a", {
+    sync_state: "fully_synced",
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT + 1,
+    synced_turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT + 1,
+  });
+
+  assert.equal(isLargeSessionForAutomaticBackfill(synced), false);
+  assert.equal(shouldSyncSessionOnOpen(synced, []), false);
+});
+
 test("opening already hydrated or fully synced sessions does not re-sync", () => {
   assert.equal(shouldSyncSessionOnOpen(session("sess_partial", "dd_a", {
     sync_state: "partial",
@@ -607,4 +632,17 @@ test("load-earlier cursor falls back to oldest loaded seq for contiguous partial
     total_turn_count: 240,
     has_older_turns: true,
   }, [], selected), 141);
+});
+
+test("load-earlier cursor uses zero for the first manual window", () => {
+  const selected = session("sess_large", "dd_a", {
+    sync_state: "catalog_only",
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT + 1,
+    synced_turn_count: 0,
+    synced_min_seq: 0,
+    synced_max_seq: 0,
+    has_older_turns: true,
+  });
+
+  assert.equal(nextLazyBackfillBeforeSeq(null, [], selected), 0);
 });

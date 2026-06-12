@@ -2428,6 +2428,7 @@ describe("worker-native Nexus api", () => {
         { session_id: "sess_recent_open", agent: "claude-code", cwd: "/work", turn_count: 200, last_timestamp: "2026-06-10T00:00:00.000Z" },
         { session_id: "sess_pinned_old", agent: "claude-code", cwd: "/work", turn_count: 200, last_timestamp: "2026-04-10T00:00:00.000Z" },
         { session_id: "sess_old", agent: "claude-code", cwd: "/work", turn_count: 200, last_timestamp: "2026-04-09T00:00:00.000Z" },
+        { session_id: "sess_large_recent_open", agent: "codex", cwd: "/work", turn_count: 2001, last_timestamp: "2026-06-10T00:00:00.000Z" },
       ],
       full_reconcile: true,
     }, daemonAuth);
@@ -2447,6 +2448,10 @@ describe("worker-native Nexus api", () => {
     }, auth);
     await call(env, "POST", "/api/sessions/sess_other_device/opened", {
       device_id: "dd_other",
+      opened_at: now,
+    }, auth);
+    await call(env, "POST", "/api/sessions/sess_large_recent_open/opened", {
+      device_id: daemon.daemon_device_id,
       opened_at: now,
     }, auth);
 
@@ -2692,6 +2697,45 @@ describe("worker-native Nexus api", () => {
       device_id: "dd_not_connected",
     }, auth);
     assert.equal(offline.status, 200);
+  });
+
+  it("does not push recently-opened SYNC_HINT for large sessions", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const envelopes = [];
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope) => {
+      envelopes.push(envelope);
+    });
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_large_hint_skip",
+        agent: "codex",
+        cwd: "/work/large",
+        snippet: "large",
+        last_seq: 2001,
+        last_timestamp: "2026-06-06T08:59:00.000Z",
+        sync_state: "catalog_only",
+        turn_count: 2001,
+      }],
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    const opened = await call(env, "POST", "/api/sessions/sess_large_hint_skip/opened", {
+      device_id: daemon.daemon_device_id,
+    }, auth);
+    assert.equal(opened.status, 200);
+    assert.deepEqual(envelopes.filter((envelope) => envelope.type === "SYNC_HINT"), []);
+
+    const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
+    assert.deepEqual(await hints.json(), { sessions: [] });
   });
 });
 

@@ -39,6 +39,7 @@ import { createStore } from "./store.js";
 const onlineWindowMs = 2 * 60 * 1000;
 const recentlyOpenedSyncHintMs = 24 * 60 * 60 * 1000;
 const prioritySyncHintTurnLimit = 100;
+const automaticSessionBackfillTurnLimit = 1000;
 const defaultHostsOnlineCacheMs = 1000;
 const hostsOnlineCache = new Map();
 const turnPayloadBlobPointerVersion = 1;
@@ -1266,8 +1267,10 @@ async function daemonSyncHints(request, store) {
     if (!sessionIDs.has(String(hint.session_id)) || hintsBySessionID.has(String(hint.session_id))) continue;
     const opened = Date.parse(hint.last_opened_at || "");
     if (!Number.isFinite(opened) || opened < cutoff) continue;
+    const session = sessionsByID.get(String(hint.session_id));
+    if (isLargeSessionForAutomaticBackfill(session)) continue;
     hintsBySessionID.set(String(hint.session_id), {
-      ...sessionSyncHintPayload(sessionsByID.get(String(hint.session_id)), String(hint.session_id)),
+      ...sessionSyncHintPayload(session, String(hint.session_id)),
       reason: "recently_opened",
       preferred_min: prioritySyncHintTurnLimit,
     });
@@ -1407,12 +1410,20 @@ async function markSessionOpened(request, store, env, sessionID) {
     updated_at: new Date().toISOString(),
   });
   const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID);
-  await pushSyncHintToDaemon(env, user.user_id, deviceID, sessionID, session);
+  if (!isLargeSessionForAutomaticBackfill(session)) {
+    await pushSyncHintToDaemon(env, user.user_id, deviceID, sessionID, session);
+  }
   return jsonResponse({
     device_id: hint.device_id,
     session_id: hint.session_id,
     last_opened_at: hint.last_opened_at,
   });
+}
+
+function isLargeSessionForAutomaticBackfill(session) {
+  const total = Number(session?.turn_count ?? session?.last_seq ?? 0) || 0;
+  const loaded = Number(session?.synced_turn_count ?? 0) || 0;
+  return total > automaticSessionBackfillTurnLimit && loaded < total;
 }
 
 // Nudge the daemon over its already-open control WS so the opened session's

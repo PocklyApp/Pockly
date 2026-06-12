@@ -893,6 +893,7 @@ export function App() {
     if (turnsStatus === "loading" || turnsStatus === "syncing") return;
     const expectedTurns = selectedSession.turn_count || selectedSession.last_seq || 0;
     if (expectedTurns <= 0 || turns.length > 0) return;
+    if (!shouldSyncSessionOnOpen(selectedSession, turns)) return;
     const syncKey = `${selected.deviceId}:${selected.sessionId}:${selectedSession.last_seq}:${selectedSession.turn_count ?? 0}`;
     if (emptySessionSyncRef.current === syncKey) return;
     emptySessionSyncRef.current = syncKey;
@@ -1776,6 +1777,7 @@ export function App() {
     if (push) {
       pushRoute({ view: "workspaceSession", sessionId: next.sessionId, deviceId: next.deviceId });
     }
+    const initialSession = sessionHint ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
     markSessionOpened({ sessionId: next.sessionId, deviceId: next.deviceId, openedAt: new Date().toISOString() })
       .catch(() => {
         // This hint only helps the daemon prioritize future lazy windows.
@@ -1787,7 +1789,7 @@ export function App() {
       const hydrated = data.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
       setTurns(hydrated);
       setTurnsHydration(data);
-      const session = sessionHint ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
+      const session = initialSession ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
       logSessionHydration("openSession loaded turns", {
         sessionId: next.sessionId,
         deviceId: next.deviceId,
@@ -1811,6 +1813,10 @@ export function App() {
         await syncSelectedSession(next, requestID, 0);
         return;
       }
+      if (isLargeSessionForAutomaticBackfill(session)) {
+        setTurnsStatus("");
+        return;
+      }
       setTurnsStatus("empty");
     } catch (error) {
       if (requestID !== loadRequestRef.current) return;
@@ -1824,6 +1830,17 @@ export function App() {
       const sessionMeta = sessionHint ?? sessions.find(
         (item) => item.session_id === next.sessionId && item.device_id === next.deviceId,
       );
+      if (isLargeSessionForAutomaticBackfill(sessionMeta)) {
+        setTurnsStatus("");
+        setTurnsHydration({
+          session_id: next.sessionId,
+          turns: [],
+          synced_turn_count: sessionMeta?.synced_turn_count ?? 0,
+          total_turn_count: sessionMeta?.turn_count ?? sessionMeta?.last_seq ?? 0,
+          has_older_turns: Boolean(sessionMeta?.has_older_turns || (sessionMeta?.turn_count ?? sessionMeta?.last_seq ?? 0) > (sessionMeta?.synced_turn_count ?? 0)),
+        });
+        return;
+      }
       const isFreshSession = !!sessionMeta
         && (sessionMeta.last_seq ?? 0) === 0
         && (sessionMeta.turn_count ?? 0) === 0;
@@ -2153,9 +2170,11 @@ export function App() {
 
   async function loadEarlierTurns() {
     if (!selected || !selectedSession || loadingEarlierRef.current) return;
-    if (!turnsHydration?.has_older_turns && !selectedSession.has_older_turns) return;
+    const loaded = turnsHydration?.synced_turn_count ?? selectedSession.synced_turn_count ?? turns.length;
+    const total = turnsHydration?.total_turn_count ?? selectedSession.turn_count ?? selectedSession.last_seq ?? 0;
+    if (!turnsHydration?.has_older_turns && !selectedSession.has_older_turns && total <= loaded) return;
     const beforeSeq = nextLazyBackfillBeforeSeq(turnsHydration, turns, selectedSession);
-    if (beforeSeq <= 1) return;
+    if (beforeSeq === 1) return;
     loadingEarlierRef.current = true;
     const requestID = loadRequestRef.current;
     try {
@@ -5242,7 +5261,9 @@ function SessionsPage({
   onToggleVoiceInput: () => void;
 }) {
   const visibleTurns = selectedSession ? visibleConversationTurns(turns) : [];
-  const hasOlderTurns = Boolean(turnsHydration?.has_older_turns || selectedSession?.has_older_turns);
+  const loadedTurns = turnsHydration?.synced_turn_count ?? selectedSession?.synced_turn_count ?? visibleTurns.length;
+  const totalAvailableTurns = turnsHydration?.total_turn_count ?? selectedSession?.turn_count ?? selectedSession?.last_seq ?? 0;
+  const hasOlderTurns = Boolean(turnsHydration?.has_older_turns || selectedSession?.has_older_turns || totalAvailableTurns > loadedTurns);
   // Composer mirrors the no-device home: starts in rest (single-row) and
   // expands to the focused 2-row layout only after the user taps in.
   const [composerFocused, setComposerFocused] = useState(false);
@@ -5502,11 +5523,15 @@ function SessionsPage({
             className={showConversationView ? "turn-scroll" : "turn-scroll is-workspace-idle"}
             onScroll={(event) => {
               updateScrollToBottomVisibility(event.currentTarget);
-              if (event.currentTarget.scrollTop < 96) {
+              if (visibleTurns.length > 0 && event.currentTarget.scrollTop < 96) {
                 requestEarlierContext(event.currentTarget);
               }
             }}
             onTouchStart={(event) => {
+              if (visibleTurns.length === 0) {
+                pullStartYRef.current = null;
+                return;
+              }
               pullStartYRef.current = event.currentTarget.scrollTop <= 2 ? event.touches[0]?.clientY ?? null : null;
             }}
             onTouchMove={(event) => {
@@ -12980,8 +13005,17 @@ function shouldLazySyncSession(session: SessionListItem) {
   return state === "catalog_only" || state === "failed" || state === "syncing" || state === "partial";
 }
 
+export const AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT = 1000;
+
+export function isLargeSessionForAutomaticBackfill(session: SessionListItem | null | undefined) {
+  const total = Number(session?.turn_count ?? session?.last_seq ?? 0) || 0;
+  const loaded = Number(session?.synced_turn_count ?? 0) || 0;
+  return total > AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT && loaded < total;
+}
+
 export function shouldSyncSessionOnOpen(session: SessionListItem, turns: SessionTurn[]) {
   if (turns.length > 0) return false;
+  if (isLargeSessionForAutomaticBackfill(session)) return false;
   const state = sessionSyncState(session);
   if (state === "ready" || state === "fully_synced") return false;
   return shouldLazySyncSession(session);

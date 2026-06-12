@@ -924,11 +924,43 @@ func TestPushedHintStoreEvictsOldestAtCapacity(t *testing.T) {
 	}
 }
 
-func TestPushedHintStoreTracksBackfillCursor(t *testing.T) {
+func TestPushedHintStoreConsumesRecentlyOpenedAfterOneWindow(t *testing.T) {
 	store := newPushedHintStore()
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	store.Add("sess-large", syncHint{
 		Reason:          "recently_opened",
+		PreferredMin:    100,
+		SyncedTurnCount: 100,
+		SyncedMinSeq:    141,
+		SyncedMaxSeq:    240,
+		NextBeforeSeq:   141,
+		TotalTurnCount:  240,
+		HasOlderTurns:   true,
+	}, now)
+
+	hint := store.Snapshot(now)["sess-large"]
+	if before := beforeSeqForHint(hint); before != 141 {
+		t.Fatalf("beforeSeqForHint = %d, want 141", before)
+	}
+
+	store.UpdateAfterSync("sess-large", pair.SyncSession{
+		SessionID: "sess-large",
+		MinSeq:    41,
+		MaxSeq:    140,
+		TurnCount: 240,
+		HasOlder:  true,
+	}, now.Add(time.Second))
+
+	if hints := store.Snapshot(now.Add(time.Second)); len(hints) != 0 {
+		t.Fatalf("recently opened hint should be consumed after one window, got %+v", hints)
+	}
+}
+
+func TestPushedHintStoreTracksPinnedBackfillCursor(t *testing.T) {
+	store := newPushedHintStore()
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	store.Add("sess-large", syncHint{
+		Reason:          "pinned",
 		PreferredMin:    100,
 		SyncedTurnCount: 100,
 		SyncedMinSeq:    141,
@@ -968,33 +1000,6 @@ func TestPushedHintStoreTracksBackfillCursor(t *testing.T) {
 	}, now.Add(2*time.Second))
 	if hints := store.Snapshot(now.Add(2 * time.Second)); len(hints) != 0 {
 		t.Fatalf("completed hint should be removed, got %+v", hints)
-	}
-}
-
-func TestPushedHintStoreDoesNotTreatNonContiguousMinMaxAsComplete(t *testing.T) {
-	store := newPushedHintStore()
-	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
-	store.Add("sess-gap", syncHint{
-		Reason:          "recently_opened",
-		PreferredMin:    100,
-		SyncedTurnCount: 140,
-		SyncedMinSeq:    1,
-		SyncedMaxSeq:    240,
-		NextBeforeSeq:   141,
-		TotalTurnCount:  240,
-		HasOlderTurns:   true,
-	}, now)
-
-	store.UpdateAfterSync("sess-gap", pair.SyncSession{
-		SessionID: "sess-gap",
-		MinSeq:    41,
-		MaxSeq:    140,
-		TurnCount: 240,
-		HasOlder:  true,
-	}, now.Add(time.Second))
-
-	if hints := store.Snapshot(now.Add(time.Second)); len(hints) != 0 {
-		t.Fatalf("non-contiguous hint should complete after filling the middle gap, got %+v", hints)
 	}
 }
 

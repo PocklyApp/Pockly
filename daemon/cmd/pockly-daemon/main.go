@@ -2547,6 +2547,10 @@ func (s *pushedHintStore) UpdateAfterSync(sessionID string, meta pair.SyncSessio
 	if !ok {
 		return
 	}
+	if entry.hint.Reason == "recently_opened" {
+		delete(s.entries, sessionID)
+		return
+	}
 	entry.hint = mergeSyncHintAfterWindow(entry.hint, meta)
 	if syncHintBackfillComplete(entry.hint) {
 		delete(s.entries, sessionID)
