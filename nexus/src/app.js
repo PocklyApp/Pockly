@@ -3260,9 +3260,13 @@ async function externalizeTurnPayload(turn, blobStore, threshold) {
   const payload = String(turn.payload);
   if (utf8ByteLength(payload) < threshold && !isTurnPayloadPointerObject(parsePayload(payload))) return turn;
   const hash = await sha256Base64URL(payload);
-  const key = turnPayloadBlobKey(turn, hash);
-  await blobStore.put(key, payload, {
-    httpMetadata: { contentType: "application/json; charset=utf-8" },
+  const encoded = await encodeTurnPayloadBlob(payload);
+  const key = turnPayloadBlobKey(turn, hash, encoded.encoding);
+  await blobStore.put(key, encoded.data, {
+    httpMetadata: {
+      contentType: "application/json; charset=utf-8",
+      ...(encoded.encoding ? { contentEncoding: encoded.encoding } : {}),
+    },
   });
   return {
     ...turn,
@@ -3272,6 +3276,8 @@ async function externalizeTurnPayload(turn, blobStore, threshold) {
       key,
       sha256: hash,
       bytes: utf8ByteLength(payload),
+      encoded_bytes: encoded.byteLength,
+      ...(encoded.encoding ? { encoding: encoded.encoding } : {}),
     }),
   };
 }
@@ -3288,7 +3294,7 @@ async function resolveTurnPayload(payload, providers = {}, blobCache = new Map()
       ? await blobCache.get(parsed.key)
       : await cacheBlobGet(blobCache, parsed.key, blobStore.get(parsed.key));
     if (!object) return { payload_ref_missing: true };
-    const text = typeof object.text === "function" ? await object.text() : String(object);
+    const text = await decodeTurnPayloadBlob(object, parsed);
     if (parsed.sha256 && await sha256Base64URL(text) !== parsed.sha256) {
       return { payload_ref_invalid: true };
     }
@@ -3296,6 +3302,44 @@ async function resolveTurnPayload(payload, providers = {}, blobCache = new Map()
   } catch {
     return { payload_ref_unavailable: true };
   }
+}
+
+async function encodeTurnPayloadBlob(payload) {
+  const fallback = {
+    data: payload,
+    byteLength: utf8ByteLength(payload),
+    encoding: "",
+  };
+  if (typeof CompressionStream !== "function" || typeof Blob !== "function") return fallback;
+  try {
+    const compressed = await new Response(new Blob([payload]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
+    return {
+      data: new Uint8Array(compressed),
+      byteLength: compressed.byteLength,
+      encoding: "gzip",
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+async function decodeTurnPayloadBlob(object, pointer) {
+  if (pointer?.encoding === "gzip") {
+    if (typeof DecompressionStream !== "function") throw new Error("gzip payload refs require DecompressionStream");
+    const source = await blobObjectArrayBuffer(object);
+    return await new Response(new Blob([source]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+  }
+  return typeof object.text === "function" ? await object.text() : String(object);
+}
+
+async function blobObjectArrayBuffer(object) {
+  if (typeof object?.arrayBuffer === "function") return await object.arrayBuffer();
+  if (typeof object?.text === "function") return new TextEncoder().encode(await object.text()).buffer;
+  if (object instanceof ArrayBuffer) return object;
+  if (ArrayBuffer.isView(object)) {
+    return object.buffer.slice(object.byteOffset, object.byteOffset + object.byteLength);
+  }
+  return new TextEncoder().encode(String(object)).buffer;
 }
 
 async function cacheBlobGet(blobCache, key, promise) {
@@ -3314,8 +3358,8 @@ function turnPayloadBlobThreshold(env = {}) {
   return Math.floor(value);
 }
 
-function turnPayloadBlobKey(turn, hash) {
-  return `${turnPayloadBlobKeyPrefix(turn)}/${hash}.json`;
+function turnPayloadBlobKey(turn, hash, encoding = "") {
+  return `${turnPayloadBlobKeyPrefix(turn)}/${hash}.json${encoding === "gzip" ? ".gz" : ""}`;
 }
 
 function turnPayloadBlobKeyPrefix(turn) {
@@ -3340,7 +3384,7 @@ function isTurnPayloadPointerObject(value, turn = null) {
     value.version === turnPayloadBlobPointerVersion &&
     typeof value.key === "string" &&
     value.key.startsWith("session-turns/") &&
-    value.key.endsWith(".json")
+    (value.key.endsWith(".json") || value.key.endsWith(".json.gz"))
   );
   if (!validShape) return false;
   if (!turn) return true;

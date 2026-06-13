@@ -445,7 +445,7 @@ describe("worker-native Nexus api", () => {
     const browserKeys = await generateSigningKeyPair();
     const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
     const daemon = await loginDaemon(env, cookie);
-    const largePayload = { text: "this payload is intentionally larger than the test threshold" };
+    const largePayload = { text: "this payload is intentionally larger than the test threshold. ".repeat(256) };
 
     const sync = await call(env, "POST", "/api/daemon/sync", {
       hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
@@ -475,8 +475,13 @@ describe("worker-native Nexus api", () => {
     assert.equal(storedTurns.length, 1);
     const pointer = JSON.parse(storedTurns[0].payload);
     assert.equal(pointer.pockly_payload_ref, "blob");
+    assert.equal(pointer.encoding, "gzip");
+    assert.equal(pointer.bytes, Buffer.byteLength(JSON.stringify(largePayload)));
+    assert.ok(pointer.encoded_bytes > 0);
+    assert.match(pointer.key, /\.json\.gz$/);
     assert.equal(Object.keys(objectStore.objects).length, 1);
-    assert.equal(await objectStore.get(pointer.key).then((object) => object.text()), JSON.stringify(largePayload));
+    assert.equal(await objectStore.get(pointer.key).then(readGzipObjectText), JSON.stringify(largePayload));
+    assert.ok(pointer.encoded_bytes < pointer.bytes);
 
     const turns = await call(env, "GET", `/api/sessions/sess_blob_payload/turns?device_id=${daemon.daemon_device_id}`, null, {
       authorization: `Bearer ${browser.device_access_token}`,
@@ -2966,11 +2971,14 @@ class FakeObjectStore {
     this.getCalls.push(key);
     const value = this.objects[key];
     if (value == null) return null;
-    return { text: async () => value };
+    return {
+      text: async () => String(value),
+      arrayBuffer: async () => valueToArrayBuffer(value),
+    };
   }
 
   async put(key, value) {
-    this.objects[key] = String(value);
+    this.objects[key] = value;
     return { key };
   }
 
@@ -2978,6 +2986,18 @@ class FakeObjectStore {
     this.deleteCalls.push(key);
     delete this.objects[key];
   }
+}
+
+async function readGzipObjectText(object) {
+  return await new Response(new Blob([await object.arrayBuffer()]).stream().pipeThrough(new DecompressionStream("gzip"))).text();
+}
+
+function valueToArrayBuffer(value) {
+  if (value instanceof ArrayBuffer) return value;
+  if (ArrayBuffer.isView(value)) {
+    return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+  }
+  return new TextEncoder().encode(String(value)).buffer;
 }
 
 class CountingControlHub extends InMemoryControlHub {
