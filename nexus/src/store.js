@@ -391,6 +391,16 @@ export class InMemoryNexusStore {
     for (const turn of turns) await this.upsertTurn(turn);
   }
 
+  async listExistingTurnPayloads(turns = []) {
+    const out = new Map();
+    for (const turn of turns) {
+      const key = turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq);
+      const existing = this.turns.get(key);
+      if (existing?.payload !== undefined) out.set(key, existing.payload);
+    }
+    return out;
+  }
+
   async listTurns(userID, deviceID, sessionID, options = {}) {
     return filterTurnWindow(
       [...this.turns.values()]
@@ -1320,6 +1330,41 @@ export class SQLNexusStore {
     for (let i = 0; i < deduped.length; i += CHUNK) {
       await this._upsertTurnsStatement(deduped.slice(i, i + CHUNK)).run();
     }
+  }
+
+  async listExistingTurnPayloads(turns = []) {
+    const deduped = dedupeTurnRows(turns);
+    if (!deduped.length) return new Map();
+    const bySession = new Map();
+    for (const turn of deduped) {
+      const key = sessionKey(turn.user_id, turn.device_id, turn.session_id);
+      const entry = bySession.get(key) || {
+        user_id: turn.user_id,
+        device_id: turn.device_id,
+        session_id: turn.session_id,
+        seqs: [],
+      };
+      entry.seqs.push(Number(turn.seq) || 0);
+      bySession.set(key, entry);
+    }
+    const out = new Map();
+    for (const entry of bySession.values()) {
+      const seqs = [...new Set(entry.seqs.filter((seq) => seq > 0))];
+      for (let i = 0; i < seqs.length; i += this.turnUpsertBatchSize) {
+        const chunk = seqs.slice(i, i + this.turnUpsertBatchSize);
+        if (!chunk.length) continue;
+        const placeholders = chunk.map(() => "?").join(", ");
+        const result = await this.db.prepare(`
+          SELECT user_id, device_id, session_id, seq, payload
+          FROM session_turns
+          WHERE user_id = ? AND device_id = ? AND session_id = ? AND seq IN (${placeholders})
+        `).bind(entry.user_id, entry.device_id, entry.session_id, ...chunk).all();
+        for (const row of result.results ?? []) {
+          out.set(turnKey(row.user_id, row.device_id, row.session_id, row.seq), row.payload);
+        }
+      }
+    }
+    return out;
   }
 
   _upsertTurnsStatement(turns) {

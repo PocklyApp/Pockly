@@ -490,6 +490,50 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(body.turns[0].payload, largePayload);
   });
 
+  it("does not rewrite history blobs when a daemon retries unchanged turns", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const payload = { text: "retry payload should be externalized once. ".repeat(256) };
+    const body = {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_blob_retry",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_blob_retry",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload,
+      }],
+    };
+
+    const first = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(first.status, 200);
+    assert.equal(objectStore.putCalls.length, 1);
+
+    const retry = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(retry.status, 200);
+    assert.equal(objectStore.putCalls.length, 1);
+  });
+
   it("treats daemon-uploaded blob pointer shaped payloads as ordinary content", async () => {
     const objectStore = new FakeObjectStore({});
     const env = testEnv({
@@ -2964,6 +3008,7 @@ class FakeObjectStore {
   constructor(objects) {
     this.objects = objects;
     this.getCalls = [];
+    this.putCalls = [];
     this.deleteCalls = [];
   }
 
@@ -2978,6 +3023,7 @@ class FakeObjectStore {
   }
 
   async put(key, value) {
+    this.putCalls.push(key);
     this.objects[key] = value;
     return { key };
   }

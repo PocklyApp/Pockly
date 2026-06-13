@@ -1049,7 +1049,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     uploadedTurnStatsBySession.set(sessionID, stats);
   }
   const turnRecords = turns.map((turn) => syncTurnRecord(user, device, turn, now));
-  await store.upsertTurns(await externalizeTurnPayloads(turnRecords, env, providers));
+  await upsertChangedTurns(store, turnRecords, env, providers);
   timings.mark("upsert_turns");
   let existingSessions = null;
   const getExistingSessions = async () => {
@@ -1795,7 +1795,7 @@ export function createSessionEventSink(store, options = {}) {
       const turnRow = sessionTurnRecord(payload, meta);
       if (turnRow) {
         try {
-          await store.upsertTurns(await externalizeTurnPayloads([turnRow], env, providers));
+          await upsertChangedTurns(store, [turnRow], env, providers);
         } catch {
           // The daemon window sync re-uploads the same turns from the local
           // jsonl, so a failed live write only delays content, never loses it.
@@ -3253,6 +3253,47 @@ async function externalizeTurnPayloads(turns, env = {}, providers = {}) {
   const blobStore = providers.historyBlobStore;
   if (!blobStore || threshold <= 0 || !turns.length) return turns;
   return await Promise.all(turns.map((turn) => externalizeTurnPayload(turn, blobStore, threshold)));
+}
+
+async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
+  const deduped = dedupeTurnRecords(turns);
+  if (!deduped.length) return;
+  const changed = await filterChangedTurnRecords(store, deduped);
+  if (!changed.length) return;
+  await store.upsertTurns(await externalizeTurnPayloads(changed, env, providers));
+}
+
+async function filterChangedTurnRecords(store, turns) {
+  if (typeof store.listExistingTurnPayloads !== "function") return turns;
+  const existingPayloads = await store.listExistingTurnPayloads(turns);
+  if (!existingPayloads?.size) return turns;
+  const out = [];
+  for (const turn of turns) {
+    const existing = existingPayloads.get(turnRecordKey(turn));
+    if (existing === undefined || !await turnPayloadsEquivalent(existing, turn.payload)) out.push(turn);
+  }
+  return out;
+}
+
+async function turnPayloadsEquivalent(existingPayload, nextPayload) {
+  if (existingPayload === nextPayload) return true;
+  const existingPointer = parsePayload(existingPayload);
+  if (isTurnPayloadPointerObject(existingPointer)) {
+    return existingPointer.sha256 && existingPointer.sha256 === await sha256Base64URL(String(nextPayload ?? ""));
+  }
+  const nextPointer = parsePayload(nextPayload);
+  if (isTurnPayloadPointerObject(nextPointer)) {
+    return nextPointer.sha256 && nextPointer.sha256 === await sha256Base64URL(String(existingPayload ?? ""));
+  }
+  return false;
+}
+
+function dedupeTurnRecords(turns = []) {
+  return [...new Map(turns.map((turn) => [turnRecordKey(turn), turn])).values()];
+}
+
+function turnRecordKey(turn) {
+  return `${turn.user_id}\x00${turn.device_id}\x00${turn.session_id}\x00${turn.seq}`;
 }
 
 async function externalizeTurnPayload(turn, blobStore, threshold) {
