@@ -40,6 +40,8 @@ const onlineWindowMs = 2 * 60 * 1000;
 const recentlyOpenedSyncHintMs = 24 * 60 * 60 * 1000;
 const prioritySyncHintTurnLimit = 100;
 const automaticSessionBackfillTurnLimit = 1000;
+const defaultSessionTurnWindowLimit = 100;
+const maxSessionTurnWindowLimit = 500;
 const defaultHostsOnlineCacheMs = 1000;
 const defaultTurnPayloadBatchRawBytes = 1024 * 1024;
 const hostsOnlineCache = new Map();
@@ -1484,11 +1486,9 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
   const { user } = await requireDeviceAuth(request, store);
   const deviceID = url.searchParams.get("device_id") ?? "";
   if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
-  const limit = sessionTurnsWindowLimit(url.searchParams.get("limit"));
+  const limit = sessionTurnsWindowLimit(url.searchParams);
   const beforeSeq = Number(url.searchParams.get("before_seq") ?? 0) || 0;
-  const session = limit > 0
-    ? await store.getSession(user.user_id, deviceID, sessionID)
-    : await sessionWithTurnStats(store, user.user_id, deviceID, sessionID, { repairMetadata: true });
+  const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID, { repairMetadata: true });
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
   const turns = await store.listTurns(user.user_id, deviceID, sessionID, {
     ...(limit > 0 ? { limit } : {}),
@@ -1534,11 +1534,14 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
   });
 }
 
-function sessionTurnsWindowLimit(value) {
-  if (value === null || value === undefined || value === "") return 0;
+function sessionTurnsWindowLimit(params) {
+  const value = params.get("limit");
+  const full = params.get("full") === "1" || params.get("full") === "true";
+  if (full && value === "0") return 0;
+  if (value === null || value === undefined || value === "") return defaultSessionTurnWindowLimit;
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.min(500, Math.max(1, Math.floor(parsed)));
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultSessionTurnWindowLimit;
+  return Math.min(maxSessionTurnWindowLimit, Math.max(1, Math.floor(parsed)));
 }
 
 async function listSessionEvents(request, store, env, providers, sessionID, url) {

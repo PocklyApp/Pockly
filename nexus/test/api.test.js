@@ -408,7 +408,14 @@ describe("worker-native Nexus api", () => {
     assert.equal(sync.status, 200);
     const auth = { authorization: `Bearer ${browser.device_access_token}` };
 
-    const full = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}`, null, auth);
+    const defaultWindow = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}`, null, auth);
+    assert.equal(defaultWindow.status, 200);
+    const defaultWindowBody = await defaultWindow.json();
+    assert.deepEqual(defaultWindowBody.turns.map((turn) => turn.seq), Array.from({ length: 100 }, (_, index) => 51 + index));
+    assert.equal(defaultWindowBody.window_limit, 100);
+    assert.equal(defaultWindowBody.next_loaded_before_seq, 51);
+
+    const full = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}&limit=0&full=1`, null, auth);
     assert.equal(full.status, 200);
     const fullBody = await full.json();
     assert.equal(fullBody.turns.length, 150);
