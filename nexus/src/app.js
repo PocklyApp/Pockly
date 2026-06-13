@@ -41,6 +41,7 @@ const recentlyOpenedSyncHintMs = 24 * 60 * 60 * 1000;
 const prioritySyncHintTurnLimit = 100;
 const automaticSessionBackfillTurnLimit = 1000;
 const defaultHostsOnlineCacheMs = 1000;
+const defaultTurnPayloadBatchRawBytes = 1024 * 1024;
 const hostsOnlineCache = new Map();
 const turnPayloadBlobPointerVersion = 1;
 
@@ -3252,7 +3253,7 @@ async function externalizeTurnPayloads(turns, env = {}, providers = {}) {
   const threshold = turnPayloadBlobThreshold(env);
   const blobStore = providers.historyBlobStore;
   if (!blobStore || threshold <= 0 || !turns.length) return turns;
-  return await Promise.all(turns.map((turn) => externalizeTurnPayload(turn, blobStore, threshold)));
+  return await externalizeTurnPayloadBatch(turns, blobStore, threshold, turnPayloadBatchRawBytes(env));
 }
 
 async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
@@ -3296,6 +3297,98 @@ function turnRecordKey(turn) {
   return `${turn.user_id}\x00${turn.device_id}\x00${turn.session_id}\x00${turn.seq}`;
 }
 
+async function externalizeTurnPayloadBatch(turns, blobStore, threshold, maxBatchRawBytes) {
+  const out = [...turns];
+  const candidates = [];
+  for (let index = 0; index < turns.length; index += 1) {
+    const turn = turns[index];
+    if (!turn?.payload) continue;
+    const payload = String(turn.payload);
+    if (utf8ByteLength(payload) < threshold && !isTurnPayloadPointerObject(parsePayload(payload))) continue;
+    candidates.push({
+      index,
+      turn,
+      payload,
+      bytes: utf8ByteLength(payload),
+      sessionKey: `${turn.user_id}\x00${turn.device_id}\x00${turn.session_id}`,
+    });
+  }
+  const singles = [];
+  for (const group of groupedPayloadCandidates(candidates)) {
+    let batch = [];
+    let batchBytes = 0;
+    const flush = async () => {
+      if (batch.length === 1) {
+        singles.push(batch[0]);
+      } else if (batch.length > 1) {
+        const pointers = await externalizeTurnPayloadCandidateBatch(batch, blobStore);
+        for (const [index, pointer] of pointers) out[index] = { ...out[index], payload: JSON.stringify(pointer) };
+      }
+      batch = [];
+      batchBytes = 0;
+    };
+    for (const candidate of group) {
+      if (batch.length > 0 && batchBytes + candidate.bytes > maxBatchRawBytes) await flush();
+      batch.push(candidate);
+      batchBytes += candidate.bytes;
+    }
+    await flush();
+  }
+  await Promise.all(singles.map(async (candidate) => {
+    out[candidate.index] = await externalizeTurnPayload(candidate.turn, blobStore, threshold);
+  }));
+  return out;
+}
+
+function groupedPayloadCandidates(candidates) {
+  const groups = new Map();
+  for (const candidate of candidates) {
+    const group = groups.get(candidate.sessionKey) || [];
+    group.push(candidate);
+    groups.set(candidate.sessionKey, group);
+  }
+  return [...groups.values()].map((group) => group.sort((left, right) => Number(left.turn.seq) - Number(right.turn.seq)));
+}
+
+async function externalizeTurnPayloadCandidateBatch(candidates, blobStore) {
+  const items = [];
+  for (const candidate of candidates) {
+    items.push({
+      seq: Number(candidate.turn.seq) || 0,
+      sha256: await sha256Base64URL(candidate.payload),
+      bytes: candidate.bytes,
+      payload: candidate.payload,
+    });
+  }
+  const manifest = JSON.stringify({
+    pockly_payload_batch: "turn_payloads",
+    version: turnPayloadBlobPointerVersion,
+    items,
+  });
+  const batchHash = await sha256Base64URL(manifest);
+  const encoded = await encodeTurnPayloadBlob(manifest);
+  const first = candidates[0].turn;
+  const last = candidates[candidates.length - 1].turn;
+  const key = turnPayloadBatchBlobKey(first, last, batchHash, encoded.encoding);
+  await blobStore.put(key, encoded.data, {
+    httpMetadata: {
+      contentType: "application/json; charset=utf-8",
+      ...(encoded.encoding ? { contentEncoding: encoded.encoding } : {}),
+    },
+  });
+  return new Map(candidates.map((candidate, index) => [candidate.index, {
+    pockly_payload_ref: "blob_batch",
+    version: turnPayloadBlobPointerVersion,
+    key,
+    batch_sha256: batchHash,
+    item_seq: items[index].seq,
+    sha256: items[index].sha256,
+    bytes: items[index].bytes,
+    encoded_bytes: encoded.byteLength,
+    ...(encoded.encoding ? { encoding: encoded.encoding } : {}),
+  }]));
+}
+
 async function externalizeTurnPayload(turn, blobStore, threshold) {
   if (!turn?.payload) return turn;
   const payload = String(turn.payload);
@@ -3331,11 +3424,11 @@ async function resolveTurnPayload(payload, providers = {}, blobCache = new Map()
   const blobStore = providers.historyBlobStore;
   if (!blobStore) return { payload_ref_unavailable: true };
   try {
-    const object = blobCache.has(parsed.key)
-      ? await blobCache.get(parsed.key)
-      : await cacheBlobGet(blobCache, parsed.key, blobStore.get(parsed.key));
-    if (!object) return { payload_ref_missing: true };
-    const text = await decodeTurnPayloadBlob(object, parsed);
+    const text = await cacheBlobText(blobCache, parsed.key, blobStore, parsed);
+    if (text === null) return { payload_ref_missing: true };
+    if (parsed.pockly_payload_ref === "blob_batch") {
+      return await resolveTurnPayloadBatchItem(text, parsed);
+    }
     if (parsed.sha256 && await sha256Base64URL(text) !== parsed.sha256) {
       return { payload_ref_invalid: true };
     }
@@ -3343,6 +3436,38 @@ async function resolveTurnPayload(payload, providers = {}, blobCache = new Map()
   } catch {
     return { payload_ref_unavailable: true };
   }
+}
+
+async function cacheBlobText(blobCache, key, blobStore, pointer) {
+  const cacheKey = `text:${key}`;
+  if (blobCache.has(cacheKey)) return await blobCache.get(cacheKey);
+  return await cacheBlobGet(blobCache, cacheKey, (async () => {
+    const object = await blobStore.get(key);
+    if (!object) return null;
+    return await decodeTurnPayloadBlob(object, pointer);
+  })());
+}
+
+async function resolveTurnPayloadBatchItem(text, pointer) {
+  if (pointer.batch_sha256 && await sha256Base64URL(text) !== pointer.batch_sha256) {
+    return { payload_ref_invalid: true };
+  }
+  const batch = parsePayload(text);
+  if (
+    !batch ||
+    typeof batch !== "object" ||
+    batch.pockly_payload_batch !== "turn_payloads" ||
+    batch.version !== turnPayloadBlobPointerVersion ||
+    !Array.isArray(batch.items)
+  ) {
+    return { payload_ref_invalid: true };
+  }
+  const item = batch.items.find((candidate) => Number(candidate?.seq) === Number(pointer.item_seq));
+  if (!item || typeof item.payload !== "string") return { payload_ref_missing: true };
+  if (pointer.sha256 && await sha256Base64URL(item.payload) !== pointer.sha256) {
+    return { payload_ref_invalid: true };
+  }
+  return parsePayload(item.payload);
 }
 
 async function encodeTurnPayloadBlob(payload) {
@@ -3399,8 +3524,20 @@ function turnPayloadBlobThreshold(env = {}) {
   return Math.floor(value);
 }
 
+function turnPayloadBatchRawBytes(env = {}) {
+  const value = Number(env.POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES ?? defaultTurnPayloadBatchRawBytes);
+  if (!Number.isFinite(value) || value <= 0) return defaultTurnPayloadBatchRawBytes;
+  return Math.max(1, Math.floor(value));
+}
+
 function turnPayloadBlobKey(turn, hash, encoding = "") {
   return `${turnPayloadBlobKeyPrefix(turn)}/${hash}.json${encoding === "gzip" ? ".gz" : ""}`;
+}
+
+function turnPayloadBatchBlobKey(firstTurn, lastTurn, hash, encoding = "") {
+  const firstSeq = String(Number(firstTurn.seq) || 0).padStart(12, "0");
+  const lastSeq = String(Number(lastTurn.seq) || 0).padStart(12, "0");
+  return `${turnPayloadBatchBlobKeyPrefix(firstTurn)}/${firstSeq}-${lastSeq}-${hash}.json${encoding === "gzip" ? ".gz" : ""}`;
 }
 
 function turnPayloadBlobKeyPrefix(turn) {
@@ -3413,6 +3550,15 @@ function turnPayloadBlobKeyPrefix(turn) {
   ].join("/");
 }
 
+function turnPayloadBatchBlobKeyPrefix(turn) {
+  return [
+    "session-turn-batches",
+    encodeBlobKeyPart(turn.user_id),
+    encodeBlobKeyPart(turn.device_id),
+    encodeBlobKeyPart(turn.session_id),
+  ].join("/");
+}
+
 function encodeBlobKeyPart(value) {
   return encodeURIComponent(String(value || "").replace(/%/g, "%25"));
 }
@@ -3421,14 +3567,17 @@ function isTurnPayloadPointerObject(value, turn = null) {
   const validShape = Boolean(
     value &&
     typeof value === "object" &&
-    value.pockly_payload_ref === "blob" &&
+    (value.pockly_payload_ref === "blob" || value.pockly_payload_ref === "blob_batch") &&
     value.version === turnPayloadBlobPointerVersion &&
     typeof value.key === "string" &&
-    value.key.startsWith("session-turns/") &&
+    (value.key.startsWith("session-turns/") || value.key.startsWith("session-turn-batches/")) &&
     (value.key.endsWith(".json") || value.key.endsWith(".json.gz"))
   );
   if (!validShape) return false;
   if (!turn) return true;
+  if (value.pockly_payload_ref === "blob_batch") {
+    return Number(value.item_seq) === Number(turn.seq) && value.key.startsWith(`${turnPayloadBatchBlobKeyPrefix(turn)}/`);
+  }
   return value.key.startsWith(`${turnPayloadBlobKeyPrefix(turn)}/`);
 }
 
@@ -3436,7 +3585,7 @@ function isCurrentTurnPayloadPointer(value, turn) {
   return Boolean(
     value &&
     typeof value === "object" &&
-    value.pockly_payload_ref === "blob" &&
+    (value.pockly_payload_ref === "blob" || value.pockly_payload_ref === "blob_batch") &&
     value.version === turnPayloadBlobPointerVersion &&
     isTurnPayloadPointerObject(value, turn),
   );

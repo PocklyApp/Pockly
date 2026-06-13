@@ -433,7 +433,7 @@ describe("worker-native Nexus api", () => {
   });
 
   it("tiers large turn payloads to object storage without changing the read API", async () => {
-    const objectStore = new FakeObjectStore({});
+    const objectStore = new FakeObjectStore({}, { oneShotReads: true });
     const env = testEnv({
       extra: {
         RELEASES: objectStore,
@@ -522,6 +522,125 @@ describe("worker-native Nexus api", () => {
         kind: "assistant_text",
         timestamp: "2026-06-06T04:00:00.000Z",
         payload,
+      }],
+    };
+
+    const first = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(first.status, 200);
+    assert.equal(objectStore.putCalls.length, 1);
+
+    const retry = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(retry.status, 200);
+    assert.equal(objectStore.putCalls.length, 1);
+  });
+
+  it("batches multiple large turn payloads into one history blob", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+        POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES: String(1024 * 1024),
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const firstPayload = { text: "first batched payload. ".repeat(256) };
+    const secondPayload = { text: "second batched payload. ".repeat(256) };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_blob_batch",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 2,
+        last_timestamp: "2026-06-06T04:00:01.000Z",
+        turn_count: 2,
+        min_seq: 1,
+        max_seq: 2,
+      }],
+      turns: [{
+        session_id: "sess_blob_batch",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: firstPayload,
+      }, {
+        session_id: "sess_blob_batch",
+        seq: 2,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:01.000Z",
+        payload: secondPayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    assert.equal(objectStore.putCalls.length, 1);
+
+    const storedTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_blob_batch");
+    assert.equal(storedTurns.length, 2);
+    const pointers = storedTurns.map((turn) => JSON.parse(turn.payload));
+    assert.deepEqual(pointers.map((pointer) => pointer.pockly_payload_ref), ["blob_batch", "blob_batch"]);
+    assert.equal(pointers[0].key, pointers[1].key);
+    assert.equal(pointers[0].item_seq, 1);
+    assert.equal(pointers[1].item_seq, 2);
+    assert.match(pointers[0].key, /^session-turn-batches\/usr_test\/dd_test\/sess_blob_batch\//);
+    assert.match(pointers[0].key, /\.json\.gz$/);
+
+    objectStore.getCalls = [];
+    const turns = await call(env, "GET", `/api/sessions/sess_blob_batch/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(turns.status, 200);
+    const body = await turns.json();
+    assert.deepEqual(body.turns.map((turn) => turn.payload), [firstPayload, secondPayload]);
+    assert.deepEqual(objectStore.getCalls, [pointers[0].key]);
+  });
+
+  it("does not rewrite batched history blobs when a daemon retries unchanged turns", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv({
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+        POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES: String(1024 * 1024),
+      },
+    });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const body = {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_blob_batch_retry",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 2,
+        last_timestamp: "2026-06-06T04:00:01.000Z",
+        turn_count: 2,
+        min_seq: 1,
+        max_seq: 2,
+      }],
+      turns: [{
+        session_id: "sess_blob_batch_retry",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: { text: "first retry payload should stay in one batch. ".repeat(256) },
+      }, {
+        session_id: "sess_blob_batch_retry",
+        seq: 2,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:01.000Z",
+        payload: { text: "second retry payload should stay in one batch. ".repeat(256) },
       }],
     };
 
@@ -771,9 +890,9 @@ describe("worker-native Nexus api", () => {
         snippet: "gc",
         last_seq: 1,
         last_timestamp: "2026-06-06T04:00:00.000Z",
-        turn_count: 1,
+        turn_count: 2,
         min_seq: 1,
-        max_seq: 1,
+        max_seq: 2,
       }],
       turns: [{
         session_id: "sess_blob_gc",
@@ -781,7 +900,14 @@ describe("worker-native Nexus api", () => {
         agent: "claude-code",
         kind: "assistant_text",
         timestamp: "2026-06-06T04:00:00.000Z",
-        payload: { text: "this payload should be externalized and later deleted" },
+        payload: { text: "this payload should be externalized and later deleted. ".repeat(256) },
+      }, {
+        session_id: "sess_blob_gc",
+        seq: 2,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:01.000Z",
+        payload: { text: "this second payload should share the deleted batch. ".repeat(256) },
       }],
     }, daemonAuth);
     assert.equal(first.status, 200);
@@ -3005,8 +3131,9 @@ function randomIDForTest(prefix) {
 }
 
 class FakeObjectStore {
-  constructor(objects) {
+  constructor(objects, options = {}) {
     this.objects = objects;
+    this.oneShotReads = Boolean(options.oneShotReads);
     this.getCalls = [];
     this.putCalls = [];
     this.deleteCalls = [];
@@ -3016,9 +3143,15 @@ class FakeObjectStore {
     this.getCalls.push(key);
     const value = this.objects[key];
     if (value == null) return null;
+    let consumed = false;
+    const read = async () => {
+      if (this.oneShotReads && consumed) throw new Error("object body already consumed");
+      consumed = true;
+      return value;
+    };
     return {
-      text: async () => String(value),
-      arrayBuffer: async () => valueToArrayBuffer(value),
+      text: async () => String(await read()),
+      arrayBuffer: async () => valueToArrayBuffer(await read()),
     };
   }
 
