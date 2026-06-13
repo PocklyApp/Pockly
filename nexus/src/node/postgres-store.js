@@ -29,6 +29,10 @@ export class PostgresStatementAdapter {
     this.client = client;
   }
 
+  payloadByteLengthSQL(column) {
+    return `OCTET_LENGTH(${column})`;
+  }
+
   prepare(sql) {
     return new PostgresStatement(this.client, translateSQLPlaceholders(sql));
   }

@@ -33,6 +33,10 @@ class SQLiteStatementAdapter {
     this.db = db;
   }
 
+  payloadByteLengthSQL(column) {
+    return `LENGTH(CAST(${column} AS BLOB))`;
+  }
+
   prepare(sql) {
     return new SQLiteStatement(this.db.prepare(translateSQLiteSQL(sql)));
   }

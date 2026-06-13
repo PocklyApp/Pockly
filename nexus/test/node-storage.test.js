@@ -93,6 +93,7 @@ describe("Node self-hosted Nexus storage adapters", () => {
       });
 
       const inlinePayload = JSON.stringify({ text: "small" });
+      const unicodeInlinePayload = JSON.stringify({ text: "你好" });
       const singleBlobPointer = JSON.stringify({
         pockly_payload_ref: "blob",
         key: "session-turns/usr_history_usage/dd_history/sess_a/000001.json.gz",
@@ -117,6 +118,17 @@ describe("Node self-hosted Nexus storage adapters", () => {
           timestamp: "2026-06-06T00:00:00Z",
           payload: inlinePayload,
           updated_at: "2026-06-06T00:00:00Z",
+        },
+        {
+          user_id: "usr_history_usage",
+          device_id: "dd_history",
+          session_id: "sess_a",
+          seq: 5,
+          agent: "claude-code",
+          kind: "user_message",
+          timestamp: "2026-06-06T00:00:04Z",
+          payload: unicodeInlinePayload,
+          updated_at: "2026-06-06T00:00:04Z",
         },
         {
           user_id: "usr_history_usage",
@@ -153,21 +165,30 @@ describe("Node self-hosted Nexus storage adapters", () => {
         },
       ]);
 
+      const preparedSQL = [];
+      const originalPrepare = store.db.prepare.bind(store.db);
+      store.db.prepare = (sql) => {
+        preparedSQL.push(sql);
+        return originalPrepare(sql);
+      };
       const usage = await store.getHistoryStorageUsage("usr_history_usage", {
         device_id: "dd_history",
         session_id: "sess_a",
       });
-      assert.equal(usage.turn_count, 4);
-      assert.equal(usage.inline_turn_count, 1);
+      assert.equal(usage.turn_count, 5);
+      assert.equal(usage.inline_turn_count, 2);
       assert.equal(usage.blob_turn_count, 1);
       assert.equal(usage.blob_batch_turn_count, 2);
       assert.equal(usage.archived_payload_bytes, 8192 + 16384 + 16384);
       assert.equal(usage.archived_encoded_bytes, 1024 + 2048);
       assert.equal(usage.archived_object_count, 2);
-      assert.equal(usage.primary_payload_bytes, Buffer.byteLength(inlinePayload) + Buffer.byteLength(singleBlobPointer) + (2 * Buffer.byteLength(batchBlobPointer)));
+      assert.equal(usage.primary_payload_bytes, Buffer.byteLength(inlinePayload) + Buffer.byteLength(unicodeInlinePayload) + Buffer.byteLength(singleBlobPointer) + (2 * Buffer.byteLength(batchBlobPointer)));
       assert.deepEqual(Object.keys(usage.sessions), ["sess_a"]);
       assert.equal(usage.sessions.sess_a.archived_object_count, 2);
       assert.equal(usage.sessions.sess_a.archived_encoded_bytes, 1024 + 2048);
+      assert.ok(preparedSQL.some((sql) => sql.includes("COUNT(*) AS turn_count")));
+      assert.ok(preparedSQL.some((sql) => sql.includes("payload LIKE")));
+      assert.equal(preparedSQL.some((sql) => sql.includes("SELECT user_id, device_id, session_id, seq, payload")), false);
     } finally {
       store.close();
       await fs.promises.rm(dir, { recursive: true, force: true });

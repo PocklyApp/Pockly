@@ -1507,12 +1507,26 @@ export class SQLNexusStore {
       clauses.push("session_id = ?");
       binds.push(sessionID);
     }
-    const result = await this.db.prepare(`
-      SELECT user_id, device_id, session_id, seq, payload
+    const where = clauses.join(" AND ");
+    const payloadBytesSQL = typeof this.db.payloadByteLengthSQL === "function"
+      ? this.db.payloadByteLengthSQL("payload")
+      : "LENGTH(CAST(payload AS BLOB))";
+    const summaries = await this.db.prepare(`
+      SELECT
+        session_id,
+        COUNT(*) AS turn_count,
+        COALESCE(SUM(${payloadBytesSQL}), 0) AS primary_payload_bytes
       FROM session_turns
-      WHERE ${clauses.join(" AND ")}
+      WHERE ${where}
+      GROUP BY session_id
     `).bind(...binds).all();
-    return historyStorageUsageFromTurns(result.results ?? []);
+    const pointers = await this.db.prepare(`
+      SELECT session_id, seq, payload
+      FROM session_turns
+      WHERE ${where}
+        AND payload LIKE '%"pockly_payload_ref"%'
+    `).bind(...binds).all();
+    return historyStorageUsageFromSQLSummaries(summaries.results ?? [], pointers.results ?? []);
   }
 
   async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
@@ -1714,6 +1728,43 @@ function historyStorageUsageFromTurns(turns = []) {
   };
 }
 
+function historyStorageUsageFromSQLSummaries(summaries = [], pointerTurns = []) {
+  const sessions = new Map();
+  const total = emptyHistoryStorageUsage();
+  for (const row of summaries) {
+    const sessionID = String(row.session_id || "");
+    const sessionUsage = emptyHistoryStorageUsage();
+    sessionUsage.turn_count = Number(row.turn_count ?? 0) || 0;
+    sessionUsage.primary_payload_bytes = Number(row.primary_payload_bytes ?? 0) || 0;
+    sessions.set(sessionID, sessionUsage);
+    total.turn_count += sessionUsage.turn_count;
+    total.primary_payload_bytes += sessionUsage.primary_payload_bytes;
+  }
+
+  const totalBatchKeys = new Set();
+  const sessionBatchKeys = new Map();
+  for (const turn of pointerTurns) {
+    const pointer = parseJSONPayload(turn?.payload == null ? "" : String(turn.payload));
+    if (!isHistoryBlobPointer(pointer)) continue;
+    const sessionID = String(turn.session_id || "");
+    const sessionUsage = sessions.get(sessionID) || emptyHistoryStorageUsage();
+    const sessionSeen = sessionBatchKeys.get(sessionID) || new Set();
+    addPointerHistoryStorageUsage(total, pointer, totalBatchKeys);
+    addPointerHistoryStorageUsage(sessionUsage, pointer, sessionSeen);
+    sessionBatchKeys.set(sessionID, sessionSeen);
+    sessions.set(sessionID, sessionUsage);
+  }
+
+  for (const usage of sessions.values()) {
+    usage.inline_turn_count = Math.max(0, usage.turn_count - usage.blob_turn_count - usage.blob_batch_turn_count);
+  }
+  total.inline_turn_count = Math.max(0, total.turn_count - total.blob_turn_count - total.blob_batch_turn_count);
+  return {
+    ...total,
+    sessions: Object.fromEntries([...sessions.entries()].sort(([left], [right]) => left.localeCompare(right))),
+  };
+}
+
 function emptyHistoryStorageUsage() {
   return {
     turn_count: 0,
@@ -1733,24 +1784,28 @@ function addTurnHistoryStorageUsage(usage, turn, seenBatchKeys) {
   const pointer = parseJSONPayload(payload);
   if (isHistoryBlobPointer(pointer)) {
     usage.primary_payload_bytes += byteLength(payload);
-    usage.archived_payload_bytes += positiveNumberField(pointer.bytes);
-    if (pointer.pockly_payload_ref === "blob_batch") {
-      usage.blob_batch_turn_count += 1;
-      const key = String(pointer.key || "");
-      if (key && !seenBatchKeys.has(key)) {
-        seenBatchKeys.add(key);
-        usage.archived_object_count += 1;
-        usage.archived_encoded_bytes += positiveNumberField(pointer.encoded_bytes);
-      }
-    } else {
-      usage.blob_turn_count += 1;
+    addPointerHistoryStorageUsage(usage, pointer, seenBatchKeys);
+    return;
+  }
+  usage.inline_turn_count += 1;
+  usage.primary_payload_bytes += byteLength(payload);
+}
+
+function addPointerHistoryStorageUsage(usage, pointer, seenBatchKeys) {
+  usage.archived_payload_bytes += positiveNumberField(pointer.bytes);
+  if (pointer.pockly_payload_ref === "blob_batch") {
+    usage.blob_batch_turn_count += 1;
+    const key = String(pointer.key || "");
+    if (key && !seenBatchKeys.has(key)) {
+      seenBatchKeys.add(key);
       usage.archived_object_count += 1;
       usage.archived_encoded_bytes += positiveNumberField(pointer.encoded_bytes);
     }
     return;
   }
-  usage.inline_turn_count += 1;
-  usage.primary_payload_bytes += byteLength(payload);
+  usage.blob_turn_count += 1;
+  usage.archived_object_count += 1;
+  usage.archived_encoded_bytes += positiveNumberField(pointer.encoded_bytes);
 }
 
 function isHistoryBlobPointer(value) {
