@@ -1646,6 +1646,7 @@ async function historyUsage(request, store, url) {
   }
   const deviceID = url.searchParams.get("device_id") || "";
   const sessionID = url.searchParams.get("session_id") || "";
+  if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
   if (!sessionID) return errorResponse("session_id is required", ErrorCode.BadRequest, { status: 400 });
   const usage = await store.getHistoryStorageUsage(user.user_id, {
     ...(deviceID ? { device_id: deviceID } : {}),

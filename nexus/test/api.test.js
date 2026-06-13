@@ -761,6 +761,12 @@ describe("worker-native Nexus api", () => {
     });
     assert.equal(accountWideUsage.status, 400);
     assert.equal((await accountWideUsage.json()).error, "session_id is required");
+
+    const crossDeviceUsage = await call(env, "GET", "/api/history-usage?session_id=sess_history_usage", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(crossDeviceUsage.status, 400);
+    assert.equal((await crossDeviceUsage.json()).error, "device_id is required");
   });
 
   it("treats daemon-uploaded blob pointer shaped payloads as ordinary content", async () => {
