@@ -401,6 +401,19 @@ export class InMemoryNexusStore {
     return out;
   }
 
+  async listTurnPayloadPointers(userID, deviceID, sessionIDs = []) {
+    const wanted = new Set(sessionIDs.map((id) => String(id)).filter(Boolean));
+    if (!wanted.size) return [];
+    return [...this.turns.values()]
+      .filter((turn) => turn.user_id === userID && turn.device_id === deviceID && wanted.has(String(turn.session_id)))
+      .sort((left, right) => String(left.session_id).localeCompare(String(right.session_id)) || Number(left.seq) - Number(right.seq))
+      .map((turn) => ({
+        session_id: turn.session_id,
+        seq: turn.seq,
+        payload: turn.payload,
+      }));
+  }
+
   async listTurns(userID, deviceID, sessionID, options = {}) {
     return filterTurnWindow(
       [...this.turns.values()]
@@ -1375,6 +1388,24 @@ export class SQLNexusStore {
           out.set(turnKey(row.user_id, row.device_id, row.session_id, row.seq), row.payload);
         }
       }
+    }
+    return out;
+  }
+
+  async listTurnPayloadPointers(userID, deviceID, sessionIDs = []) {
+    const ids = [...new Set(sessionIDs.map((id) => String(id)).filter(Boolean))];
+    if (!ids.length) return [];
+    const out = [];
+    for (let i = 0; i < ids.length; i += this.turnUpsertBatchSize) {
+      const chunk = ids.slice(i, i + this.turnUpsertBatchSize);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = await this.db.prepare(`
+        SELECT session_id, seq, payload
+        FROM session_turns
+        WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
+        ORDER BY session_id ASC, seq ASC
+      `).bind(userID, deviceID, ...chunk).all();
+      out.push(...(result.results ?? []));
     }
     return out;
   }

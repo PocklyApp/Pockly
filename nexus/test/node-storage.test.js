@@ -174,6 +174,58 @@ describe("Node self-hosted Nexus storage adapters", () => {
     }
   });
 
+  it("lists SQL turn payload pointers without loading full turn rows", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-payload-pointers-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      await store.upsertUser({
+        user_id: "usr_payload_pointers",
+        email: "payload-pointers@example.local",
+        name: "Payload Pointers User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+      await store.upsertTurns([
+        {
+          user_id: "usr_payload_pointers",
+          device_id: "dd_payload_pointers",
+          session_id: "sess_a",
+          seq: 1,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: "2026-06-06T00:00:01Z",
+          payload: JSON.stringify({ text: "a" }),
+          updated_at: "2026-06-06T00:00:01Z",
+        },
+        {
+          user_id: "usr_payload_pointers",
+          device_id: "dd_payload_pointers",
+          session_id: "sess_b",
+          seq: 1,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: "2026-06-06T00:00:02Z",
+          payload: JSON.stringify({ text: "b" }),
+          updated_at: "2026-06-06T00:00:02Z",
+        },
+      ]);
+
+      const pointers = await store.listTurnPayloadPointers("usr_payload_pointers", "dd_payload_pointers", ["sess_b"]);
+      assert.deepEqual(pointers, [{
+        session_id: "sess_b",
+        seq: 1,
+        payload: JSON.stringify({ text: "b" }),
+      }]);
+      assert.equal(Object.hasOwn(pointers[0], "agent"), false);
+      assert.equal(Object.hasOwn(pointers[0], "kind"), false);
+      assert.equal(Object.hasOwn(pointers[0], "timestamp"), false);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("serves local filesystem blobs through the object-store get/text contract", async () => {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-blobs-"));
     try {

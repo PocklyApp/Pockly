@@ -986,7 +986,9 @@ describe("worker-native Nexus api", () => {
 
   it("garbage-collects history blobs when full reconcile removes sessions", async () => {
     const objectStore = new FakeObjectStore({});
+    const store = new CountingNexusStore();
     const env = testEnv({
+      store,
       extra: {
         HISTORY_BLOBS: objectStore,
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
@@ -1028,6 +1030,7 @@ describe("worker-native Nexus api", () => {
     }, daemonAuth);
     assert.equal(first.status, 200);
     assert.equal(Object.keys(objectStore.objects).length, 1);
+    store.resetCounts();
 
     const reconcile = await call(env, "POST", "/api/daemon/sync", {
       hello: { device_id: daemon.daemon_device_id },
@@ -1039,6 +1042,8 @@ describe("worker-native Nexus api", () => {
     assert.equal((await reconcile.json()).session_delete_count, 1);
     assert.deepEqual(Object.keys(objectStore.objects), []);
     assert.equal(objectStore.deleteCalls.length, 1);
+    assert.equal(store.counts.listTurnPayloadPointers, 1);
+    assert.equal(store.counts.listTurns, 0);
   });
 
   it("merges lazy backfill windows instead of replacing the latest synced range", async () => {
@@ -3332,6 +3337,7 @@ class CountingNexusStore extends InMemoryNexusStore {
       getSession: 0,
       getSessionTurnStats: 0,
       listTurns: 0,
+      listTurnPayloadPointers: 0,
       upsertSessions: 0,
       upsertSessionRows: 0,
       listSessionPrefsForUser: 0,
@@ -3385,6 +3391,11 @@ class CountingNexusStore extends InMemoryNexusStore {
   async listTurns(...args) {
     this.counts.listTurns += 1;
     return await super.listTurns(...args);
+  }
+
+  async listTurnPayloadPointers(...args) {
+    this.counts.listTurnPayloadPointers += 1;
+    return await super.listTurnPayloadPointers(...args);
   }
 
   async listSessionPrefsForUser(...args) {

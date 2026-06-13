@@ -3659,7 +3659,16 @@ async function collectSessionHistoryBlobKeys(store, providers = {}, userID, devi
 
 async function collectHistoryBlobKeysForSessions(store, userID, deviceID, sessionIDs = []) {
   const keys = new Set();
-  for (const sessionID of sessionIDs) {
+  const ids = sessionIDs.map((id) => String(id)).filter(Boolean);
+  if (!ids.length) return [];
+  if (typeof store.listTurnPayloadPointers === "function") {
+    for (const turn of await store.listTurnPayloadPointers(userID, deviceID, ids)) {
+      const pointer = parsePayload(turn.payload);
+      if (isCurrentTurnPayloadPointer(pointer, { user_id: userID, device_id: deviceID, ...turn })) keys.add(pointer.key);
+    }
+    return [...keys];
+  }
+  for (const sessionID of ids) {
     const turns = await store.listTurns(userID, deviceID, sessionID);
     for (const turn of turns) {
       const pointer = parsePayload(turn.payload);
