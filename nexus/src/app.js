@@ -44,6 +44,8 @@ const defaultHostsOnlineCacheMs = 1000;
 const defaultTurnPayloadBatchRawBytes = 1024 * 1024;
 const hostsOnlineCache = new Map();
 const turnPayloadBlobPointerVersion = 1;
+const primaryPayloadStorageGBMonthUSD = 0.75;
+const archivePayloadStorageGBMonthUSD = 0.015;
 
 export async function handleRequest(request, env = {}, ctx = {}) {
   const url = new URL(request.url);
@@ -85,6 +87,7 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (path === "/api/device-challenge") return await createDeviceChallenge(request, store);
     if (path === "/api/device-challenge/verify") return await verifyDeviceChallenge(request, store);
     if (path === "/api/hosts/online") return await listOnlineHosts(request, store, env, requestRuntime.providers.telemetryProvider);
+    if (path === "/api/history-usage") return await historyUsage(request, store, url);
     if (path === "/api/push/vapid-public-key") return await getVAPIDPublicKey(request, env);
     if (path === "/api/push/subscriptions") return await pushSubscriptions(request, store, env);
     if (path === "/api/voice/transcriptions") return await transcribeVoice(request, store, env);
@@ -1630,6 +1633,22 @@ async function listOnlineHosts(request, store, env, telemetryProvider = null) {
     presence_batch_size: daemonDevices.length,
   });
   return jsonResponse({ hosts });
+}
+
+async function historyUsage(request, store, url) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user } = await requireUserFromCookieOrDevice(request, store);
+  if (typeof store.getHistoryStorageUsage !== "function") {
+    return errorResponse("history_usage_unavailable", ErrorCode.NotSupported, { status: 501 });
+  }
+  const deviceID = url.searchParams.get("device_id") || "";
+  const sessionID = url.searchParams.get("session_id") || "";
+  if (!sessionID) return errorResponse("session_id is required", ErrorCode.BadRequest, { status: 400 });
+  const usage = await store.getHistoryStorageUsage(user.user_id, {
+    ...(deviceID ? { device_id: deviceID } : {}),
+    ...(sessionID ? { session_id: sessionID } : {}),
+  });
+  return jsonResponse(withHistoryStorageCostEstimate(usage));
 }
 
 async function hostControlAction(request, store, env, daemonDeviceID, action) {
@@ -3247,6 +3266,35 @@ function publicHost(device, activeSessionCount, controlOnline = false) {
     active_session_count: activeSessionCount,
     connected: online,
   };
+}
+
+function withHistoryStorageCostEstimate(usage) {
+  const estimated = estimateHistoryStorageCostUSD(usage);
+  return {
+    ...usage,
+    estimated_storage_cost_usd_per_month: estimated.total,
+    estimated_storage_cost_components: estimated.components,
+  };
+}
+
+function estimateHistoryStorageCostUSD(usage) {
+  const primary = bytesToGiB(Number(usage?.primary_payload_bytes ?? 0) || 0) * primaryPayloadStorageGBMonthUSD;
+  const archive = bytesToGiB(Number(usage?.archived_encoded_bytes ?? 0) || 0) * archivePayloadStorageGBMonthUSD;
+  return {
+    total: roundCost(primary + archive),
+    components: {
+      primary_payload_storage: roundCost(primary),
+      archive_payload_storage: roundCost(archive),
+    },
+  };
+}
+
+function bytesToGiB(bytes) {
+  return Math.max(0, bytes) / 1024 / 1024 / 1024;
+}
+
+function roundCost(value) {
+  return Number(value.toFixed(8));
 }
 
 async function externalizeTurnPayloads(turns, env = {}, providers = {}) {

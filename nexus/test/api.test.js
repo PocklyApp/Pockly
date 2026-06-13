@@ -653,6 +653,109 @@ describe("worker-native Nexus api", () => {
     assert.equal(objectStore.putCalls.length, 1);
   });
 
+  it("reports history storage usage for inline, blob, and batched payloads", async () => {
+    const objectStore = new FakeObjectStore({});
+    const env = testEnv();
+    env.HISTORY_BLOBS = objectStore;
+    const blobEnv = {
+      ...env,
+      POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
+      POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES: String(1024 * 1024),
+    };
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const inlinePayload = { text: "small" };
+    const firstPayload = { text: "first archived payload. ".repeat(256) };
+    const secondPayload = { text: "second archived payload. ".repeat(256) };
+
+    const inlineSync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_history_usage",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "usage",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:00:02.000Z",
+        turn_count: 3,
+        min_seq: 1,
+        max_seq: 3,
+      }],
+      turns: [{
+        session_id: "sess_history_usage",
+        seq: 1,
+        agent: "claude-code",
+        kind: "user_message",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: inlinePayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(inlineSync.status, 200);
+
+    const archiveSync = await call(blobEnv, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_history_usage",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "usage",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:00:02.000Z",
+        turn_count: 3,
+        min_seq: 1,
+        max_seq: 3,
+      }],
+      turns: [{
+        session_id: "sess_history_usage",
+        seq: 2,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:01.000Z",
+        payload: firstPayload,
+      }, {
+        session_id: "sess_history_usage",
+        seq: 3,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:02.000Z",
+        payload: secondPayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(archiveSync.status, 200);
+
+    const storedTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_history_usage");
+    const pointerPayloads = storedTurns.slice(1).map((turn) => JSON.parse(turn.payload));
+    assert.equal(pointerPayloads[0].pockly_payload_ref, "blob_batch");
+    assert.equal(pointerPayloads[0].key, pointerPayloads[1].key);
+
+    const usage = await call(env, "GET", `/api/history-usage?device_id=${daemon.daemon_device_id}&session_id=sess_history_usage`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(usage.status, 200);
+    const body = await usage.json();
+    assert.equal(body.turn_count, 3);
+    assert.equal(body.inline_turn_count, 1);
+    assert.equal(body.blob_turn_count, 0);
+    assert.equal(body.blob_batch_turn_count, 2);
+    assert.equal(body.archived_object_count, 1);
+    assert.equal(body.archived_payload_bytes, Buffer.byteLength(JSON.stringify(firstPayload)) + Buffer.byteLength(JSON.stringify(secondPayload)));
+    assert.equal(body.archived_encoded_bytes, pointerPayloads[0].encoded_bytes);
+    assert.ok(body.primary_payload_bytes > Buffer.byteLength(JSON.stringify(inlinePayload)));
+    assert.ok(body.estimated_storage_cost_components.primary_payload_storage > 0);
+    assert.ok(body.estimated_storage_cost_components.archive_payload_storage >= 0);
+    assert.ok(body.estimated_storage_cost_usd_per_month > 0);
+    assert.deepEqual(Object.keys(body.sessions), ["sess_history_usage"]);
+    assert.equal(body.sessions.sess_history_usage.archived_object_count, 1);
+
+    const accountWideUsage = await call(env, "GET", `/api/history-usage?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(accountWideUsage.status, 400);
+    assert.equal((await accountWideUsage.json()).error, "session_id is required");
+  });
+
   it("treats daemon-uploaded blob pointer shaped payloads as ordinary content", async () => {
     const objectStore = new FakeObjectStore({});
     const env = testEnv({

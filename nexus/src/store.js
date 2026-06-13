@@ -429,6 +429,18 @@ export class InMemoryNexusStore {
     };
   }
 
+  async getHistoryStorageUsage(userID, options = {}) {
+    const deviceID = String(options.device_id ?? options.deviceID ?? "");
+    const sessionID = String(options.session_id ?? options.sessionID ?? "");
+    const turns = [...this.turns.values()].filter((turn) => {
+      if (turn.user_id !== userID) return false;
+      if (deviceID && turn.device_id !== deviceID) return false;
+      if (sessionID && turn.session_id !== sessionID) return false;
+      return true;
+    });
+    return historyStorageUsageFromTurns(turns);
+  }
+
   async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
     const after = Number(afterSeq) || 0;
     return (await this.listTurns(userID, deviceID, sessionID))
@@ -1451,6 +1463,27 @@ export class SQLNexusStore {
     };
   }
 
+  async getHistoryStorageUsage(userID, options = {}) {
+    const deviceID = String(options.device_id ?? options.deviceID ?? "");
+    const sessionID = String(options.session_id ?? options.sessionID ?? "");
+    const clauses = ["user_id = ?"];
+    const binds = [userID];
+    if (deviceID) {
+      clauses.push("device_id = ?");
+      binds.push(deviceID);
+    }
+    if (sessionID) {
+      clauses.push("session_id = ?");
+      binds.push(sessionID);
+    }
+    const result = await this.db.prepare(`
+      SELECT user_id, device_id, session_id, seq, payload
+      FROM session_turns
+      WHERE ${clauses.join(" AND ")}
+    `).bind(...binds).all();
+    return historyStorageUsageFromTurns(result.results ?? []);
+  }
+
   async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
     const result = await this.db.prepare(`
       SELECT * FROM session_turns
@@ -1628,6 +1661,92 @@ function bindingKey(daemonDeviceID, browserDeviceID) {
 
 function turnKey(userID, deviceID, sessionID, seq) {
   return `${sessionKey(userID, deviceID, sessionID)}\x00${seq}`;
+}
+
+function historyStorageUsageFromTurns(turns = []) {
+  const sessions = new Map();
+  const totalBatchKeys = new Set();
+  const sessionBatchKeys = new Map();
+  const total = emptyHistoryStorageUsage();
+  for (const turn of turns) {
+    const sessionID = String(turn.session_id || "");
+    const sessionUsage = sessions.get(sessionID) || emptyHistoryStorageUsage();
+    const sessionSeen = sessionBatchKeys.get(sessionID) || new Set();
+    addTurnHistoryStorageUsage(total, turn, totalBatchKeys);
+    addTurnHistoryStorageUsage(sessionUsage, turn, sessionSeen);
+    sessionBatchKeys.set(sessionID, sessionSeen);
+    sessions.set(sessionID, sessionUsage);
+  }
+  return {
+    ...total,
+    sessions: Object.fromEntries([...sessions.entries()].sort(([left], [right]) => left.localeCompare(right))),
+  };
+}
+
+function emptyHistoryStorageUsage() {
+  return {
+    turn_count: 0,
+    inline_turn_count: 0,
+    blob_turn_count: 0,
+    blob_batch_turn_count: 0,
+    primary_payload_bytes: 0,
+    archived_payload_bytes: 0,
+    archived_encoded_bytes: 0,
+    archived_object_count: 0,
+  };
+}
+
+function addTurnHistoryStorageUsage(usage, turn, seenBatchKeys) {
+  usage.turn_count += 1;
+  const payload = turn?.payload == null ? "" : String(turn.payload);
+  const pointer = parseJSONPayload(payload);
+  if (isHistoryBlobPointer(pointer)) {
+    usage.primary_payload_bytes += byteLength(payload);
+    usage.archived_payload_bytes += positiveNumberField(pointer.bytes);
+    if (pointer.pockly_payload_ref === "blob_batch") {
+      usage.blob_batch_turn_count += 1;
+      const key = String(pointer.key || "");
+      if (key && !seenBatchKeys.has(key)) {
+        seenBatchKeys.add(key);
+        usage.archived_object_count += 1;
+        usage.archived_encoded_bytes += positiveNumberField(pointer.encoded_bytes);
+      }
+    } else {
+      usage.blob_turn_count += 1;
+      usage.archived_object_count += 1;
+      usage.archived_encoded_bytes += positiveNumberField(pointer.encoded_bytes);
+    }
+    return;
+  }
+  usage.inline_turn_count += 1;
+  usage.primary_payload_bytes += byteLength(payload);
+}
+
+function isHistoryBlobPointer(value) {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    (value.pockly_payload_ref === "blob" || value.pockly_payload_ref === "blob_batch") &&
+    typeof value.key === "string",
+  );
+}
+
+function parseJSONPayload(payload) {
+  if (typeof payload !== "string") return payload;
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+function positiveNumberField(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function byteLength(value) {
+  return new TextEncoder().encode(String(value)).byteLength;
 }
 
 function eventID() {
