@@ -92,6 +92,111 @@ describe("in-process Nexus control hub", () => {
     });
   });
 
+  it("routes browser realtime inject commands to the daemon and streams command events", async () => {
+    const envelopes = [];
+    const hub = new InMemoryControlHub({
+      browserCommandHandler: async ({ userID, browserDeviceID, message }) => {
+        assert.equal(userID, "usr_control");
+        assert.equal(browserDeviceID, "bd_control");
+        return {
+          mode: "stream",
+          daemonDeviceID: "dd_control",
+          daemonRequestID: message.request_id,
+          sessionID: "sess_control",
+          closeWhen: (event) => event.type === "inject_completed",
+          initialEvent: { request_id: message.request_id, type: "inject_started", session_id: "sess_control" },
+          ack: { status: "accepted", session_id: "sess_control", device_id: "dd_control" },
+          envelope: {
+            type: "INJECT_REQUEST",
+            request: {
+              request_id: message.request_id,
+              daemon_device_id: "dd_control",
+              browser_device_id: "bd_control",
+              session_id: "sess_control",
+              text: message.payload.text,
+            },
+          },
+        };
+      },
+    });
+    hub.attachDaemonForTest("dd_control", "usr_control", async (envelope, reply) => {
+      envelopes.push(envelope);
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "inject_completed",
+          session_id: "sess_control",
+          turn: {
+            device_id: "dd_control",
+            session_id: "sess_control",
+            seq: 2,
+            kind: "assistant_text",
+            payload: { text: "done" },
+          },
+        },
+      });
+    });
+    const browser = hub.attachBrowserForTest({
+      userID: "usr_control",
+      browserDeviceID: "bd_control",
+      daemonDeviceID: "dd_control",
+      sessionID: "sess_control",
+    });
+    browser.messages.length = 0;
+
+    hub.handleBrowserSocketMessage(browser.socket, JSON.stringify({
+      type: "COMMAND",
+      request_id: "bcmd_control",
+      command: "inject_session",
+      daemon_device_id: "dd_control",
+      session_id: "sess_control",
+      payload: { text: "hello" },
+    }));
+
+    await eventually(() => {
+      assert.deepEqual(envelopes.map((envelope) => envelope.type), ["INJECT_REQUEST"]);
+      assert.deepEqual(browser.messages.map((message) => message.type), ["COMMAND_ACK", "COMMAND_EVENT", "COMMAND_EVENT", "TURN"]);
+    });
+    assert.equal(browser.messages[0].request_id, "bcmd_control");
+    assert.equal(browser.messages[1].event.type, "inject_started");
+    assert.equal(browser.messages[2].event.type, "inject_completed");
+    assert.equal(browser.messages[3].turn.payload.text, "done");
+    browser.cleanup();
+  });
+
+  it("returns browser realtime daemon_offline without a separate presence precheck", async () => {
+    const hub = new InMemoryControlHub({
+      browserCommandHandler: async (input) => ({
+        mode: "dispatch",
+        daemonDeviceID: input.message.daemon_device_id,
+        envelope: { type: "SYNC_HINT", sync_hint: { session_id: "sess_control" } },
+      }),
+    });
+    const browser = hub.attachBrowserForTest({
+      userID: "usr_control",
+      browserDeviceID: "bd_control",
+      daemonDeviceID: "dd_missing",
+      sessionID: "sess_control",
+    });
+    browser.messages.length = 0;
+
+    hub.handleBrowserSocketMessage(browser.socket, JSON.stringify({
+      type: "COMMAND",
+      request_id: "bcmd_offline",
+      command: "session_opened_hint",
+      daemon_device_id: "dd_missing",
+      payload: { session_id: "sess_control" },
+    }));
+
+    await eventually(() => {
+      assert.equal(browser.messages.length, 1);
+      assert.equal(browser.messages[0].type, "COMMAND_ERROR");
+      assert.equal(browser.messages[0].code, "daemon_offline");
+    });
+    browser.cleanup();
+  });
+
   it("persists terminal sessions and history through injected terminal storage", async () => {
     const terminalStorage = new FakeTerminalStorage();
     const hub = new InMemoryControlHub({ terminalStorage });
@@ -229,6 +334,55 @@ describe("in-process Nexus control hub", () => {
     }));
     assert.equal(unsubscribe.status, 200);
     assert.equal(envelopes.at(-1)?.type, "TERMINAL_UNSUBSCRIBE");
+  });
+
+  it("pushes terminal output to browser realtime terminal subscribers", async () => {
+    const envelopes = [];
+    const hub = new InMemoryControlHub();
+    hub.attachDaemonForTest("dd_control", "usr_control", async (envelope) => {
+      envelopes.push(envelope);
+    });
+    await hub.createTerminalSession({
+      request_id: "term_req",
+      terminal_session_id: "ts_browser",
+      user_id: "usr_control",
+      daemon_device_id: "dd_control",
+      browser_device_id: "bd_control",
+      session_id: "sess_control",
+      agent: "claude-code",
+      cwd: "/work/app",
+    });
+    const browser = hub.attachBrowserForTest({
+      userID: "usr_control",
+      browserDeviceID: "bd_control",
+      daemonDeviceID: "dd_control",
+      sessionID: "sess_control",
+    });
+    browser.messages.length = 0;
+
+    hub.handleBrowserSocketMessage(browser.socket, JSON.stringify({
+      type: "SUBSCRIBE_TERMINAL",
+      terminal_session_id: "ts_browser",
+    }));
+    await eventually(() => {
+      assert.equal(envelopes.at(-1)?.type, "TERMINAL_SUBSCRIBE");
+    });
+    browser.messages.length = 0;
+
+    hub.receiveDaemonEnvelope("dd_control", {
+      type: "TERMINAL_EVENT",
+      terminal_event: {
+        terminal_session_id: "ts_browser",
+        kind: "text_delta",
+        payload: "batched output",
+        timestamp: "2026-06-06T01:00:00Z",
+      },
+    });
+
+    assert.equal(browser.messages.length, 1);
+    assert.equal(browser.messages[0].type, "TERMINAL_EVENT");
+    assert.equal(browser.messages[0].event.payload, "batched output");
+    browser.cleanup();
   });
 
   it("forwards terminal batches to the recent-event sink", async () => {

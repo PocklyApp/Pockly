@@ -8,8 +8,8 @@ import { gzipSync } from "node:zlib";
 const defaults = Object.freeze({
   thresholdBytes: 32 * 1024,
   batchRawBytes: 1024 * 1024,
-  r2ClassAPerMillionUSD: 4.50,
-  r2StorageGBMonthUSD: 0.015,
+  objectWritePerMillionUSD: 4.50,
+  objectStorageGBMonthUSD: 0.015,
 });
 
 async function main() {
@@ -40,10 +40,10 @@ function parseArgs(args) {
       options.thresholdBytes = positiveInteger(args[++index], "--threshold-bytes");
     } else if (arg === "--batch-raw-bytes") {
       options.batchRawBytes = positiveInteger(args[++index], "--batch-raw-bytes");
-    } else if (arg === "--r2-class-a-per-million-usd") {
-      options.r2ClassAPerMillionUSD = positiveNumber(args[++index], "--r2-class-a-per-million-usd");
-    } else if (arg === "--r2-storage-gb-month-usd") {
-      options.r2StorageGBMonthUSD = positiveNumber(args[++index], "--r2-storage-gb-month-usd");
+    } else if (arg === "--object-write-per-million-usd") {
+      options.objectWritePerMillionUSD = positiveNumber(args[++index], arg);
+    } else if (arg === "--object-storage-gb-month-usd") {
+      options.objectStorageGBMonthUSD = positiveNumber(args[++index], arg);
     } else if (arg.startsWith("--")) {
       throw new Error(`unknown option: ${arg}`);
     } else {
@@ -144,10 +144,10 @@ function combineEstimates(left, right) {
 }
 
 function printEstimate(estimate, options) {
-  const singleClassA = estimate.singleObjects / 1_000_000 * options.r2ClassAPerMillionUSD;
-  const batchClassA = estimate.batchObjects / 1_000_000 * options.r2ClassAPerMillionUSD;
-  const singleStorage = bytesToGiB(estimate.singleEncodedBytes) * options.r2StorageGBMonthUSD;
-  const batchStorage = bytesToGiB(estimate.batchEncodedBytes) * options.r2StorageGBMonthUSD;
+  const singleClassA = estimate.singleObjects / 1_000_000 * options.objectWritePerMillionUSD;
+  const batchClassA = estimate.batchObjects / 1_000_000 * options.objectWritePerMillionUSD;
+  const singleStorage = bytesToGiB(estimate.singleEncodedBytes) * options.objectStorageGBMonthUSD;
+  const batchStorage = bytesToGiB(estimate.batchEncodedBytes) * options.objectStorageGBMonthUSD;
   const savedObjects = estimate.singleObjects - estimate.batchObjects;
   const savedClassA = singleClassA - batchClassA;
 
@@ -193,14 +193,14 @@ function printUsage(exitCode) {
   const out = exitCode === 0 ? console.log : console.error;
   out(`Usage: ${script} [options] <rollout-or-jsonl>...
 
-Estimate large history payload storage cost by comparing one R2 object per
-oversized JSONL line with Pockly's batched history blob layout.
+Estimate large history payload storage cost by comparing one object-storage
+object per oversized JSONL line with Pockly's batched history blob layout.
 
 Options:
   --threshold-bytes <n>              Payload externalization threshold. Default: ${defaults.thresholdBytes}
   --batch-raw-bytes <n>              Max raw bytes per batch object. Default: ${defaults.batchRawBytes}
-  --r2-class-a-per-million-usd <n>   Class A operation price. Default: ${defaults.r2ClassAPerMillionUSD}
-  --r2-storage-gb-month-usd <n>      Storage price. Default: ${defaults.r2StorageGBMonthUSD}
+  --object-write-per-million-usd <n>   Object write-operation price. Default: ${defaults.objectWritePerMillionUSD}
+  --object-storage-gb-month-usd <n>    Object storage price. Default: ${defaults.objectStorageGBMonthUSD}
 `);
   process.exitCode = exitCode;
 }

@@ -5,6 +5,8 @@ package relay
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -92,17 +94,17 @@ func BuildCatalogSyncSessions(idx *index.Index, profile runner.Profile) []pair.S
 		session := entry.session
 		title := firstNonEmpty(session.FirstMessageForTitle, session.FirstMessage, session.Snippet)
 		snippet := firstNonEmpty(session.FirstMessage, session.Snippet, title)
-			sessions = append(sessions, pair.SyncSession{
-				SessionID:         session.SessionID,
-				Agent:             entry.agentName,
-				RunnerAlias:       profile.AliasFor(entry.agentName),
-				Cwd:               safeCwdLabel(entry.cwd),
-				Title:             title,
-				Snippet:           snippet,
-				LastSeq:           0,
-				LastTimestamp:     session.Timestamp,
-				ChannelLastSeenAt: session.Timestamp,
-				SyncState:         "catalog_only",
+		sessions = append(sessions, pair.SyncSession{
+			SessionID:         session.SessionID,
+			Agent:             entry.agentName,
+			RunnerAlias:       profile.AliasFor(entry.agentName),
+			Cwd:               safeCwdLabel(entry.cwd),
+			Title:             title,
+			Snippet:           snippet,
+			LastSeq:           0,
+			LastTimestamp:     session.Timestamp,
+			ChannelLastSeenAt: session.Timestamp,
+			SyncState:         "catalog_only",
 			TurnCount:         session.TurnCount,
 		})
 	}
@@ -202,6 +204,7 @@ func BuildSingleSessionWindowSyncRequestContext(ctx context.Context, idx *index.
 	totalCount := len(data.Blocks)
 	windowed, minSeq, maxSeq, hasOlder := selectBlockWindow(data.Blocks, window)
 	total := len(windowed)
+	hasher := newTurnWindowHasher()
 	for idx, block := range windowed {
 		if err := ctx.Err(); err != nil {
 			return req, err
@@ -214,14 +217,16 @@ func BuildSingleSessionWindowSyncRequestContext(ctx context.Context, idx *index.
 			return req, fmt.Errorf("extract_failed: %w", err)
 		}
 		seq := minSeq + idx
-		req.Turns = append(req.Turns, pair.SyncTurn{
+		turn := pair.SyncTurn{
 			SessionID: sessionID,
 			Seq:       seq,
 			Agent:     ref.Agent,
 			Kind:      string(block.Kind),
 			Timestamp: block.Timestamp,
 			Payload:   payload,
-		})
+		}
+		req.Turns = append(req.Turns, turn)
+		hasher.Add(turn)
 	}
 	syncState := "fully_synced"
 	if hasOlder || minSeq > 1 {
@@ -243,8 +248,47 @@ func BuildSingleSessionWindowSyncRequestContext(ctx context.Context, idx *index.
 		MinSeq:            minSeq,
 		MaxSeq:            maxSeq,
 		HasOlder:          hasOlder,
+		WindowHash:        hasher.Sum(),
 	})
 	return req, nil
+}
+
+type turnWindowHasher struct {
+	hash hashWriter
+}
+
+type hashWriter interface {
+	Write([]byte) (int, error)
+	Sum([]byte) []byte
+}
+
+func newTurnWindowHasher() *turnWindowHasher {
+	return &turnWindowHasher{hash: sha256.New()}
+}
+
+func (h *turnWindowHasher) Add(turn pair.SyncTurn) {
+	if h == nil || h.hash == nil {
+		return
+	}
+	writeHashPart(h.hash, turn.SessionID)
+	writeHashPart(h.hash, turn.Agent)
+	writeHashPart(h.hash, fmt.Sprintf("%d", turn.Seq))
+	writeHashPart(h.hash, turn.Kind)
+	writeHashPart(h.hash, turn.Timestamp)
+	payloadHash := sha256.Sum256([]byte(turn.Payload))
+	writeHashPart(h.hash, base64.RawURLEncoding.EncodeToString(payloadHash[:]))
+}
+
+func (h *turnWindowHasher) Sum() string {
+	if h == nil || h.hash == nil {
+		return ""
+	}
+	return "sha256:" + base64.RawURLEncoding.EncodeToString(h.hash.Sum(nil))
+}
+
+func writeHashPart(w hashWriter, value string) {
+	_, _ = w.Write([]byte(value))
+	_, _ = w.Write([]byte{0})
 }
 
 // isSupportedSyncAgent gates agent families that can be exposed beyond the

@@ -91,18 +91,19 @@ type SyncSessionRequest struct {
 }
 
 type SyncSessionEvent struct {
-	RequestID string `json:"request_id"`
-	SessionID string `json:"session_id"`
-	Stage     string `json:"stage"`
-	Status    string `json:"status"`
-	Processed int    `json:"processed,omitempty"`
-	Total     int    `json:"total,omitempty"`
-	MinSeq    int    `json:"min_seq,omitempty"`
-	MaxSeq    int    `json:"max_seq,omitempty"`
-	HasOlder  bool   `json:"has_older,omitempty"`
-	TurnCount int    `json:"total_turn_count,omitempty"`
-	Message   string `json:"message,omitempty"`
-	Error     string `json:"error,omitempty"`
+	RequestID string       `json:"request_id"`
+	SessionID string       `json:"session_id"`
+	Stage     string       `json:"stage"`
+	Status    string       `json:"status"`
+	Processed int          `json:"processed,omitempty"`
+	Total     int          `json:"total,omitempty"`
+	MinSeq    int          `json:"min_seq,omitempty"`
+	MaxSeq    int          `json:"max_seq,omitempty"`
+	HasOlder  bool         `json:"has_older,omitempty"`
+	TurnCount int          `json:"total_turn_count,omitempty"`
+	Message   string       `json:"message,omitempty"`
+	Error     string       `json:"error,omitempty"`
+	Turns     []StoredTurn `json:"turns,omitempty"`
 }
 
 type TerminalRequest struct {
@@ -410,9 +411,8 @@ type PermissionDecider interface {
 
 // SyncHintPush is a Nexus→daemon notice that a session should be prioritized
 // for lazy window sync (the user just opened it in the web reader). It rides
-// the already-open control WS — outgoing WebSocket messages are free on the
-// managed runtime, so pushed hints replace hint polling as the default
-// transport.
+// the already-open control WS, so pushed hints replace fixed-interval hint
+// polling as the default transport.
 type SyncHintPush struct {
 	SessionID       string `json:"session_id"`
 	Reason          string `json:"reason,omitempty"`
@@ -423,6 +423,7 @@ type SyncHintPush struct {
 	NextBeforeSeq   int    `json:"next_before_seq,omitempty"`
 	TotalTurnCount  int    `json:"total_turn_count,omitempty"`
 	HasOlderTurns   bool   `json:"has_older_turns,omitempty"`
+	WindowHash      string `json:"window_hash,omitempty"`
 }
 
 // SyncHintHandler receives Nexus-pushed sync hints. Implementations must be
@@ -2185,12 +2186,32 @@ func (r *runner) handleSyncSession(parent context.Context, cfg Client, req SyncS
 		return
 	}
 	meta := syncWindowMeta(syncReq.Sessions)
+	if req.BeforeSeq > 0 {
+		send(SyncSessionEvent{RequestID: req.RequestID, SessionID: req.SessionID, Stage: "completed", Status: "completed", Processed: len(syncReq.Turns), Total: len(syncReq.Turns), MinSeq: meta.MinSeq, MaxSeq: meta.MaxSeq, HasOlder: meta.HasOlder, TurnCount: meta.TurnCount, Message: "Session window loaded", Turns: storedTurnsFromSync(syncReq.Turns, cfg.Identity.DeviceID)})
+		return
+	}
 	send(SyncSessionEvent{RequestID: req.RequestID, SessionID: req.SessionID, Stage: "uploading", Status: "running", Processed: len(syncReq.Turns), Total: len(syncReq.Turns), MinSeq: meta.MinSeq, MaxSeq: meta.MaxSeq, HasOlder: meta.HasOlder, TurnCount: meta.TurnCount, Message: "Uploading history"})
 	if _, err := client.SyncHistoryContext(ctx, cfg.Identity, syncReq); err != nil {
 		send(SyncSessionEvent{RequestID: req.RequestID, SessionID: req.SessionID, Stage: "failed", Status: "failed", Error: "upload_failed"})
 		return
 	}
 	send(SyncSessionEvent{RequestID: req.RequestID, SessionID: req.SessionID, Stage: "completed", Status: "completed", Processed: len(syncReq.Turns), Total: len(syncReq.Turns), MinSeq: meta.MinSeq, MaxSeq: meta.MaxSeq, HasOlder: meta.HasOlder, TurnCount: meta.TurnCount, Message: "Session synced"})
+}
+
+func storedTurnsFromSync(turns []pair.SyncTurn, deviceID string) []StoredTurn {
+	out := make([]StoredTurn, 0, len(turns))
+	for _, turn := range turns {
+		out = append(out, StoredTurn{
+			DeviceID:   deviceID,
+			SessionID:  turn.SessionID,
+			Seq:        turn.Seq,
+			Agent:      turn.Agent,
+			Kind:       turn.Kind,
+			Timestamp:  turn.Timestamp,
+			PayloadRaw: turn.Payload,
+		})
+	}
+	return out
 }
 
 func syncWindowMeta(sessions []pair.SyncSession) pair.SyncSession {

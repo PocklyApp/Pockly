@@ -16,7 +16,7 @@ Pockly is a remote control for the coding agents that run on your computer. Clau
 
 When you send a prompt from your phone, it goes web → Pockly Nexus → your computer's daemon → the agent. The agent's output (text, thinking, tool calls, file edits, test results) streams back the same way and renders live on your phone.
 
-> Pockly supports both Claude Code and Codex. The agent always runs on your machine — Pockly never moves your runtime or keys to the cloud.
+> Pockly supports both Claude Code and Codex. The agent always runs on your machine — Pockly never moves your runtime or keys to remote servers.
 
 ## Before you start
 
@@ -200,5 +200,4 @@ schtasks /Delete /TN PocklyDaemon /F
 ```
 
 Then remove the daemon binary, and revoke the computer from Connected computers in the workspace if you want to cut its access immediately.
-
 

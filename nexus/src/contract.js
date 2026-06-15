@@ -36,6 +36,7 @@ export function nexusRuntimeCapabilities(env = {}, defaults = {}) {
     runtime,
     realtime: hasControlRuntime && envFlag(env.REALTIME_ENABLED),
     browser_realtime: hasControlRuntime && envFlag(env.BROWSER_REALTIME_ENABLED ?? env.REALTIME_ENABLED),
+    browser_realtime_control: hasControlRuntime && envFlag(env.BROWSER_REALTIME_ENABLED ?? env.REALTIME_ENABLED) && envFlag(env.BROWSER_REALTIME_CONTROL_ENABLED),
     control_streaming: envFlag(env.CONTROL_STREAMING_ENABLED ?? "1"),
     terminal: hasControlRuntime && envFlag(env.TERMINAL_ENABLED),
     terminal_streaming: hasControlRuntime && envFlag(env.TERMINAL_STREAMING_ENABLED ?? env.TERMINAL_ENABLED),
@@ -66,9 +67,11 @@ export function errorResponse(error, code, init = {}) {
 
 export function jsonResponse(body, init = {}) {
   const headers = new Headers(init.headers);
+  const text = JSON.stringify(body);
   headers.set("content-type", "application/json; charset=utf-8");
   headers.set("cache-control", "no-store");
-  return new Response(JSON.stringify(body), {
+  headers.set("content-length", String(new TextEncoder().encode(text).byteLength));
+  return new Response(text, {
     ...init,
     headers,
   });

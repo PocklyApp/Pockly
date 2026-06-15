@@ -152,7 +152,7 @@ func (b *terminalEventBatcher) DropTerminal(terminalSessionID string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// Seal pending output into the daemon-local ring without waking the cloud
+		// Seal pending output into the daemon-local ring without waking the remote
 	// stream. If a terminal panel opens later, SnapshotUndeliveredTerminal can
 	// replay only the bytes that were never forwarded.
 	_ = b.takeLocked(terminalSessionID)
@@ -194,7 +194,7 @@ func (b *terminalEventBatcher) snapshotTerminal(terminalSessionID string, undeli
 		return TerminalEvent{}, false
 	}
 	// Seal any pending bytes into the local ring first. The caller controls
-	// whether the returned snapshot is sent to the cloud.
+	// whether the returned snapshot is sent to the remote runtime.
 	_ = b.takeLocked(terminalSessionID)
 	ring := append([]terminalRingEntry(nil), b.rings[terminalSessionID]...)
 	deliveredSeq := b.deliveredSeq[terminalSessionID]

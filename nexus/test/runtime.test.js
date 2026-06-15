@@ -22,6 +22,7 @@ describe("Nexus runtime contract", () => {
       runtime: "self_hosted",
       realtime: false,
       browser_realtime: false,
+      browser_realtime_control: false,
       control_streaming: true,
       terminal: false,
       terminal_streaming: false,
@@ -37,6 +38,7 @@ describe("Nexus runtime contract", () => {
       runtime: "self_hosted",
       realtime: false,
       browser_realtime: false,
+      browser_realtime_control: false,
       control_streaming: true,
       terminal: false,
       terminal_streaming: false,
@@ -54,6 +56,7 @@ describe("Nexus runtime contract", () => {
       nexusRuntimeCapabilities({
         POCKLY_CONTROL_HUB: {},
         REALTIME_ENABLED: "1",
+        BROWSER_REALTIME_CONTROL_ENABLED: "1",
         TERMINAL_ENABLED: "true",
         WEB_PUSH_ENABLED: "1",
         VAPID_PUBLIC_KEY: "B".repeat(88),
@@ -67,6 +70,7 @@ describe("Nexus runtime contract", () => {
         runtime: "self_hosted",
         realtime: true,
         browser_realtime: true,
+        browser_realtime_control: true,
         control_streaming: true,
         terminal: true,
         terminal_streaming: true,
@@ -114,6 +118,26 @@ describe("Nexus runtime contract", () => {
     assert.equal(calls[0].pathname, "/api/telemetry/daemon");
   });
 
+  it("does not emit endpoint cost telemetry without an explicit provider or for telemetry ingestion", async () => {
+    const res = await handleRequest(new Request(`${base}/healthz`));
+    assert.equal(res.status, 200);
+
+    const calls = [];
+    const withProvider = await handleRequest(new Request(`${base}/api/telemetry/web`, {
+      method: "POST",
+      body: JSON.stringify({ events: [{ name: "web_bootstrap" }] }),
+    }), {}, {
+      providers: {
+        telemetryProvider: {
+          record: async ({ text }) => calls.push(JSON.parse(text)),
+        },
+      },
+    });
+    assert.equal(withProvider.status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].events[0].name, "web_bootstrap");
+  });
+
   it("does not treat environment variables as telemetry provider wiring", async () => {
     const calls = [];
     const res = await handleRequest(new Request(`${base}/api/telemetry/web`, {
@@ -151,6 +175,7 @@ describe("Nexus runtime contract", () => {
       runtime: "self_hosted",
       realtime: false,
       browser_realtime: false,
+      browser_realtime_control: false,
       control_streaming: true,
       terminal: false,
       terminal_streaming: false,
@@ -163,6 +188,7 @@ describe("Nexus runtime contract", () => {
       runtime: "self_hosted",
       realtime: false,
       browser_realtime: false,
+      browser_realtime_control: false,
       control_streaming: true,
       terminal: false,
       terminal_streaming: false,

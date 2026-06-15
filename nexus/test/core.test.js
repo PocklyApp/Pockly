@@ -52,6 +52,7 @@ describe("Nexus core provider bundle", () => {
       runtime: "self_hosted",
       realtime: true,
       browser_realtime: true,
+      browser_realtime_control: false,
       control_streaming: true,
       terminal: true,
       terminal_streaming: true,
@@ -68,5 +69,33 @@ describe("Nexus core provider bundle", () => {
     }), { POCKLY_NEXUS_DEV_LOGIN_ENABLED: "1" }, { providers });
     assert.equal(login.status, 200);
     assert.equal((await store.getUserByEmail("provider@example.local")).name, "Provider User");
+  });
+
+  it("caps in-memory session events per session and per user", async () => {
+    const store = new InMemoryNexusStore();
+    const userID = "usr_memory_events";
+    for (let sessionIndex = 1; sessionIndex <= 11; sessionIndex += 1) {
+      const sessionID = `sess_memory_${String(sessionIndex).padStart(2, "0")}`;
+      for (let index = 1; index <= 501; index += 1) {
+        const globalIndex = (sessionIndex - 1) * 501 + index;
+        await store.appendSessionEvent({
+          event_id: `ev_${String(globalIndex).padStart(8, "0")}`,
+          user_id: userID,
+          device_id: "dd_memory_events",
+          session_id: sessionID,
+          request_id: `inj_memory_${sessionIndex}`,
+          event_type: "inject_completed",
+          payload: JSON.stringify({ globalIndex }),
+          created_at: "2026-06-06T00:00:00Z",
+        });
+      }
+    }
+
+    assert.equal(store.sessionEvents.filter((event) => event.user_id === userID).length, 5000);
+    const firstSession = await store.listSessionEvents(userID, "dd_memory_events", "sess_memory_01", { limit: 600 });
+    assert.equal(firstSession.length, 0);
+    const lastSession = await store.listSessionEvents(userID, "dd_memory_events", "sess_memory_11", { limit: 600 });
+    assert.equal(lastSession.length, 500);
+    assert.equal(lastSession[0].event_id, "ev_00005012");
   });
 });

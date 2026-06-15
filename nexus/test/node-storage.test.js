@@ -236,11 +236,218 @@ describe("Node self-hosted Nexus storage adapters", () => {
       assert.deepEqual(pointers, [{
         session_id: "sess_b",
         seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T00:00:02Z",
         payload: JSON.stringify({ text: "b" }),
       }]);
-      assert.equal(Object.hasOwn(pointers[0], "agent"), false);
-      assert.equal(Object.hasOwn(pointers[0], "kind"), false);
-      assert.equal(Object.hasOwn(pointers[0], "timestamp"), false);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes SQL hot turn cache by session, user, and inactivity TTL", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-hot-cache-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      const userID = "usr_hot_cache";
+      const deviceID = "dd_hot_cache";
+      await store.upsertUser({
+        user_id: userID,
+        email: "hot-cache@example.local",
+        name: "Hot Cache User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+      await store.upsertDevice({
+        device_id: deviceID,
+        user_id: userID,
+        device_type: "daemon",
+        device_name: "daemon",
+        public_key: "pub",
+        status: "active",
+        remote_access_enabled: true,
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+        last_seen_at: "2026-06-06T00:00:00Z",
+      });
+      await upsertSQLSession(store, userID, deviceID, "sess_old", "2026-06-06T00:00:00Z", 5);
+      await upsertSQLSession(store, userID, deviceID, "sess_new", "2026-06-06T00:10:00Z", 5);
+      await store.upsertTurns([
+        ...sqlTurns(userID, deviceID, "sess_old", 5, "2026-06-06T00:00"),
+        ...sqlTurns(userID, deviceID, "sess_new", 5, "2026-06-06T00:10"),
+      ]);
+
+      const perSessionAffected = await store.pruneHotTurnCache({
+        perSession: 3,
+        perUser: 20,
+        userIDs: [userID],
+        sessionKeys: [`${userID}\x00${deviceID}\x00sess_old`],
+      });
+      assert.deepEqual(perSessionAffected.map((session) => session.session_id), ["sess_old"]);
+      assert.deepEqual((await store.listTurns(userID, deviceID, "sess_old", { limit: 20 })).map((turn) => turn.seq), [3, 4, 5]);
+      assert.deepEqual((await store.listTurns(userID, deviceID, "sess_new", { limit: 20 })).map((turn) => turn.seq), [1, 2, 3, 4, 5]);
+
+      const perUserAffected = await store.pruneHotTurnCache({ perSession: 10, perUser: 4, userIDs: [userID] });
+      assert.deepEqual(perUserAffected.map((session) => session.session_id).sort(), ["sess_new", "sess_old"]);
+      assert.deepEqual((await store.listTurns(userID, deviceID, "sess_new", { limit: 20 })).map((turn) => turn.seq), [2, 3, 4, 5]);
+      assert.deepEqual((await store.listTurns(userID, deviceID, "sess_old", { limit: 20 })), []);
+
+      const inactiveAffected = await store.pruneHotTurnCache({ inactiveBefore: "2026-06-06T00:05:00Z", userIDs: [userID] });
+      assert.deepEqual(inactiveAffected.map((session) => session.session_id), []);
+      assert.deepEqual(await store.listTurns(userID, deviceID, "sess_old", { limit: 20 }), []);
+      assert.equal((await store.getSession(userID, deviceID, "sess_old")).session_id, "sess_old");
+      assert.deepEqual((await store.listTurns(userID, deviceID, "sess_new", { limit: 20 })).map((turn) => turn.seq), [2, 3, 4, 5]);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("caps SQL session event cache to the newest 500 rows per session", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-events-cap-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      const userID = "usr_event_cap";
+      await store.upsertUser({
+        user_id: userID,
+        email: "event-cap@example.local",
+        name: "Event Cap User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+
+      for (let index = 1; index <= 5005; index += 1) {
+        await store.appendSessionEvent({
+          event_id: `ev_${String(index).padStart(8, "0")}`,
+          user_id: userID,
+          device_id: "dd_event_cap",
+          session_id: "sess_event_cap",
+          request_id: "inj_event_cap",
+          event_type: "inject_completed",
+          payload: JSON.stringify({ index }),
+          created_at: `2026-06-06T00:${String(index % 60).padStart(2, "0")}:00Z`,
+        });
+      }
+      await store.pruneSessionEvents(userID);
+
+      const firstPage = await store.listSessionEvents(userID, "dd_event_cap", "sess_event_cap", { limit: 10 });
+      assert.equal(firstPage.length, 10);
+      assert.equal(firstPage[0].event_id, "ev_00004506");
+      assert.equal(firstPage.at(-1).event_id, "ev_00004515");
+
+      const count = await store.db.prepare(`SELECT COUNT(*) AS count FROM session_events WHERE user_id = ?`).bind(userID).first();
+      assert.equal(count.count, 500);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("caps SQL session event cache to the newest 5000 rows per user", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-events-user-cap-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      const userID = "usr_event_user_cap";
+      await store.upsertUser({
+        user_id: userID,
+        email: "event-user-cap@example.local",
+        name: "Event User Cap",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+
+      for (let sessionIndex = 1; sessionIndex <= 11; sessionIndex += 1) {
+        const sessionID = `sess_event_user_cap_${String(sessionIndex).padStart(2, "0")}`;
+        for (let index = 1; index <= 500; index += 1) {
+          const globalIndex = (sessionIndex - 1) * 500 + index;
+          await store.appendSessionEvent({
+            event_id: `ev_${String(globalIndex).padStart(8, "0")}`,
+            user_id: userID,
+            device_id: "dd_event_user_cap",
+            session_id: sessionID,
+            request_id: `inj_event_user_cap_${sessionIndex}`,
+            event_type: "inject_completed",
+            payload: JSON.stringify({ globalIndex }),
+            created_at: `2026-06-06T00:${String(globalIndex % 60).padStart(2, "0")}:00Z`,
+          });
+        }
+      }
+      await store.pruneSessionEvents(userID);
+
+      const count = await store.db.prepare(`SELECT COUNT(*) AS count FROM session_events WHERE user_id = ?`).bind(userID).first();
+      assert.equal(count.count, 5000);
+      const oldest = await store.db.prepare(`SELECT MIN(event_id) AS event_id FROM session_events WHERE user_id = ?`).bind(userID).first();
+      assert.equal(oldest.event_id, "ev_00000501");
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses bounded SQL windows for large session catalog and turn reads", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-large-window-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    const preparedSQL = [];
+    try {
+      const userID = "usr_large_window";
+      const deviceID = "dd_large_window";
+      await store.upsertUser({
+        user_id: userID,
+        email: "large-window@example.local",
+        name: "Large Window User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+      await store.upsertDevice({
+        device_id: deviceID,
+        user_id: userID,
+        device_type: "daemon",
+        device_name: "daemon",
+        public_key: "pub",
+        status: "active",
+        remote_access_enabled: true,
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+        last_seen_at: "2026-06-06T00:00:00Z",
+      });
+      for (let index = 0; index < 550; index += 1) {
+        await upsertSQLSession(
+          store,
+          userID,
+          deviceID,
+          `sess_catalog_${String(index).padStart(3, "0")}`,
+          `2026-06-06T${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}:00Z`,
+          1,
+        );
+      }
+      await upsertSQLSession(store, userID, deviceID, "sess_large_turns", "2026-06-07T00:00:00Z", 10_000);
+      for (let start = 1; start <= 10_000; start += 250) {
+        await store.upsertTurns(sqlTurnsRange(userID, deviceID, "sess_large_turns", start, Math.min(start + 249, 10_000), "2026-06-07T00"));
+      }
+
+      const originalPrepare = store.db.prepare.bind(store.db);
+      store.db.prepare = (sql) => {
+        preparedSQL.push(sql.replace(/\s+/g, " ").trim());
+        return originalPrepare(sql);
+      };
+
+      const firstPage = await store.listSessionCatalogPage(userID, { limit: 101 });
+      assert.equal(firstPage.length, 101);
+      const tailWindow = await store.listTurns(userID, deviceID, "sess_large_turns", { limit: 20 });
+      assert.deepEqual(tailWindow.map((turn) => turn.seq), Array.from({ length: 20 }, (_, index) => 9981 + index));
+      const afterWindow = await store.listSessionTurnsAfter(userID, deviceID, "sess_large_turns", 9_990, 20);
+      assert.deepEqual(afterWindow.map((turn) => turn.seq), Array.from({ length: 10 }, (_, index) => 9991 + index));
+
+      assert.ok(preparedSQL.some((sql) => /FROM sessions WHERE user_id = \? ORDER BY updated_at DESC, device_id ASC, session_id ASC LIMIT \?/.test(sql)));
+      assert.ok(preparedSQL.some((sql) => /ORDER BY seq DESC LIMIT \?/.test(sql)));
+      assert.ok(preparedSQL.some((sql) => /session_id = \? AND seq > \? ORDER BY seq ASC LIMIT \?/.test(sql)));
+      assert.equal(preparedSQL.some((sql) => /SELECT \* FROM session_turns WHERE user_id = \? AND device_id = \? AND session_id = \? ORDER BY seq ASC$/.test(sql)), false);
     } finally {
       store.close();
       await fs.promises.rm(dir, { recursive: true, force: true });
@@ -260,3 +467,51 @@ describe("Node self-hosted Nexus storage adapters", () => {
     }
   });
 });
+
+async function upsertSQLSession(store, userID, deviceID, sessionID, timestamp, turnCount) {
+  await store.upsertSession({
+    user_id: userID,
+    computer_id: "cmp_hot_cache",
+    device_id: deviceID,
+    session_id: sessionID,
+    agent: "claude-code",
+    runner_alias: "",
+    cwd: "/work/app",
+    snippet: sessionID,
+    first_message: "",
+    title: "",
+    last_seq: turnCount,
+    last_timestamp: timestamp,
+    channel_last_seen_at: timestamp,
+    sync_state: "partial",
+    turn_count: turnCount,
+    last_sync_error: "",
+    synced_turn_count: turnCount,
+    synced_min_seq: 1,
+    synced_max_seq: turnCount,
+    has_older_turns: false,
+    updated_at: timestamp,
+  });
+}
+
+function sqlTurns(userID, deviceID, sessionID, count, minutePrefix) {
+  return sqlTurnsRange(userID, deviceID, sessionID, 1, count, minutePrefix);
+}
+
+function sqlTurnsRange(userID, deviceID, sessionID, startSeq, endSeq, minutePrefix) {
+  return Array.from({ length: endSeq - startSeq + 1 }, (_, index) => {
+    const seq = startSeq + index;
+    const timestamp = `${minutePrefix}:${String(index).padStart(2, "0")}Z`;
+    return {
+      user_id: userID,
+      device_id: deviceID,
+      session_id: sessionID,
+      seq,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp,
+      payload: JSON.stringify({ text: `${sessionID} ${seq}` }),
+      updated_at: timestamp,
+    };
+  });
+}

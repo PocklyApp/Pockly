@@ -7,13 +7,13 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import { base64Url, challengeMessage } from "../src/auth.js";
-import { handleRequest } from "../src/app.js";
+import { createBrowserRealtimeCommandHandler, handleRequest } from "../src/app.js";
 import { InMemoryControlHub } from "../src/control.js";
 import { InMemoryNexusStore } from "../src/store.js";
 
 const base = "https://nexus-runtime.test";
 
-describe("worker-native Nexus api", () => {
+describe("Nexus api", () => {
   it("keeps dev login disabled unless explicitly enabled", async () => {
     const env = testEnv({ devLogin: false });
     const login = await call(env, "POST", "/api/dev/login", {
@@ -376,7 +376,7 @@ describe("worker-native Nexus api", () => {
   });
 
   it("serves session history windows without reading the entire large session", async () => {
-    const env = testEnv();
+    const env = testEnv({ extra: { POCKLY_EDGE_RETENTION_PROFILE: "extended" } });
     const cookie = await loginCookie(env);
     const browserKeys = await generateSigningKeyPair();
     const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
@@ -437,6 +437,420 @@ describe("worker-native Nexus api", () => {
     const earlierBody = await earlier.json();
     assert.deepEqual(earlierBody.turns.map((turn) => turn.seq), Array.from({ length: 20 }, (_, index) => 111 + index));
     assert.equal(earlierBody.next_loaded_before_seq, 111);
+
+    const incremental = await call(env, "GET", `/api/sessions/sess_windowed_history/turns?device_id=${daemon.daemon_device_id}&limit=20&after_seq=145`, null, auth);
+    assert.equal(incremental.status, 200);
+    const incrementalBody = await incremental.json();
+    assert.deepEqual(incrementalBody.turns.map((turn) => turn.seq), [146, 147, 148, 149, 150]);
+    assert.equal(incrementalBody.after_seq, 145);
+    assert.equal(incrementalBody.oldest_seq, 146);
+    assert.equal(incrementalBody.latest_seq, 150);
+  });
+
+  it("serves incremental turn reads without full turn stats", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const turns = Array.from({ length: 150 }, (_, index) => ({
+      session_id: "sess_incremental_turns",
+      seq: index + 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: new Date(Date.UTC(2026, 5, 6, 4, 0, index % 60)).toISOString(),
+      payload: { text: `turn ${index + 1}` },
+    }));
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_incremental_turns",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "incremental",
+        last_seq: 150,
+        last_timestamp: "2026-06-06T04:02:30.000Z",
+        turn_count: 150,
+        min_seq: 1,
+        max_seq: 150,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    store.resetCounts();
+    const incremental = await call(env, "GET", `/api/sessions/sess_incremental_turns/turns?device_id=${daemon.daemon_device_id}&limit=20&after_seq=145`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(incremental.status, 200);
+    const body = await incremental.json();
+    assert.equal(body.source, "remote_hot_window");
+    assert.deepEqual(body.turns.map((turn) => turn.seq), [146, 147, 148, 149, 150]);
+    assert.equal(body.after_seq, 145);
+    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.getSessionTurnStats, 0);
+    assert.equal(store.counts.listTurns, 0);
+  });
+
+  it("keeps only bounded hot turns per session in remote storage", async () => {
+    const env = testEnv({
+      extra: {
+        POCKLY_HOT_TURNS_PER_SESSION: "5",
+        POCKLY_HOT_TURNS_PER_USER: "100",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const turns = Array.from({ length: 12 }, (_, index) => ({
+      session_id: "sess_hot_window",
+      seq: index + 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: `2026-06-06T04:00:${String(index).padStart(2, "0")}.000Z`,
+      payload: { text: `turn ${index + 1}` },
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_hot_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "hot",
+        last_seq: 12,
+        last_timestamp: "2026-06-06T04:00:12.000Z",
+        turn_count: 12,
+        min_seq: 1,
+        max_seq: 12,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const stored = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_hot_window", { limit: 20 });
+    assert.deepEqual(stored.map((turn) => turn.seq), [8, 9, 10, 11, 12]);
+    const response = await call(env, "GET", `/api/sessions/sess_hot_window/turns?device_id=${daemon.daemon_device_id}&limit=20`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const body = await response.json();
+    assert.deepEqual(body.turns.map((turn) => turn.seq), [8, 9, 10, 11, 12]);
+    assert.equal(body.synced_turn_count, 5);
+    assert.equal(body.synced_min_seq, 8);
+    assert.equal(body.synced_max_seq, 12);
+    assert.equal(body.next_loaded_before_seq, 0);
+    assert.equal(body.next_before_seq, 8);
+    assert.equal(body.has_older_turns, true);
+  });
+
+  it("pre-clips a 500-session large fixture before durable writes", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({
+      store,
+      extra: {
+        POCKLY_EDGE_RETENTION_PROFILE: "standard",
+        POCKLY_HOT_TURN_MAX_PAYLOAD_BYTES: "32768",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const sessionCount = 500;
+    const turnCount = 10_000;
+    const largeSessionID = "sess_large_fixture_000";
+    const sessions = Array.from({ length: sessionCount }, (_, index) => ({
+      session_id: `sess_large_fixture_${String(index).padStart(3, "0")}`,
+      agent: "claude-code",
+      cwd: "/work/large-fixture",
+      snippet: `large fixture session ${index}`,
+      last_seq: index === 0 ? turnCount : 1,
+      last_timestamp: new Date(Date.UTC(2026, 5, 6, 6, 0, index % 60)).toISOString(),
+      turn_count: index === 0 ? turnCount : 1,
+      min_seq: index === 0 ? 1 : 0,
+      max_seq: index === 0 ? turnCount : 0,
+    }));
+    const largeText = "x".repeat(40 * 1024);
+    const turns = Array.from({ length: turnCount }, (_, index) => {
+      const seq = index + 1;
+      return {
+        session_id: largeSessionID,
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: new Date(Date.UTC(2026, 5, 6, 7, 0, 0, seq)).toISOString(),
+        payload: { text: seq === 9_950 ? largeText : `large fixture turn ${seq}` },
+      };
+    });
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      full_reconcile: true,
+      sessions,
+      turns,
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+    const syncBody = await sync.json();
+    assert.equal(syncBody.session_count, sessionCount);
+    assert.equal(syncBody.turn_count, turnCount);
+    assert.equal(store.counts.upsertTurnRows, 100);
+    assert.equal(store.counts.upsertSessionRows, sessionCount);
+    assert.equal(store.pruneHotTurnCacheOptions.at(-1).sessionKeys.length, 1);
+
+    const stored = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, largeSessionID, { limit: 200 });
+    assert.equal(stored.length, 100);
+    assert.equal(stored[0].seq, 9_901);
+    assert.equal(stored.at(-1).seq, 10_000);
+    const largeStored = stored.find((turn) => turn.seq === 9_950);
+    assert.ok(largeStored, "large payload fixture turn should be inside the retained hot window");
+    const largeStoredPayload = JSON.parse(largeStored.payload);
+    assert.equal(largeStoredPayload.pockly_payload_ref, "local_only");
+    assert.equal(largeStoredPayload.reason, "payload_too_large");
+    assert.ok(largeStoredPayload.bytes > 32 * 1024);
+
+    const response = await call(env, "GET", `/api/sessions/${largeSessionID}/turns?device_id=${daemon.daemon_device_id}&limit=150`, null, browserAuth);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.turns.length, 100);
+    assert.equal(body.synced_turn_count, 100);
+    assert.equal(body.synced_min_seq, 9_901);
+    assert.equal(body.synced_max_seq, 10_000);
+    assert.equal(body.next_before_seq, 9_901);
+    assert.equal(body.has_older_turns, true);
+
+    store.resetCounts();
+    const retry = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      full_reconcile: true,
+      sessions,
+      turns,
+    }, daemonAuth);
+    assert.equal(retry.status, 200);
+    assert.equal(store.counts.upsertTurns, 0);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.upsertSessions, 0);
+    assert.equal(store.counts.upsertSessionRows, 0);
+  });
+
+  it("uses retention profiles for default hot turn caps", async () => {
+    const env = testEnv({ extra: { POCKLY_EDGE_RETENTION_PROFILE: "standard" } });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const turns = Array.from({ length: 130 }, (_, index) => ({
+      session_id: "sess_standard_profile_hot_window",
+      seq: index + 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: `2026-06-06T04:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      payload: { text: `turn ${index + 1}` },
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_standard_profile_hot_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "standard profile hot cap",
+        last_seq: 130,
+        last_timestamp: "2026-06-06T04:59:00.000Z",
+        turn_count: 130,
+        min_seq: 1,
+        max_seq: 130,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const stored = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_standard_profile_hot_window", { limit: 200 });
+    assert.equal(stored.length, 100);
+    assert.equal(stored[0].seq, 31);
+    assert.equal(stored.at(-1).seq, 130);
+  });
+
+  it("allows larger hot windows for extended retention defaults", async () => {
+    const env = testEnv({ extra: { POCKLY_EDGE_RETENTION_PROFILE: "extended" } });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const turns = Array.from({ length: 350 }, (_, index) => ({
+      session_id: "sess_extended_profile_hot_window",
+      seq: index + 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: `2026-06-06T05:${String(index % 60).padStart(2, "0")}:00.000Z`,
+      payload: { text: `turn ${index + 1}` },
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_extended_profile_hot_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "extended retention hot cap",
+        last_seq: 350,
+        last_timestamp: "2026-06-06T05:59:00.000Z",
+        turn_count: 350,
+        min_seq: 1,
+        max_seq: 350,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    const stored = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_extended_profile_hot_window", { limit: 400 });
+    assert.equal(stored.length, 300);
+    assert.equal(stored[0].seq, 51);
+    assert.equal(stored.at(-1).seq, 350);
+  });
+
+  it("enforces a per-user hot turn cap across sessions", async () => {
+    const env = testEnv({
+      extra: {
+        POCKLY_HOT_TURNS_PER_SESSION: "20",
+        POCKLY_HOT_TURNS_PER_USER: "6",
+        POCKLY_FORCE_GLOBAL_HOT_TURN_PRUNE: "1",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const syncSession = async (sessionID, timestampMinute) => {
+      const turns = Array.from({ length: 5 }, (_, index) => ({
+        session_id: sessionID,
+        seq: index + 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T04:${String(timestampMinute).padStart(2, "0")}:${String(index).padStart(2, "0")}.000Z`,
+        payload: { text: `${sessionID} turn ${index + 1}` },
+      }));
+      const res = await call(env, "POST", "/api/daemon/sync", {
+        hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+        sessions: [{
+          session_id: sessionID,
+          agent: "claude-code",
+          cwd: "/work/app",
+          snippet: sessionID,
+          last_seq: 5,
+          last_timestamp: `2026-06-06T04:${String(timestampMinute).padStart(2, "0")}:05.000Z`,
+          turn_count: 5,
+          min_seq: 1,
+          max_seq: 5,
+        }],
+        turns,
+      }, { authorization: `Bearer ${daemon.device_access_token}` });
+      assert.equal(res.status, 200);
+      return await res.json();
+    };
+
+    const firstSync = await syncSession("sess_hot_user_old", 0);
+    assert.equal(firstSync.session_repair_count, 0);
+    const secondSync = await syncSession("sess_hot_user_new", 1);
+    assert.equal(secondSync.session_repair_count, 1);
+
+    const oldTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_hot_user_old", { limit: 20 });
+    const newTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_hot_user_new", { limit: 20 });
+    assert.equal(oldTurns.length + newTurns.length, 6);
+    assert.deepEqual(newTurns.map((turn) => turn.seq), [1, 2, 3, 4, 5]);
+    assert.deepEqual(oldTurns.map((turn) => turn.seq), [5]);
+
+    const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
+    assert.equal(listed.status, 200);
+    const sessions = (await listed.json()).sessions;
+    const oldSession = sessions.find((session) => session.session_id === "sess_hot_user_old");
+    assert.equal(oldSession.synced_turn_count, 1);
+    assert.equal(oldSession.synced_min_seq, 5);
+    assert.equal(oldSession.synced_max_seq, 5);
+    assert.equal(oldSession.sync_state, "partial");
+    assert.equal(oldSession.has_older_turns, true);
+  });
+
+  it("omits large payloads from the remote hot window without writing history blobs by default", async () => {
+    const objectStore = new FakeObjectStore({});
+    const store = new CountingNexusStore();
+    const env = testEnv({
+      store,
+      extra: {
+        HISTORY_BLOBS: objectStore,
+        POCKLY_HOT_TURN_MAX_PAYLOAD_BYTES: "64",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const largePayload = { text: "large hot window payload ".repeat(64) };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_hot_payload",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_hot_payload",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: largePayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    assert.equal(Object.keys(objectStore.objects).length, 0);
+
+    const storedTurns = await env.POCKLY_NEXUS_STORE.listTurns("usr_test", daemon.daemon_device_id, "sess_hot_payload");
+    const storedPayload = JSON.parse(storedTurns[0].payload);
+    assert.equal(storedPayload.pockly_payload_ref, "local_only");
+    assert.equal(storedPayload.reason, "payload_too_large");
+    assert.equal(storedPayload.bytes, Buffer.byteLength(JSON.stringify(largePayload)));
+    assert.match(storedPayload.text, /Large message omitted/);
+
+    const turns = await call(env, "GET", `/api/sessions/sess_hot_payload/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const body = await turns.json();
+    assert.equal(body.turns[0].payload.pockly_payload_ref, "local_only");
+    assert.match(body.turns[0].payload.text, /Large message omitted/);
+
+    store.resetCounts();
+    const retry = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_hot_payload",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "payload",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_hot_payload",
+        seq: 1,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T04:00:00.000Z",
+        payload: largePayload,
+      }],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(retry.status, 200);
+    assert.equal(store.counts.upsertTurns, 0);
   });
 
   it("tiers large turn payloads to object storage without changing the read API", async () => {
@@ -445,6 +859,7 @@ describe("worker-native Nexus api", () => {
       extra: {
         RELEASES: objectStore,
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
       },
     });
@@ -502,6 +917,7 @@ describe("worker-native Nexus api", () => {
     const env = testEnv({
       extra: {
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
       },
     });
@@ -546,6 +962,7 @@ describe("worker-native Nexus api", () => {
     const env = testEnv({
       extra: {
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
         POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES: String(1024 * 1024),
       },
@@ -614,6 +1031,7 @@ describe("worker-native Nexus api", () => {
     const env = testEnv({
       extra: {
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
         POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES: String(1024 * 1024),
       },
@@ -666,6 +1084,7 @@ describe("worker-native Nexus api", () => {
     env.HISTORY_BLOBS = objectStore;
     const blobEnv = {
       ...env,
+      POCKLY_HISTORY_BLOBS_ENABLED: "1",
       POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
       POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES: String(1024 * 1024),
     };
@@ -774,6 +1193,7 @@ describe("worker-native Nexus api", () => {
     const env = testEnv({
       extra: {
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "1024",
       },
     });
@@ -991,6 +1411,7 @@ describe("worker-native Nexus api", () => {
       store,
       extra: {
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
       },
     });
@@ -1043,6 +1464,292 @@ describe("worker-native Nexus api", () => {
     assert.deepEqual(Object.keys(objectStore.objects), []);
     assert.equal(objectStore.deleteCalls.length, 1);
     assert.equal(store.counts.listTurnPayloadPointers, 1);
+    assert.equal(store.counts.listTurns, 0);
+  });
+
+  it("returns known hot-window hashes on metadata-only catalog sync", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_known_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "known",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        turn_count: 3,
+        min_seq: 1,
+        max_seq: 3,
+      }],
+      turns: [1, 2, 3].map((seq) => ({
+        session_id: "sess_known_window",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T04:0${seq}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      })),
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+    store.resetCounts();
+
+    const second = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_known_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "known",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        turn_count: 3,
+      }],
+      known_window_session_ids: ["sess_known_window"],
+    }, daemonAuth);
+    assert.equal(second.status, 200);
+    const body = await second.json();
+    assert.equal(body.turn_count, 0);
+    assert.match(body.known_windows?.[0]?.window_hash || "", /^sha256:[A-Za-z0-9_-]+$/);
+    delete body.known_windows[0].window_hash;
+    assert.deepEqual(body.known_windows, [{
+      session_id: "sess_known_window",
+      synced_min_seq: 1,
+      synced_max_seq: 3,
+      synced_turn_count: 3,
+    }]);
+    assert.equal(store.counts.listTurnPayloadPointers, 1);
+    assert.equal(store.counts.listTurns, 0);
+  });
+
+  it("returns known hot-window hashes on lightweight probe sync without session rows", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_known_window_probe",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "known",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        turn_count: 3,
+        min_seq: 1,
+        max_seq: 3,
+      }],
+      turns: [1, 2, 3].map((seq) => ({
+        session_id: "sess_known_window_probe",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T04:0${seq}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      })),
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+    store.resetCounts();
+
+    const probe = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      known_window_session_ids: ["sess_known_window_probe"],
+    }, daemonAuth);
+    assert.equal(probe.status, 200);
+    const body = await probe.json();
+    assert.equal(body.session_count, 0);
+    assert.equal(body.session_upsert_count, 0);
+    assert.equal(body.turn_count, 0);
+    assert.match(body.known_windows?.[0]?.window_hash || "", /^sha256:[A-Za-z0-9_-]+$/);
+    delete body.known_windows[0].window_hash;
+    assert.deepEqual(body.known_windows, [{
+      session_id: "sess_known_window_probe",
+      synced_min_seq: 1,
+      synced_max_seq: 3,
+      synced_turn_count: 3,
+    }]);
+    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.listTurnPayloadPointers, 1);
+    assert.equal(store.counts.listTurns, 0);
+    assert.equal(store.counts.upsertSessions, 0);
+    assert.equal(store.counts.appendSessionCatalogChanges, 0);
+  });
+
+  it("returns latest contiguous known hot-window tail when hot cache is sparse", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const syncWindow = async (min, max) => {
+      const turns = [];
+      for (let seq = min; seq <= max; seq += 1) {
+        turns.push({
+          session_id: "sess_known_sparse",
+          seq,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: `2026-06-06T04:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+          payload: { text: `turn ${seq}` },
+        });
+      }
+      const res = await call(env, "POST", "/api/daemon/sync", {
+        hello: { device_id: daemon.daemon_device_id },
+        sessions: [{
+          session_id: "sess_known_sparse",
+          agent: "claude-code",
+          cwd: "/work/app",
+          snippet: "sparse",
+          last_seq: 45628,
+          last_timestamp: "2026-06-06T04:28:00.000Z",
+          sync_state: "partial",
+          turn_count: 45628,
+          min_seq: min,
+          max_seq: max,
+          has_older: true,
+        }],
+        turns,
+      }, daemonAuth);
+      assert.equal(res.status, 200);
+    };
+
+    await syncWindow(45406, 45420);
+    await syncWindow(45609, 45628);
+    store.resetCounts();
+
+    const probe = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      known_window_session_ids: ["sess_known_sparse"],
+    }, daemonAuth);
+    assert.equal(probe.status, 200);
+    const body = await probe.json();
+    assert.match(body.known_windows?.[0]?.window_hash || "", /^sha256:[A-Za-z0-9_-]+$/);
+    delete body.known_windows[0].window_hash;
+    assert.deepEqual(body.known_windows, [{
+      session_id: "sess_known_sparse",
+      synced_min_seq: 45609,
+      synced_max_seq: 45628,
+      synced_turn_count: 20,
+    }]);
+    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.listTurnPayloadPointers, 1);
+    assert.equal(store.counts.listTurns, 0);
+    assert.equal(store.counts.upsertSessions, 0);
+  });
+
+  it("does not compute known hot-window hashes unless daemon opts in", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_known_window_no_opt_in",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "known",
+        last_seq: 2,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        turn_count: 2,
+        min_seq: 1,
+        max_seq: 2,
+      }],
+      turns: [1, 2].map((seq) => ({
+        session_id: "sess_known_window_no_opt_in",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T04:0${seq}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      })),
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+    store.resetCounts();
+
+    const second = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_known_window_no_opt_in",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "known",
+        last_seq: 2,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        turn_count: 2,
+      }],
+    }, daemonAuth);
+    assert.equal(second.status, 200);
+    assert.equal((await second.json()).known_windows, undefined);
+    assert.equal(store.counts.listTurnPayloadPointers, 0);
+    assert.equal(store.counts.listTurns, 0);
+  });
+
+  it("bounds known hot-window hashes to daemon-requested sessions", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const sessions = ["sess_known_a", "sess_known_b"].map((sessionID, index) => ({
+      session_id: sessionID,
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: sessionID,
+      last_seq: 2,
+      last_timestamp: `2026-06-06T04:1${index}:00.000Z`,
+      turn_count: 2,
+      min_seq: 1,
+      max_seq: 2,
+    }));
+    const turns = sessions.flatMap((session) => [1, 2].map((seq) => ({
+      session_id: session.session_id,
+      seq,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: `2026-06-06T04:1${seq}:00.000Z`,
+      payload: { text: `${session.session_id} turn ${seq}` },
+    })));
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions,
+      turns,
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+    store.resetCounts();
+
+    const second = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions,
+      known_window_session_ids: ["sess_known_b"],
+    }, daemonAuth);
+    assert.equal(second.status, 200);
+    const body = await second.json();
+    assert.deepEqual(body.known_windows?.map((window) => window.session_id), ["sess_known_b"]);
+    assert.equal(store.counts.listTurnPayloadPointers, 1);
+    assert.equal(store.counts.listTurns, 0);
+
+    store.resetCounts();
+    const third = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions,
+      known_window_session_ids: [],
+    }, daemonAuth);
+    assert.equal(third.status, 200);
+    assert.equal((await third.json()).known_windows, undefined);
+    assert.equal(store.counts.listTurnPayloadPointers, 0);
     assert.equal(store.counts.listTurns, 0);
   });
 
@@ -1270,7 +1977,7 @@ describe("worker-native Nexus api", () => {
     assert.equal(repairedSession.has_older_turns, true);
   });
 
-  it("uses one batch presence lookup for large session catalogs", async () => {
+  it("uses cached device presence for large session catalogs", async () => {
     const env = testEnv();
     const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
     env.POCKLY_CONTROL_HUB = control;
@@ -1313,11 +2020,364 @@ describe("worker-native Nexus api", () => {
     const body = await listed.json();
     assert.equal(body.sessions.length, 336);
     assert.equal(body.sessions.every((session) => session.writable === true), true);
-    assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
+    assert.deepEqual(control.onlineDeviceBatches, []);
     assert.equal(telemetryEvents[0].command, "sessions");
+    assert.equal(telemetryEvents[0].presence_source, "device_last_seen");
     assert.equal(telemetryEvents[0].sessions_count, 336);
     assert.equal(telemetryEvents[0].unique_daemon_count, 1);
-    assert.equal(telemetryEvents[0].presence_batch_size, 1);
+    assert.equal(telemetryEvents[0].presence_batch_size, 0);
+  });
+
+  it("emits low-cardinality endpoint cost telemetry for sync and session polls", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const telemetryEvents = [];
+    const pendingTelemetry = [];
+    const ctx = {
+      providers: {
+        telemetryProvider: {
+          record: async ({ text }) => telemetryEvents.push(...JSON.parse(text).events),
+        },
+      },
+      waitUntil: (promise) => pendingTelemetry.push(promise),
+    };
+    const sessionID = "sess_secret_identifier_should_not_appear";
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: sessionID,
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "cost",
+        last_seq: 2,
+        last_timestamp: "2026-06-06T01:00:02.000Z",
+        turn_count: 2,
+        min_seq: 1,
+        max_seq: 2,
+      }],
+      turns: [{
+        session_id: sessionID,
+        seq: 1,
+        agent: "claude-code",
+        kind: "user_message",
+        timestamp: "2026-06-06T01:00:01.000Z",
+        payload: { text: "hello" },
+      }, {
+        session_id: sessionID,
+        seq: 2,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-06T01:00:02.000Z",
+        payload: { text: "world" },
+      }],
+    }, daemonAuth, ctx);
+    assert.equal(sync.status, 200);
+
+    const turns = await call(env, "GET", `/api/sessions/${sessionID}/turns?device_id=${daemon.daemon_device_id}`, null, browserAuth, ctx);
+    assert.equal(turns.status, 200);
+    const events = await call(env, "GET", `/api/sessions/${sessionID}/events?device_id=${daemon.daemon_device_id}`, null, browserAuth, ctx);
+    assert.equal(events.status, 200);
+    const catalogItem = await call(env, "GET", `/api/sessions/${sessionID}?device_id=${daemon.daemon_device_id}`, null, browserAuth, ctx);
+    assert.equal(catalogItem.status, 200);
+    const delta = await call(env, "GET", "/api/sessions/delta?limit=10", null, browserAuth, ctx);
+    assert.equal(delta.status, 200);
+    const sessions = await call(env, "GET", "/api/sessions", null, browserAuth, ctx);
+    assert.equal(sessions.status, 200);
+    await Promise.all(pendingTelemetry);
+
+    const costEvents = telemetryEvents.filter((event) => event.name === "nexus_endpoint_cost");
+    assert.deepEqual(costEvents.map((event) => event.endpoint), ["daemon_sync", "session_turns", "session_events", "session_catalog_item", "sessions_delta", "sessions"]);
+    assert.deepEqual(costEvents.map((event) => event.status), [200, 200, 200, 200, 200, 200]);
+    assert.equal(costEvents.every((event) => event.duration_ms >= 0), true);
+    assert.equal(costEvents.every((event) => event.worker_requests === 1), true);
+    assert.equal(costEvents.every((event) => event.worker_wall_duration_ms >= 0), true);
+    assert.equal(costEvents.every((event) => event.worker_cpu_time_ms_estimate >= 0), true);
+    assert.equal(costEvents.every((event) => event.worker_cpu_time_source === "wall_clock_proxy"), true);
+    assert.equal(costEvents.every((event) => event.response_bytes > 0), true);
+    assert.equal(costEvents.find((event) => event.endpoint === "daemon_sync").store_writes > 0, true);
+    assert.equal(costEvents.find((event) => event.endpoint === "session_turns").store_reads > 0, true);
+    assert.equal(costEvents.find((event) => event.endpoint === "session_events").store_reads > 0, true);
+    assert.equal(costEvents.find((event) => event.endpoint === "sessions").control_requests, 0);
+    assert.equal(costEvents.find((event) => event.endpoint === "sessions").do_requests, 0);
+    assert.equal(JSON.stringify(costEvents).includes(sessionID), false);
+  });
+
+  it("serves session catalog delta pages and tombstones without full catalog reads", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
+    env.POCKLY_CONTROL_HUB = control;
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const sessions = Array.from({ length: 75 }, (_, index) => ({
+      session_id: `sess_delta_${String(index).padStart(3, "0")}`,
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: `session ${index}`,
+      last_seq: 1,
+      last_timestamp: new Date(Date.UTC(2026, 5, 6, 1, 0, index)).toISOString(),
+      turn_count: 1,
+      min_seq: 1,
+      max_seq: 1,
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions,
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+    assert.equal(store.counts.appendSessionCatalogChanges, 1);
+    assert.equal(store.counts.appendSessionCatalogChangeRows, 75);
+    assert.equal(store.counts.appendSessionCatalogChange, 0);
+
+    control.onlineDeviceBatches = [];
+    const initialDelta = await call(env, "GET", "/api/sessions/delta?limit=50", null, browserAuth);
+    assert.equal(initialDelta.status, 200);
+    const initialBody = await initialDelta.json();
+    assert.equal(initialBody.reset, true);
+    assert.equal(initialBody.upserts.length, 50);
+    assert.deepEqual(initialBody.deletes, []);
+    assert.equal(typeof initialBody.next_cursor, "string");
+    assert.equal(initialBody.has_more, true);
+    assert.equal(typeof initialBody.next_page_cursor, "string");
+    assert.notEqual(initialBody.next_page_cursor, "");
+    assert.equal(initialBody.upserts.every((session) => session.writable === false), true);
+    assert.deepEqual(control.onlineDeviceBatches, []);
+    assert.equal(store.counts.listDevicesForUser, 0);
+
+    const secondPage = await call(env, "GET", `/api/sessions/delta?limit=50&page_cursor=${encodeURIComponent(initialBody.next_page_cursor)}`, null, browserAuth);
+    assert.equal(secondPage.status, 200);
+    const secondPageBody = await secondPage.json();
+    assert.equal(secondPageBody.reset, undefined);
+    assert.equal(secondPageBody.upserts.length, 25);
+    assert.equal(secondPageBody.has_more, false);
+    assert.equal(secondPageBody.next_page_cursor, "");
+
+    const nextSessions = sessions.slice(1).map((session, index) => index === 0
+      ? { ...session, title: "Updated delta session", last_timestamp: "2026-06-06T03:00:00.000Z" }
+      : session);
+    const reconcile = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: nextSessions,
+    }, daemonAuth);
+    assert.equal(reconcile.status, 200);
+
+    const delta = await call(env, "GET", `/api/sessions/delta?since=${encodeURIComponent(initialBody.next_cursor)}&limit=10`, null, browserAuth);
+    assert.equal(delta.status, 200);
+    const deltaBody = await delta.json();
+    assert.deepEqual(deltaBody.deletes, [{ device_id: daemon.daemon_device_id, session_id: "sess_delta_000" }]);
+    assert.equal(deltaBody.upserts.length, 1);
+    assert.equal(deltaBody.upserts[0].session_id, "sess_delta_001");
+    assert.equal(deltaBody.upserts[0].title, "Updated delta session");
+    assert.equal(deltaBody.next_cursor > initialBody.next_cursor, true);
+    assert.deepEqual(control.onlineDeviceBatches, []);
+    assert.equal(store.counts.listDevicesForUser, 0);
+  });
+
+  it("does not skip catalog changes after an empty initial delta cursor", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const empty = await call(env, "GET", "/api/sessions/delta?limit=50", null, browserAuth);
+    assert.equal(empty.status, 200);
+    const emptyBody = await empty.json();
+    assert.deepEqual(emptyBody.upserts, []);
+    assert.deepEqual(emptyBody.deletes, []);
+    assert.equal(emptyBody.next_cursor, "sc_0000000000000_000000_000000");
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [{
+        session_id: "sess_after_empty_cursor",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "created after empty cursor",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T04:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    const delta = await call(env, "GET", `/api/sessions/delta?since=${encodeURIComponent(emptyBody.next_cursor)}&limit=50`, null, browserAuth);
+    assert.equal(delta.status, 200);
+    const deltaBody = await delta.json();
+    assert.equal(deltaBody.upserts.length, 1);
+    assert.equal(deltaBody.upserts[0].session_id, "sess_after_empty_cursor");
+    assert.deepEqual(deltaBody.deletes, []);
+    assert.equal(deltaBody.next_cursor > emptyBody.next_cursor, true);
+  });
+
+  it("does not skip catalog changes created while building the initial catalog page", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [{
+        session_id: "sess_initial_page_race",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "before race",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T06:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    let injected = false;
+    store.onListSessionCatalogPage = async () => {
+      if (injected) return;
+      injected = true;
+      const update = await call(env, "POST", "/api/daemon/sync", {
+        hello: { device_id: daemon.daemon_device_id },
+        full_reconcile: true,
+        sessions: [{
+          session_id: "sess_initial_page_race",
+          agent: "claude-code",
+          cwd: "/work/app",
+          snippet: "after race",
+          title: "Updated during initial page",
+          last_seq: 2,
+          last_timestamp: "2026-06-06T06:01:00.000Z",
+          turn_count: 2,
+          min_seq: 1,
+          max_seq: 2,
+        }],
+      }, daemonAuth);
+      assert.equal(update.status, 200);
+    };
+
+    const initial = await call(env, "GET", "/api/sessions/delta?limit=50", null, browserAuth);
+    assert.equal(initial.status, 200);
+    const initialBody = await initial.json();
+    assert.equal(initialBody.reset, true);
+    assert.equal(initialBody.upserts.length, 1);
+    assert.equal(initialBody.upserts[0].title, "Updated during initial page");
+
+    const delta = await call(env, "GET", `/api/sessions/delta?since=${encodeURIComponent(initialBody.next_cursor)}&limit=50`, null, browserAuth);
+    assert.equal(delta.status, 200);
+    const deltaBody = await delta.json();
+    assert.equal(deltaBody.upserts.length, 1);
+    assert.equal(deltaBody.upserts[0].session_id, "sess_initial_page_race");
+    assert.equal(deltaBody.upserts[0].title, "Updated during initial page");
+    assert.deepEqual(deltaBody.deletes, []);
+    assert.equal(deltaBody.next_cursor > initialBody.next_cursor, true);
+  });
+
+  it("returns a reset page when a session catalog delta cursor has expired", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [{
+        session_id: "sess_reset_page",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "reset page",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T05:00:00.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    const delta = await call(env, "GET", "/api/sessions/delta?since=sc_0000000000001_000000_oldold&limit=50", null, browserAuth);
+    assert.equal(delta.status, 200);
+    const body = await delta.json();
+    assert.equal(body.reset, true);
+    assert.equal(body.upserts.length, 1);
+    assert.equal(body.upserts[0].session_id, "sess_reset_page");
+    assert.deepEqual(body.deletes, []);
+  });
+
+  it("serves a single session catalog item without full catalog or presence reads", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
+    env.POCKLY_CONTROL_HUB = control;
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+    const sessions = Array.from({ length: 120 }, (_, index) => ({
+      session_id: `sess_catalog_item_${String(index).padStart(3, "0")}`,
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: `session ${index}`,
+      last_seq: 1,
+      last_timestamp: new Date(Date.UTC(2026, 5, 6, 1, 0, index % 60)).toISOString(),
+      turn_count: 1,
+      min_seq: 1,
+      max_seq: 1,
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions,
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    store.resetCounts();
+    control.onlineDeviceBatches = [];
+    const item = await call(
+      env,
+      "GET",
+      `/api/sessions/sess_catalog_item_099?device_id=${encodeURIComponent(daemon.daemon_device_id)}`,
+      null,
+      browserAuth,
+    );
+    assert.equal(item.status, 200);
+    const body = await item.json();
+    assert.equal(body.session.session_id, "sess_catalog_item_099");
+    assert.equal(body.session.device_id, daemon.daemon_device_id);
+    assert.equal(body.session.writable, false);
+    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.listSessionsForUser, 0);
+    assert.equal(store.counts.listDevicesForUser, 0);
+    assert.deepEqual(control.onlineDeviceBatches, []);
   });
 
   it("syncs large catalog reconciles without per-session session or stats queries", async () => {
@@ -1412,7 +2472,7 @@ describe("worker-native Nexus api", () => {
     assert.equal(preserved.first_message, "existing long first message should survive catalog-only sync");
   });
 
-  it("uses batch presence for host lists", async () => {
+  it("uses batch control presence for host lists", async () => {
     const env = testEnv();
     const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
     env.POCKLY_CONTROL_HUB = control;
@@ -1426,6 +2486,43 @@ describe("worker-native Nexus api", () => {
     const body = await hosts.json();
     assert.equal(body.hosts.length, 1);
     assert.equal(body.hosts[0].presence_status, "online");
+    assert.equal(body.hosts[0].presence_reason, "control_connected");
+    assert.equal(body.hosts[0].control_connected, true);
+    assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
+  });
+
+  it("does not read full session rows for host presence on large catalogs", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const control = new CountingControlHub({ onlineDeviceIDs: ["dd_test"] });
+    env.POCKLY_CONTROL_HUB = control;
+    env.POCKLY_HOSTS_ONLINE_CACHE_MS = "0";
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const sessions = Array.from({ length: 336 }, (_, index) => ({
+      session_id: `sess_host_presence_${String(index).padStart(3, "0")}`,
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: `session ${index}`,
+      last_seq: 1,
+      last_timestamp: new Date(Date.UTC(2026, 5, 6, 1, 0, index % 60)).toISOString(),
+      turn_count: 1,
+    }));
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    store.resetCounts();
+    const hosts = await call(env, "GET", "/api/hosts/online", null, { cookie });
+    assert.equal(hosts.status, 200);
+    const body = await hosts.json();
+    assert.equal(body.hosts.length, 1);
+    assert.equal(body.hosts[0].active_session_count, 336);
+    assert.equal(store.counts.countSessionsByDeviceForUser, 1);
+    assert.equal(store.counts.listSessionsForUser, 0);
     assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
   });
 
@@ -1450,10 +2547,11 @@ describe("worker-native Nexus api", () => {
     assert.equal(first.status, 200);
     assert.equal(second.status, 200);
     assert.deepEqual(control.onlineDeviceBatches, [["dd_test"]]);
-    assert.deepEqual(telemetryEvents.map((event) => event.presence_source), ["batch_do", "cache"]);
-    assert.equal(telemetryEvents[0].sessions_count, 0);
-    assert.equal(telemetryEvents[0].unique_daemon_count, 1);
-    assert.equal(telemetryEvents[0].presence_batch_size, 1);
+    const presenceEvents = telemetryEvents.filter((event) => event.name === "nexus_presence_refresh");
+    assert.deepEqual(presenceEvents.map((event) => event.presence_source), ["batch_control", "cache"]);
+    assert.equal(presenceEvents[0].sessions_count, 0);
+    assert.equal(presenceEvents[0].unique_daemon_count, 1);
+    assert.equal(presenceEvents[0].presence_batch_size, 1);
   });
 
   it("does not touch presence for catalogs without controllable daemon devices", async () => {
@@ -1818,6 +2916,7 @@ describe("worker-native Nexus api", () => {
     const env = testEnv({
       extra: {
         HISTORY_BLOBS: objectStore,
+        POCKLY_HISTORY_BLOBS_ENABLED: "1",
         POCKLY_TURN_PAYLOAD_BLOB_THRESHOLD_BYTES: "16",
       },
     });
@@ -1847,7 +2946,7 @@ describe("worker-native Nexus api", () => {
         agent: "claude-code",
         kind: "assistant_text",
         timestamp: "2026-06-06T04:00:00.000Z",
-        payload: { text: "this manually deleted session payload should leave R2" },
+        payload: { text: "this manually deleted session payload should leave object storage" },
       }],
     }, daemonAuth);
     assert.equal(sync.status, 200);
@@ -2149,8 +3248,8 @@ describe("worker-native Nexus api", () => {
             message: "noise event should not be persisted",
           },
         });
-        // A mid-turn stream_event: its turn must land in session_turns (one
-        // write) and must NOT be duplicated into a session_events row.
+        // A mid-turn stream_event is delivered through the transient control
+        // cache. It must not be duplicated into durable session_turns/events.
         reply({
           type: "INJECT_EVENT",
           event: {
@@ -2197,6 +3296,15 @@ describe("worker-native Nexus api", () => {
             status: "completed",
             processed: 1,
             total: 1,
+            turns: [{
+              device_id: daemon.daemon_device_id,
+              session_id: envelope.sync_request.session_id,
+              seq: 41,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: "2026-06-06T00:00:41Z",
+              payload: { text: "transient older window" },
+            }],
           },
         });
       }
@@ -2225,7 +3333,7 @@ describe("worker-native Nexus api", () => {
       authorization: `Bearer ${browser.device_access_token}`,
     }, 1);
     // Only the lifecycle event persists as a session_events row; the mid-turn
-    // stream_event content arrives once through session_turns instead.
+    // stream_event content arrives through the transient control cache.
     assert.equal(injectEventBody.events.length, 1);
     assert.equal(injectEventBody.events[0].payload.type, "inject_completed");
     assert.equal(injectEventBody.events[0].payload.turn.payload.text, "polling fallback done");
@@ -2242,13 +3350,13 @@ describe("worker-native Nexus api", () => {
     assert.equal(drainedBody.events.length, 0);
     assert.deepEqual(drainedBody.turns, []);
     assert.equal(drainedBody.next_seq, 3);
-    // The live-written turns are durable: the plain turns endpoint sees them
-    // without any daemon window sync having run.
+    // Only the final completed turn is durable without a later daemon window
+    // sync. Stream deltas remain transient active-turn content.
     const turnsAfterInject = await call(env, "GET", `/api/sessions/sess_low/turns?device_id=${daemon.daemon_device_id}`, null, {
       authorization: `Bearer ${browser.device_access_token}`,
     });
     const turnsAfterInjectBody = await turnsAfterInject.json();
-    assert.deepEqual(turnsAfterInjectBody.turns.map((turn) => turn.seq).filter((seq) => seq >= 2), [2, 3]);
+    assert.deepEqual(turnsAfterInjectBody.turns.map((turn) => turn.seq).filter((seq) => seq >= 2), [3]);
 
     const sync = await call(env, "POST", `/api/sessions/sess_low/sync?device_id=${daemon.daemon_device_id}`, {
       limit: 20,
@@ -2270,6 +3378,23 @@ describe("worker-native Nexus api", () => {
     }, 1);
     assert.equal(syncEventBody.events.length, 1);
     assert.equal(syncEventBody.events[0].payload.status, "completed");
+    assert.deepEqual(syncEventBody.events[0].payload.turns.map((turn) => [turn.seq, turn.payload.text]), [
+      [41, "transient older window"],
+    ]);
+    const persistedSyncEvents = await env.POCKLY_NEXUS_STORE.listSessionEvents("usr_test", daemon.daemon_device_id, "sess_low", {
+      request_id: syncBody.request_id,
+    });
+    assert.equal(persistedSyncEvents.length, 1);
+    const persistedSyncPayload = JSON.parse(persistedSyncEvents[0].payload);
+    assert.equal(persistedSyncPayload.turns, undefined);
+    assert.equal(persistedSyncPayload.turns_omitted, true);
+    assert.equal(persistedSyncPayload.turns_omitted_count, 1);
+    assert.equal(JSON.stringify(persistedSyncPayload).includes("transient older window"), false);
+    const turnsAfterTransientSync = await call(env, "GET", `/api/sessions/sess_low/turns?device_id=${daemon.daemon_device_id}&limit=100&before_seq=81`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const turnsAfterTransientSyncBody = await turnsAfterTransientSync.json();
+    assert.equal(turnsAfterTransientSyncBody.turns.some((turn) => turn.seq === 41), false);
 
     const terminalCreate = await call(env, "POST", "/api/terminal-sessions", {
       daemon_device_id: daemon.daemon_device_id,
@@ -2339,6 +3464,162 @@ describe("worker-native Nexus api", () => {
     const afterTerminalCursorBody = await afterTerminalCursor.json();
     assert.equal(afterTerminalCursorBody.events.length, 1);
     assert.equal(afterTerminalCursorBody.events[0].payload.turn.payload.text, "control event after terminal cursor");
+  });
+
+  it("does not persist every active-turn stream delta as a session event", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    env.POCKLY_NEXUS_RUNTIME = "managed";
+    env.REALTIME_ENABLED = "1";
+    env.BROWSER_REALTIME_ENABLED = "0";
+    env.CONTROL_STREAMING_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [
+        { session_id: "sess_burst", agent: "claude-code", cwd: "/work/app", last_seq: 1, last_timestamp: "2026-06-06T01:00:01Z", turn_count: 1 },
+      ],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+
+    store.resetCounts();
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      if (envelope.type !== "INJECT_REQUEST") return;
+      for (let seq = 2; seq <= 101; seq += 1) {
+        reply({
+          type: "INJECT_EVENT",
+          event: {
+            request_id: envelope.request.request_id,
+            type: "stream_event",
+            session_id: envelope.request.session_id,
+            turn: {
+              device_id: daemon.daemon_device_id,
+              session_id: envelope.request.session_id,
+              seq,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: `2026-06-06T01:${String(seq % 60).padStart(2, "0")}:00Z`,
+              payload: { text: `delta ${seq}` },
+            },
+          },
+        });
+      }
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "inject_completed",
+          session_id: envelope.request.session_id,
+          turn: {
+            device_id: daemon.daemon_device_id,
+            session_id: envelope.request.session_id,
+            seq: 102,
+            agent: "claude-code",
+            kind: "assistant_text",
+            timestamp: "2026-06-06T01:59:59Z",
+            payload: { text: "done" },
+          },
+        },
+      });
+    });
+
+    const inject = await call(env, "POST", `/api/sessions/sess_burst/inject?device_id=${daemon.daemon_device_id}`, {
+      text: "burst",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(inject.status, 200);
+    const injectBody = await inject.json();
+    const events = await readEventsEventually(env, `/api/sessions/sess_burst/events?device_id=${daemon.daemon_device_id}&request_id=${injectBody.request_id}&after_seq=1&limit=150`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 1);
+
+    assert.equal(events.events.length, 1);
+    assert.equal(events.events[0].payload.type, "inject_completed");
+    assert.equal(events.turns.length, 101);
+    assert.equal(events.next_seq, 102);
+    assert.equal(store.counts.appendSessionEvents, 1);
+    assert.equal(store.counts.appendSessionEventRows, 1);
+    assert.equal(store.counts.upsertTurnRows, 1);
+    assert.equal(store.counts.pruneHotTurnCache, 1);
+    assert.equal(store.pruneHotTurnCacheOptions.every((options) => Number(options.perSession) > 0), true);
+    assert.equal(store.pruneHotTurnCacheOptions.every((options) => options.sessionKeys.length === 1), true);
+    assert.equal(store.pruneHotTurnCacheOptions.filter((options) => Number(options.perUser) > 0).length <= 1, true);
+    assert.equal(store.pruneHotTurnCacheOptions.filter((options) => options.inactiveBefore).length <= 1, true);
+
+    const storedTurns = await call(env, "GET", `/api/sessions/sess_burst/turns?device_id=${daemon.daemon_device_id}&limit=150`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(storedTurns.status, 200);
+    const storedTurnsBody = await storedTurns.json();
+    assert.equal(storedTurnsBody.turns.length, 1);
+    assert.deepEqual(storedTurnsBody.turns.at(-1).payload, { text: "done" });
+  });
+
+  it("keeps daemon stream_event turns live when inject_completed is only an ack", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    env.POCKLY_NEXUS_RUNTIME = "managed";
+    env.REALTIME_ENABLED = "1";
+    env.BROWSER_REALTIME_ENABLED = "0";
+    env.CONTROL_STREAMING_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [
+        { session_id: "sess_ack_only", agent: "claude-code", cwd: "/work/app", last_seq: 1, last_timestamp: "2026-06-06T01:00:01Z", turn_count: 1 },
+      ],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+
+    store.resetCounts();
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      if (envelope.type !== "INJECT_REQUEST") return;
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "stream_event",
+          session_id: envelope.request.session_id,
+          turn: {
+            device_id: daemon.daemon_device_id,
+            session_id: envelope.request.session_id,
+            seq: 2,
+            agent: "claude-code",
+            kind: "assistant_text",
+            timestamp: "2026-06-06T01:00:02Z",
+            payload: { text: "live reply from stream event" },
+          },
+        },
+      });
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "inject_completed",
+          session_id: envelope.request.session_id,
+        },
+      });
+    });
+
+    const inject = await call(env, "POST", `/api/sessions/sess_ack_only/inject?device_id=${daemon.daemon_device_id}`, {
+      text: "ack only",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(inject.status, 200);
+    const injectBody = await inject.json();
+    const events = await readEventsEventually(env, `/api/sessions/sess_ack_only/events?device_id=${daemon.daemon_device_id}&request_id=${injectBody.request_id}&after_seq=1`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 1);
+
+    assert.equal(events.events.length, 1);
+    assert.equal(events.events[0].payload.type, "inject_completed");
+    assert.deepEqual(events.turns.map((turn) => [turn.seq, turn.payload.text]), [
+      [2, "live reply from stream event"],
+    ]);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.appendSessionEventRows, 1);
   });
 
   it("falls back to live control terminal events when persisted cache is disabled", async () => {
@@ -2632,6 +3913,7 @@ describe("worker-native Nexus api", () => {
       runtime: "self_hosted",
       realtime: true,
       browser_realtime: true,
+      browser_realtime_control: false,
       control_streaming: true,
       terminal: false,
       terminal_streaming: false,
@@ -2666,6 +3948,117 @@ describe("worker-native Nexus api", () => {
     });
     assert.equal(transcriptions.length, 1);
     assert.ok(transcriptions[0].audio instanceof File);
+  });
+
+  it("builds browser realtime commands with the same ownership checks as HTTP control", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    await env.POCKLY_NEXUS_STORE.upsertDevice({
+      user_id: daemon.user_id,
+      device_id: daemon.daemon_device_id,
+      kind: "daemon",
+      public_key: "daemon-public",
+      name: "Pockly Test Host",
+      status: "active",
+      remote_access_enabled: true,
+      created_at: "2026-06-10T00:00:00.000Z",
+      updated_at: "2026-06-10T00:00:00.000Z",
+    });
+    await env.POCKLY_NEXUS_STORE.upsertDeviceBinding({
+      user_id: daemon.user_id,
+      daemon_device_id: daemon.daemon_device_id,
+      browser_device_id: browser.browser_device_id,
+      status: "active",
+      created_at: "2026-06-10T00:00:00.000Z",
+      updated_at: "2026-06-10T00:00:00.000Z",
+    });
+    await env.POCKLY_NEXUS_STORE.upsertSession({
+      user_id: daemon.user_id,
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_realtime",
+      agent: "codex",
+      cwd: "/work/app",
+      title: "Realtime",
+      snippet: "hello",
+      last_seq: 12,
+      last_timestamp: "2026-06-10T00:00:00.000Z",
+      updated_at: "2026-06-10T00:00:00.000Z",
+    });
+
+    const build = createBrowserRealtimeCommandHandler(env.POCKLY_NEXUS_STORE, {});
+    const spec = await build({
+      userID: daemon.user_id,
+      browserDeviceID: browser.browser_device_id,
+      message: {
+        type: "COMMAND",
+        command: "inject_session",
+        request_id: "bcmd_realtime",
+        daemon_device_id: daemon.daemon_device_id,
+        session_id: "sess_realtime",
+        payload: { text: "continue", model: "gpt-5.1-codex" },
+      },
+    });
+
+    assert.equal(spec.mode, "stream");
+    assert.equal(spec.daemonDeviceID, daemon.daemon_device_id);
+    assert.equal(spec.envelope.type, "INJECT_REQUEST");
+    assert.deepEqual(spec.envelope.request, {
+      request_id: "bcmd_realtime",
+      daemon_device_id: daemon.daemon_device_id,
+      browser_device_id: browser.browser_device_id,
+      mode: "resume_session",
+      session_id: "sess_realtime",
+      agent: "codex",
+      cwd: "/work/app",
+      text: "continue",
+      model: "gpt-5.1-codex",
+      files: [],
+    });
+
+    await assert.rejects(
+      () => build({
+        userID: daemon.user_id,
+        browserDeviceID: "bd_not_bound",
+        message: {
+          type: "COMMAND",
+          command: "inject_session",
+          request_id: "bcmd_reject",
+          daemon_device_id: daemon.daemon_device_id,
+          session_id: "sess_realtime",
+          payload: { text: "continue" },
+        },
+      }),
+      /browser is not connected to this host/,
+    );
+
+    await env.POCKLY_NEXUS_STORE.upsertDevice({
+      user_id: daemon.user_id,
+      device_id: daemon.daemon_device_id,
+      kind: "daemon",
+      public_key: "daemon-public",
+      name: "Pockly Test Host",
+      status: "active",
+      remote_access_enabled: false,
+      created_at: "2026-06-10T00:00:00.000Z",
+      updated_at: "2026-06-10T00:01:00.000Z",
+    });
+    await assert.rejects(
+      () => build({
+        userID: daemon.user_id,
+        browserDeviceID: browser.browser_device_id,
+        message: {
+          type: "COMMAND",
+          command: "session_opened_hint",
+          request_id: "bcmd_remote_disabled",
+          daemon_device_id: daemon.daemon_device_id,
+          payload: { session_id: "sess_realtime" },
+        },
+      }),
+      /remote access is disabled/,
+    );
   });
 
   it("stores per-user session and project prefs without partial-update clobbering", async () => {
@@ -2893,7 +4286,10 @@ describe("worker-native Nexus api", () => {
 
     const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
     assert.equal(hints.status, 200);
-    assert.deepEqual(await hints.json(), {
+    const body = await hints.json();
+    assert.match(body.sessions[0].window_hash, /^sha256:[A-Za-z0-9_-]+$/);
+    delete body.sessions[0].window_hash;
+    assert.deepEqual(body, {
       sessions: [{
         session_id: "sess_gap",
         reason: "recently_opened",
@@ -2959,13 +4355,16 @@ describe("worker-native Nexus api", () => {
 
     const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
     assert.equal(hints.status, 200);
-    assert.deepEqual(await hints.json(), {
+    const body = await hints.json();
+    assert.match(body.sessions[0].window_hash, /^sha256:[A-Za-z0-9_-]+$/);
+    delete body.sessions[0].window_hash;
+    assert.deepEqual(body, {
       sessions: [{
         session_id: "sess_noncontiguous",
         reason: "recently_opened",
         preferred_min: 100,
-        synced_turn_count: 140,
-        synced_min_seq: 1,
+        synced_turn_count: 100,
+        synced_min_seq: 141,
         synced_max_seq: 240,
         latest_contiguous_min_seq: 141,
         next_before_seq: 141,
@@ -2978,6 +4377,57 @@ describe("worker-native Nexus api", () => {
     const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_noncontiguous");
     assert.equal(session.has_older_turns, true);
     assert.equal(session.sync_state, "partial");
+  });
+
+  it("computes sync hint window_hash with the daemon-compatible algorithm", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const turns = [];
+    for (let seq = 1; seq <= 3; seq += 1) {
+      turns.push({
+        session_id: "sess_hash_parity",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T04:0${seq}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      });
+    }
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_hash_parity",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "hash",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        sync_state: "fully_synced",
+        turn_count: 3,
+        min_seq: 1,
+        max_seq: 3,
+        has_older: false,
+      }],
+      turns,
+    }, daemonAuth);
+    assert.equal(sync.status, 200);
+
+    const opened = await call(env, "POST", "/api/sessions/sess_hash_parity/opened", {
+      device_id: daemon.daemon_device_id,
+      opened_at: new Date().toISOString(),
+    }, auth);
+    assert.equal(opened.status, 200);
+
+    const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
+    assert.equal(hints.status, 200);
+    const body = await hints.json();
+    assert.equal(body.sessions[0].window_hash, "sha256:5snTIyF1vDYeoLml9s3oSpSLyexv6juLDgHZ9if9ruw");
   });
 
   it("pushes a SYNC_HINT over the control WS when a session is opened", async () => {
@@ -3031,6 +4481,8 @@ describe("worker-native Nexus api", () => {
 
     const hint = envelopes.find((envelope) => envelope.type === "SYNC_HINT");
     assert.ok(hint, "daemon should receive a SYNC_HINT envelope");
+    assert.match(hint.sync_hint.window_hash, /^sha256:[A-Za-z0-9_-]+$/);
+    delete hint.sync_hint.window_hash;
     assert.deepEqual(hint.sync_hint, {
       session_id: "sess_hint_push",
       reason: "recently_opened",
@@ -3083,12 +4535,28 @@ describe("worker-native Nexus api", () => {
 
     const opened = await call(env, "POST", "/api/sessions/sess_large_hint_skip/opened", {
       device_id: daemon.daemon_device_id,
+      opened_at: "2026-06-10T08:00:00.000Z",
     }, auth);
     assert.equal(opened.status, 200);
+    assert.deepEqual(await opened.json(), {
+      device_id: daemon.daemon_device_id,
+      session_id: "sess_large_hint_skip",
+      last_opened_at: "2026-06-10T08:00:00.000Z",
+    });
     assert.deepEqual(envelopes.filter((envelope) => envelope.type === "SYNC_HINT"), []);
 
     const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
     assert.deepEqual(await hints.json(), { sessions: [] });
+    assert.deepEqual(await env.POCKLY_NEXUS_STORE.listSessionOpenHintsForDevice("usr_test", daemon.daemon_device_id), []);
+
+    const turns = await call(env, "GET", `/api/sessions/sess_large_hint_skip/turns?device_id=${daemon.daemon_device_id}`, null, auth);
+    assert.equal(turns.status, 200);
+    const turnsBody = await turns.json();
+    assert.deepEqual(turnsBody.turns, []);
+    assert.equal(turnsBody.needs_sync, true);
+    assert.equal(turnsBody.total_turn_count, 2001);
+    assert.equal(turnsBody.synced_turn_count, 0);
+    assert.equal(turnsBody.has_older_turns, true);
   });
 });
 
@@ -3338,19 +4806,61 @@ class CountingNexusStore extends InMemoryNexusStore {
       getSessionTurnStats: 0,
       listTurns: 0,
       listTurnPayloadPointers: 0,
+      upsertTurns: 0,
+      upsertTurnRows: 0,
       upsertSessions: 0,
       upsertSessionRows: 0,
+      appendSessionCatalogChange: 0,
+      appendSessionCatalogChanges: 0,
+      appendSessionCatalogChangeRows: 0,
+      appendSessionEvents: 0,
+      appendSessionEventRows: 0,
+      listDevicesForUser: 0,
+      listSessionsForUser: 0,
+      countSessionsByDeviceForUser: 0,
       listSessionPrefsForUser: 0,
       listSessionPrefsForDevice: 0,
       listSessionOpenHintsForUser: 0,
       listSessionOpenHintsForDevice: 0,
+      pruneHotTurnCache: 0,
     };
+    this.pruneHotTurnCacheOptions = [];
   }
 
   async upsertSessions(sessions) {
     this.counts.upsertSessions += 1;
     this.counts.upsertSessionRows += sessions.length;
     return await super.upsertSessions(sessions);
+  }
+
+  async upsertTurns(turns) {
+    this.counts.upsertTurns += 1;
+    this.counts.upsertTurnRows += turns.length;
+    return await super.upsertTurns(turns);
+  }
+
+  async appendSessionCatalogChange(change) {
+    this.counts.appendSessionCatalogChange += 1;
+    this.counts.appendSessionCatalogChangeRows += 1;
+    return await super.appendSessionCatalogChange(change);
+  }
+
+  async appendSessionCatalogChanges(changes) {
+    this.counts.appendSessionCatalogChanges += 1;
+    this.counts.appendSessionCatalogChangeRows += changes.length;
+    return await InMemoryNexusStore.prototype.appendSessionCatalogChanges.call(this, changes);
+  }
+
+  async appendSessionEvent(event) {
+    this.counts.appendSessionEvents += 1;
+    this.counts.appendSessionEventRows += 1;
+    return await super.appendSessionEvent(event);
+  }
+
+  async pruneHotTurnCache(options = {}) {
+    this.counts.pruneHotTurnCache += 1;
+    this.pruneHotTurnCacheOptions.push(options);
+    return await super.pruneHotTurnCache(options);
   }
 
   async listDeviceSessions(...args) {
@@ -3396,6 +4906,28 @@ class CountingNexusStore extends InMemoryNexusStore {
   async listTurnPayloadPointers(...args) {
     this.counts.listTurnPayloadPointers += 1;
     return await super.listTurnPayloadPointers(...args);
+  }
+
+  async listSessionsForUser(...args) {
+    this.counts.listSessionsForUser += 1;
+    return await super.listSessionsForUser(...args);
+  }
+
+  async listSessionCatalogPage(...args) {
+    if (this.onListSessionCatalogPage) {
+      await this.onListSessionCatalogPage(...args);
+    }
+    return await super.listSessionCatalogPage(...args);
+  }
+
+  async listDevicesForUser(...args) {
+    this.counts.listDevicesForUser += 1;
+    return await super.listDevicesForUser(...args);
+  }
+
+  async countSessionsByDeviceForUser(...args) {
+    this.counts.countSessionsByDeviceForUser += 1;
+    return await super.countSessionsByDeviceForUser(...args);
   }
 
   async listSessionPrefsForUser(...args) {

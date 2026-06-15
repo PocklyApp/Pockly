@@ -8,6 +8,8 @@ import { ErrorCode, errorResponse, jsonResponse } from "./contract.js";
 const defaultRequestTimeoutMs = 30_000;
 const injectTimeoutMs = 35 * 60_000;
 const syncTimeoutMs = 35 * 60_000;
+const transientEventTTLms = 10 * 60_000;
+const transientEventLimitPerRequest = 200;
 
 export function createControlHub(env = {}) {
   if (env.POCKLY_CONTROL_HUB) return withEventSink(env.POCKLY_CONTROL_HUB, env);
@@ -33,6 +35,10 @@ function withEventSink(hub, env = {}) {
     if (typeof hub.setEventSink === "function") hub.setEventSink(env.POCKLY_CONTROL_EVENT_SINK);
     else hub.eventSink = env.POCKLY_CONTROL_EVENT_SINK;
   }
+  if (hub && env.POCKLY_BROWSER_COMMAND_HANDLER && !hub.browserCommandHandler) {
+    if (typeof hub.setBrowserCommandHandler === "function") hub.setBrowserCommandHandler(env.POCKLY_BROWSER_COMMAND_HANDLER);
+    else hub.browserCommandHandler = env.POCKLY_BROWSER_COMMAND_HANDLER;
+  }
   return hub;
 }
 
@@ -49,11 +55,19 @@ export class InMemoryControlHub {
     this.daemons = new Map();
     this.pending = new Map();
     this.streams = new Map();
+    this.browserCommandStreams = new Map();
     this.browserSockets = new Map();
+    this.browserCommandHandler = options.browserCommandHandler || null;
     this.terminalSessions = new Map();
     this.terminalStreams = new Map();
     this.terminalHistory = new Map();
     this.terminalEventCounter = 1;
+    this.transientEventCounter = 1;
+    this.transientSessionEvents = new Map();
+  }
+
+  setBrowserCommandHandler(handler) {
+    this.browserCommandHandler = handler || null;
   }
 
   async hydrateTerminalState() {
@@ -117,10 +131,17 @@ export class InMemoryControlHub {
     const ws = {
       send: (message) => messages.push(JSON.parse(String(message))),
     };
-    const socket = { userID, deviceID: browserDeviceID, ws, subscriptions: new Set([subscriptionKey(userID, daemonDeviceID, sessionID)]) };
+    const socket = {
+      userID,
+      deviceID: browserDeviceID,
+      ws,
+      subscriptions: new Set([subscriptionKey(userID, daemonDeviceID, sessionID)]),
+      terminalSubscriptions: new Set(),
+    };
     this.browserSockets.set(ws, socket);
     return {
       messages,
+      socket,
       cleanup: () => this.browserSockets.delete(ws),
     };
   }
@@ -226,21 +247,34 @@ export class InMemoryControlHub {
   }
 
   // registerBrowserSocket creates the registry entry without wiring any socket
-  // listeners — runtimes that deliver events out-of-band (the Cloudflare DO
-  // Hibernation API routes them through webSocketMessage/webSocketClose
-  // callbacks) register recovered sockets through this seam.
-  registerBrowserSocket({ userID, deviceID, socket, subscriptions }) {
+  // listeners — runtimes that deliver events through platform hibernation
+  // callbacks register recovered sockets through this seam.
+  registerBrowserSocket({ userID, deviceID, socket, subscriptions, terminalSubscriptions }) {
     const browserSocket = {
       userID,
       deviceID,
       ws: socket,
       subscriptions: subscriptions instanceof Set ? subscriptions : new Set(subscriptions ?? []),
+      terminalSubscriptions: terminalSubscriptions instanceof Set ? terminalSubscriptions : new Set(terminalSubscriptions ?? []),
     };
     this.browserSockets.set(socket, browserSocket);
     return browserSocket;
   }
 
   unregisterBrowserSocket(socket) {
+    const browserSocket = this.browserSockets.get(socket);
+    if (browserSocket) {
+      for (const [requestID, entry] of [...this.browserCommandStreams.entries()]) {
+        if (entry.browserSocket === browserSocket) this.closeBrowserCommandStream(requestID);
+      }
+      for (const terminalSessionID of [...browserSocket.terminalSubscriptions]) {
+        browserSocket.terminalSubscriptions.delete(terminalSessionID);
+        const session = this.terminalSessions.get(terminalSessionID);
+        if (session && !this.hasTerminalSubscribers(terminalSessionID)) {
+          void this.sendTerminalSubscription(session, false);
+        }
+      }
+    }
     this.browserSockets.delete(socket);
   }
 
@@ -248,40 +282,241 @@ export class InMemoryControlHub {
     const socket = browserSocket.ws;
     try {
       const msg = JSON.parse(String(raw));
-      if (msg.type !== "SUBSCRIBE") return;
-      const sessionID = String(msg.session_id || "");
-      const daemonDeviceID = String(msg.device_id || "");
-      if (!sessionID || !daemonDeviceID) {
-        socketSend(socket, JSON.stringify({ type: "ERROR", message: "session_id and device_id are required" }));
-        return;
-      }
-      browserSocket.subscriptions.add(subscriptionKey(browserSocket.userID, daemonDeviceID, sessionID));
-      socketSend(socket, JSON.stringify({ type: "SESSION_STATUS", message: "subscribed" }));
-      const localOnline = this.isDaemonOnline(daemonDeviceID);
-      socketSend(socket, JSON.stringify({
-        type: "HOST_STATUS",
-        device_id: daemonDeviceID,
-        presence_status: localOnline ? "online" : "offline",
-        presence_reason: localOnline ? "control_connected" : "control_disconnected",
-        control_connected: localOnline,
-      }));
-      if (this.presenceResolver) {
-        Promise.resolve(this.presenceResolver(daemonDeviceID))
-          .then((status) => {
-            if (!status || this.browserSockets.get(socket) !== browserSocket) return;
-            socketSend(socket, JSON.stringify({
-              type: "HOST_STATUS",
-              device_id: daemonDeviceID,
-              presence_status: status.presence_status || (status.online ? "online" : "offline"),
-              presence_reason: status.presence_reason || (status.online ? "control_connected" : "control_disconnected"),
-              control_connected: Boolean(status.control_connected ?? status.online),
-            }));
-          })
-          .catch(() => undefined);
+      switch (msg.type) {
+        case "SUBSCRIBE":
+        case "SUBSCRIBE_SESSION":
+          this.subscribeBrowserSession(browserSocket, msg);
+          return;
+        case "UNSUBSCRIBE":
+        case "UNSUBSCRIBE_SESSION":
+          this.unsubscribeBrowserSession(browserSocket, msg);
+          return;
+        case "SUBSCRIBE_TERMINAL":
+          void this.subscribeBrowserTerminal(browserSocket, String(msg.terminal_session_id || ""));
+          return;
+        case "UNSUBSCRIBE_TERMINAL":
+          void this.unsubscribeBrowserTerminal(browserSocket, String(msg.terminal_session_id || ""));
+          return;
+        case "COMMAND":
+          void this.handleBrowserCommand(browserSocket, msg);
+          return;
+        default:
+          return;
       }
     } catch {
       socketSend(socket, JSON.stringify({ type: "ERROR", message: "invalid websocket message" }));
     }
+  }
+
+  subscribeBrowserSession(browserSocket, msg) {
+    const socket = browserSocket.ws;
+    const sessionID = String(msg.session_id || "");
+    const daemonDeviceID = String(msg.device_id || msg.daemon_device_id || "");
+    if (!sessionID || !daemonDeviceID) {
+      socketSend(socket, JSON.stringify({ type: "ERROR", message: "session_id and device_id are required" }));
+      return;
+    }
+    browserSocket.subscriptions.add(subscriptionKey(browserSocket.userID, daemonDeviceID, sessionID));
+    socketSend(socket, JSON.stringify({ type: "SESSION_STATUS", message: "subscribed", session_id: sessionID, device_id: daemonDeviceID }));
+    const localOnline = this.isDaemonOnline(daemonDeviceID);
+    socketSend(socket, JSON.stringify({
+      type: "HOST_STATUS",
+      device_id: daemonDeviceID,
+      presence_status: localOnline ? "online" : "offline",
+      presence_reason: localOnline ? "control_connected" : "control_disconnected",
+      control_connected: localOnline,
+    }));
+    if (this.presenceResolver) {
+      Promise.resolve(this.presenceResolver(daemonDeviceID))
+        .then((status) => {
+          if (!status || this.browserSockets.get(socket) !== browserSocket) return;
+          socketSend(socket, JSON.stringify({
+            type: "HOST_STATUS",
+            device_id: daemonDeviceID,
+            presence_status: status.presence_status || (status.online ? "online" : "offline"),
+            presence_reason: status.presence_reason || (status.online ? "control_connected" : "control_disconnected"),
+            control_connected: Boolean(status.control_connected ?? status.online),
+          }));
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  unsubscribeBrowserSession(browserSocket, msg) {
+    const sessionID = String(msg.session_id || "");
+    const daemonDeviceID = String(msg.device_id || msg.daemon_device_id || "");
+    if (!sessionID || !daemonDeviceID) return;
+    browserSocket.subscriptions.delete(subscriptionKey(browserSocket.userID, daemonDeviceID, sessionID));
+    socketSend(browserSocket.ws, JSON.stringify({ type: "SESSION_STATUS", message: "unsubscribed", session_id: sessionID, device_id: daemonDeviceID }));
+  }
+
+  async handleBrowserCommand(browserSocket, msg) {
+    const requestID = String(msg.request_id || "");
+    const command = String(msg.command || "");
+    if (!requestID || !command) {
+      this.sendBrowserCommandError(browserSocket, requestID, command, "bad_request", "request_id and command are required");
+      return;
+    }
+    if (!this.browserCommandHandler) {
+      this.sendBrowserCommandError(browserSocket, requestID, command, "unsupported", "browser realtime commands are unavailable");
+      return;
+    }
+    let spec;
+    try {
+      spec = await this.browserCommandHandler({
+        userID: browserSocket.userID,
+        browserDeviceID: browserSocket.deviceID,
+        message: msg,
+      });
+    } catch (error) {
+      this.sendBrowserCommandError(browserSocket, requestID, command, browserCommandErrorCode(error), error instanceof Error ? error.message : String(error));
+      return;
+    }
+    try {
+      await this.executeBrowserCommandSpec(browserSocket, requestID, command, spec || {});
+    } catch (error) {
+      this.sendBrowserCommandError(browserSocket, requestID, command, browserCommandErrorCode(error), error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async executeBrowserCommandSpec(browserSocket, requestID, command, spec) {
+    switch (spec.mode) {
+      case "stream":
+        return await this.startBrowserCommandStream(browserSocket, requestID, command, spec);
+      case "dispatch":
+        await this.dispatch(spec.daemonDeviceID, spec.envelope);
+        this.sendBrowserCommandAck(browserSocket, requestID, command, spec.ack || { status: "accepted", device_id: spec.daemonDeviceID, session_id: spec.sessionID || "" });
+        return;
+      case "request_response":
+        return await this.runBrowserCommandRequestResponse(browserSocket, requestID, command, spec);
+      case "terminal_create": {
+        const terminal = await this.createTerminalSession(spec.terminalSession);
+        this.sendBrowserCommandAck(browserSocket, requestID, command, { status: "accepted", terminal_session: terminal, terminal_session_id: terminal.terminal_session_id });
+        return;
+      }
+      case "terminal_action":
+        return await this.runBrowserCommandTerminalAction(browserSocket, requestID, command, spec);
+      default:
+        throw new Error("unsupported browser command");
+    }
+  }
+
+  async startBrowserCommandStream(browserSocket, requestID, command, spec) {
+    const daemonRequestID = spec.daemonRequestID || requestID;
+    if (this.browserCommandStreams.has(daemonRequestID)) throw new Error("request_id already in flight");
+    const daemon = this.daemons.get(spec.daemonDeviceID);
+    if (!daemon) throw new Error("daemon offline");
+    const entry = {
+      requestID,
+      command,
+      browserSocket,
+      daemonDeviceID: spec.daemonDeviceID,
+      userID: browserSocket.userID,
+      daemonRequestID,
+      closeWhen: spec.closeWhen || (() => false),
+      timer: setTimeout(() => {
+        this.sendBrowserCommandEvent(entry, spec.timeoutEvent ? spec.timeoutEvent(daemonRequestID) : { request_id: daemonRequestID, type: "command_failed", error: "command timed out" });
+        this.closeBrowserCommandStream(daemonRequestID);
+      }, spec.timeoutMs ?? defaultRequestTimeoutMs),
+    };
+    this.browserCommandStreams.set(daemonRequestID, entry);
+    this.sendBrowserCommandAck(browserSocket, requestID, command, spec.ack || { status: "accepted", device_id: spec.daemonDeviceID, session_id: spec.sessionID || "" });
+    if (spec.initialEvent) this.sendBrowserCommandEvent(entry, spec.initialEvent);
+    try {
+      await daemon.sendEnvelope(spec.envelope);
+    } catch (error) {
+      this.sendBrowserCommandEvent(entry, spec.errorEvent ? spec.errorEvent(daemonRequestID, error.message || "daemon send failed") : { request_id: daemonRequestID, type: "command_failed", error: error.message || "daemon send failed" });
+      this.closeBrowserCommandStream(daemonRequestID);
+    }
+  }
+
+  async runBrowserCommandRequestResponse(browserSocket, requestID, command, spec) {
+    const daemon = this.daemons.get(spec.daemonDeviceID);
+    if (!daemon) throw new Error("daemon offline");
+    this.sendBrowserCommandAck(browserSocket, requestID, command, spec.ack || { status: "accepted", device_id: spec.daemonDeviceID });
+    const result = await this.requestResponse(
+      spec.daemonDeviceID,
+      spec.envelope,
+      spec.responseType,
+      spec.daemonRequestID || requestID,
+      spec.timeoutMs ?? defaultRequestTimeoutMs,
+    );
+    this.sendBrowserCommandEvent({ browserSocket, requestID, command, daemonRequestID: spec.daemonRequestID || requestID }, result);
+  }
+
+  async runBrowserCommandTerminalAction(browserSocket, requestID, command, spec) {
+    switch (spec.action) {
+      case "input":
+        await this.sendTerminalInput(browserSocket.userID, spec.terminalSessionID, String(spec.text || ""));
+        break;
+      case "open":
+        await this.openTerminalSession(browserSocket.userID, spec.terminalSessionID);
+        break;
+      case "stop":
+        await this.stopTerminalSession(browserSocket.userID, spec.terminalSessionID);
+        break;
+      case "subscribe":
+        await this.subscribeBrowserTerminal(browserSocket, spec.terminalSessionID);
+        break;
+      case "unsubscribe":
+        await this.unsubscribeBrowserTerminal(browserSocket, spec.terminalSessionID);
+        break;
+      default:
+        throw new Error("unsupported terminal command");
+    }
+    this.sendBrowserCommandAck(browserSocket, requestID, command, { status: "accepted", terminal_session_id: spec.terminalSessionID });
+  }
+
+  async subscribeBrowserTerminal(browserSocket, terminalSessionID) {
+    const session = this.requireTerminalSession(browserSocket.userID, terminalSessionID);
+    browserSocket.terminalSubscriptions.add(terminalSessionID);
+    await this.sendTerminalSubscription(session, true);
+    socketSend(browserSocket.ws, JSON.stringify({
+      type: "TERMINAL_EVENT",
+      terminal_session_id: terminalSessionID,
+      event: { terminal_session_id: terminalSessionID, kind: "terminal_session", session_status: session.session_status, turn_status: session.turn_status, timestamp: session.updated_at },
+    }));
+    for (const event of this.terminalHistory.get(terminalSessionID) ?? []) {
+      socketSend(browserSocket.ws, JSON.stringify({ type: "TERMINAL_EVENT", terminal_session_id: terminalSessionID, event }));
+    }
+  }
+
+  async unsubscribeBrowserTerminal(browserSocket, terminalSessionID) {
+    const session = this.requireTerminalSession(browserSocket.userID, terminalSessionID);
+    browserSocket.terminalSubscriptions.delete(terminalSessionID);
+    if (!this.hasTerminalSubscribers(terminalSessionID)) await this.sendTerminalSubscription(session, false);
+  }
+
+  sendBrowserCommandAck(browserSocket, requestID, command, payload = {}) {
+    socketSend(browserSocket.ws, JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: requestID,
+      command,
+      status: payload.status || "accepted",
+      ...payload,
+    }));
+  }
+
+  sendBrowserCommandEvent(entry, event) {
+    const out = event && typeof event === "object"
+      ? { ...event, request_id: entry.requestID, daemon_request_id: event.request_id || entry.daemonRequestID || "" }
+      : event;
+    socketSend(entry.browserSocket.ws, JSON.stringify({
+      type: "COMMAND_EVENT",
+      request_id: entry.requestID,
+      command: entry.command,
+      event: out,
+    }));
+  }
+
+  sendBrowserCommandError(browserSocket, requestID, command, code, error) {
+    socketSend(browserSocket.ws, JSON.stringify({
+      type: "COMMAND_ERROR",
+      request_id: requestID,
+      command,
+      code,
+      error,
+    }));
   }
 
   async requestResponse(daemonDeviceID, envelope, responseType, requestID, timeoutMs = defaultRequestTimeoutMs) {
@@ -595,6 +830,7 @@ export class InMemoryControlHub {
     this.terminalHistory.set(event.terminal_session_id, history);
     this.persistTerminalState();
     this.emitNotificationForTerminalEvent(event, nextSession);
+    this.broadcastTerminalEvent(event.terminal_session_id, event);
     const streams = this.terminalStreams.get(event.terminal_session_id);
     if (!streams) return;
     for (const entry of [...streams]) {
@@ -604,6 +840,25 @@ export class InMemoryControlHub {
         streams.delete(entry);
       }
     }
+  }
+
+  broadcastTerminalEvent(terminalSessionID, event) {
+    for (const socket of this.browserSockets.values()) {
+      if (!socket.terminalSubscriptions?.has(terminalSessionID)) continue;
+      try {
+        socket.ws.send(JSON.stringify({ type: "TERMINAL_EVENT", terminal_session_id: terminalSessionID, event }));
+      } catch {
+        this.browserSockets.delete(socket.ws);
+      }
+    }
+  }
+
+  hasTerminalSubscribers(terminalSessionID) {
+    if ((this.terminalStreams.get(terminalSessionID)?.size || 0) > 0) return true;
+    for (const socket of this.browserSockets.values()) {
+      if (socket.terminalSubscriptions?.has(terminalSessionID)) return true;
+    }
+    return false;
   }
 
   nextTerminalEventID() {
@@ -649,6 +904,9 @@ export class InMemoryControlHub {
   deliverInjectEvent(payload, userID, daemonDeviceID = "") {
     if (!payload) return;
     this.eventSink?.onControlEvent?.(payload, { userID, daemonDeviceID, kind: "inject" });
+    if (isTransientTurnEvent(payload)) {
+      this.captureTransientSessionEvent(payload, { userID, daemonDeviceID });
+    }
     this.deliverStream(payload);
     if (payload.turn) this.broadcastTurn(payload.turn, userID);
     this.emitNotificationForInjectEvent(payload, userID);
@@ -656,7 +914,16 @@ export class InMemoryControlHub {
 
   deliverStream(payload, options = {}) {
     if (!payload?.request_id) return;
+    if (options.persistEvent) this.captureTransientSessionEvent(payload, {
+      userID: options.userID || "",
+      daemonDeviceID: options.daemonDeviceID || "",
+    });
     if (options.persistEvent) this.eventSink?.onControlEvent?.(payload, { userID: options.userID || "", daemonDeviceID: options.daemonDeviceID || "", kind: "sync" });
+    const browserEntry = this.browserCommandStreams.get(payload.request_id);
+    if (browserEntry) {
+      this.sendBrowserCommandEvent(browserEntry, payload);
+      if (browserEntry.closeWhen(payload)) this.closeBrowserCommandStream(payload.request_id);
+    }
     const entry = this.streams.get(payload.request_id);
     if (!entry) return;
     this.writeSSE(entry.controller, entry.eventName, payload);
@@ -717,6 +984,11 @@ export class InMemoryControlHub {
       this.writeSSE(stream.controller, stream.eventName, { request_id: requestID, type: "inject_failed", error: reason });
       this.closeStream(requestID);
     }
+    for (const [requestID, entry] of [...this.browserCommandStreams.entries()]) {
+      if (entry.daemonDeviceID !== daemonDeviceID) continue;
+      this.sendBrowserCommandEvent(entry, { request_id: entry.requestID, type: "inject_failed", error: reason });
+      this.closeBrowserCommandStream(requestID);
+    }
   }
 
   closeStream(requestID, closeController = true) {
@@ -733,8 +1005,72 @@ export class InMemoryControlHub {
     }
   }
 
+  closeBrowserCommandStream(requestID) {
+    const entry = this.browserCommandStreams.get(requestID);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    this.browserCommandStreams.delete(requestID);
+  }
+
   writeSSE(controller, eventName, payload) {
     writeSSE(controller, eventName, payload);
+  }
+
+  captureTransientSessionEvent(payload, meta = {}) {
+    if (!hasTransientTurnPayload(payload)) return;
+    const requestID = String(payload.request_id || "");
+    if (!requestID) return;
+    const turn = payload.turn && typeof payload.turn === "object" ? payload.turn : null;
+    const sessionID = String(payload.session_id || turn?.session_id || "");
+    const deviceID = String(payload.device_id || turn?.device_id || meta.daemonDeviceID || "");
+    const userID = String(meta.userID || "");
+    if (!userID || !deviceID) return;
+    this.pruneTransientSessionEvents();
+    const event = {
+      cursor: this.nextTransientEventID(),
+      event_id: "",
+      request_id: requestID,
+      device_id: deviceID,
+      session_id: sessionID,
+      type: String(payload.type || payload.stage || "sync_event"),
+      created_at: String(payload.timestamp || new Date().toISOString()),
+      payload,
+      expires_at: Date.now() + transientEventTTLms,
+      user_id: userID,
+    };
+    const entries = this.transientSessionEvents.get(requestID) || [];
+    entries.push(event);
+    if (entries.length > transientEventLimitPerRequest) {
+      entries.splice(0, entries.length - transientEventLimitPerRequest);
+    }
+    this.transientSessionEvents.set(requestID, entries);
+  }
+
+  listTransientSessionEvents(userID, deviceID, sessionID, options = {}) {
+    this.pruneTransientSessionEvents();
+    const requestID = String(options.request_id || "");
+    if (!requestID) return [];
+    const after = String(options.after || "");
+    return (this.transientSessionEvents.get(requestID) || [])
+      .filter((event) => event.user_id === userID)
+      .filter((event) => !deviceID || event.device_id === deviceID)
+      .filter((event) => !sessionID || event.session_id === sessionID)
+      .filter((event) => !after || String(event.cursor) > after)
+      .map(({ expires_at, user_id, ...event }) => event);
+  }
+
+  pruneTransientSessionEvents(now = Date.now()) {
+    for (const [requestID, entries] of this.transientSessionEvents) {
+      const kept = entries.filter((event) => Number(event.expires_at || 0) > now);
+      if (kept.length) this.transientSessionEvents.set(requestID, kept);
+      else this.transientSessionEvents.delete(requestID);
+    }
+  }
+
+  nextTransientEventID() {
+    const millis = String(Date.now()).padStart(13, "0");
+    this.transientEventCounter = (this.transientEventCounter + 1) % 1_000_000;
+    return `tev_${millis}_${String(this.transientEventCounter).padStart(6, "0")}`;
   }
 
   emitNotificationForInjectEvent(payload, userID) {
@@ -792,6 +1128,22 @@ export class InMemoryControlHub {
       .catch(() => undefined);
     return this.notificationChain;
   }
+}
+
+function hasTransientTurnPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (Array.isArray(payload.turns) && payload.turns.length > 0) return true;
+  return Boolean(payload.turn && typeof payload.turn === "object");
+}
+
+function isTransientTurnEvent(payload) {
+  if (!payload || typeof payload !== "object" || !payload.turn || typeof payload.turn !== "object") return false;
+  const type = String(payload.type || payload.stage || "");
+  const status = String(payload.status || "");
+  if (type === "inject_completed" || type === "completed" || type === "turn_completed") return false;
+  if (type === "inject_failed" || type === "inject_cancelled" || type === "failed") return false;
+  if (status === "completed" || status === "failed" || status === "cancelled") return false;
+  return true;
 }
 
 export function handleControlHubRequest(hub, request) {
@@ -856,6 +1208,18 @@ export function handleControlHubRequest(hub, request) {
       options.initialEvent = body.initial_event || options.initialEvent;
       return hub.streamRequest(body.daemon_device_id, body.envelope, body.request_id, options);
     }, true);
+  }
+  if (request.method === "GET" && path === "/control/transient-session-events") {
+    return jsonControl(async () => hub.listTransientSessionEvents(
+      requiredQuery(url, "user_id"),
+      url.searchParams.get("device_id") || "",
+      url.searchParams.get("session_id") || "",
+      {
+        request_id: url.searchParams.get("request_id") || "",
+        after: url.searchParams.get("after") || "",
+        limit: url.searchParams.get("limit") || "",
+      },
+    ));
   }
   if (path === "/control/terminal-sessions" && request.method === "GET") {
     return jsonControl(async () => ({ terminal_sessions: await hub.listTerminalSessions(requiredQuery(url, "user_id")) }));
@@ -1027,6 +1391,15 @@ function uniqueStrings(values) {
     out.push(next);
   }
   return out;
+}
+
+function browserCommandErrorCode(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  if (message === "daemon offline") return "daemon_offline";
+  if (message.includes("not found")) return "not_found";
+  if (message.includes("forbidden") || message.includes("not connected") || message.includes("remote access")) return "forbidden";
+  if (message.includes("required") || message.includes("must be")) return "bad_request";
+  return "service_unavailable";
 }
 
 function publicTerminalEvent(event) {

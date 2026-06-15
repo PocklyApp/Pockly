@@ -12,6 +12,8 @@ export function createStore(env = {}) {
 }
 
 let nextEventCounter = 1;
+const maxSessionEventsPerUser = 5000;
+const maxSessionEventsPerSession = 500;
 
 export class InMemoryNexusStore {
   constructor() {
@@ -33,6 +35,7 @@ export class InMemoryNexusStore {
     this.sessions = new Map();
     this.turns = new Map();
     this.sessionEvents = [];
+    this.sessionCatalogChanges = [];
     this.sessionPrefs = new Map();
     this.sessionOpenHints = new Map();
     this.projectPrefs = new Map();
@@ -121,6 +124,18 @@ export class InMemoryNexusStore {
     return [...this.devices.values()]
       .filter((device) => device.user_id === userID)
       .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  }
+
+  async countSessionsByDeviceForUser(userID, deviceIDs = []) {
+    const allowed = new Set(deviceIDs.map((id) => String(id)).filter(Boolean));
+    const counts = new Map();
+    for (const session of this.sessions.values()) {
+      if (session.user_id !== userID) continue;
+      const deviceID = String(session.device_id || "");
+      if (allowed.size > 0 && !allowed.has(deviceID)) continue;
+      counts.set(deviceID, (counts.get(deviceID) ?? 0) + 1);
+    }
+    return counts;
   }
 
   async patchDevice(userID, deviceID, patch) {
@@ -295,13 +310,64 @@ export class InMemoryNexusStore {
   async listSessionsForUser(userID) {
     return [...this.sessions.values()]
       .filter((session) => session.user_id === userID)
-      .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+      .sort(compareSessionCatalogRows);
+  }
+
+  async listSessionCatalogPage(userID, options = {}) {
+    const limit = clampLimit(options.limit, 100);
+    const after = options.after ?? null;
+    return (await this.listSessionsForUser(userID))
+      .filter((session) => !after || sessionCatalogRowAfterCursor(session, after))
+      .slice(0, limit);
   }
 
   async listDeviceSessions(userID, deviceID) {
     return [...this.sessions.values()]
       .filter((session) => session.user_id === userID && session.device_id === deviceID)
       .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  }
+
+  async appendSessionCatalogChange(change) {
+    const next = normalizeSessionCatalogChange(change);
+    this.appendSessionCatalogChangeRows([next]);
+    return next;
+  }
+
+  async appendSessionCatalogChanges(changes = []) {
+    const out = changes.map(normalizeSessionCatalogChange);
+    this.appendSessionCatalogChangeRows(out);
+    return out;
+  }
+
+  appendSessionCatalogChangeRows(rows) {
+    this.sessionCatalogChanges.push(...rows);
+    if (this.sessionCatalogChanges.length > 10_000) {
+      this.sessionCatalogChanges.splice(0, this.sessionCatalogChanges.length - 10_000);
+    }
+  }
+
+  async listSessionCatalogChanges(userID, options = {}) {
+    const since = String(options.since ?? "");
+    const limit = clampLimit(options.limit, 100);
+    return this.sessionCatalogChanges
+      .filter((change) => change.user_id === userID && (!since || String(change.change_id) > since))
+      .sort((left, right) => String(left.change_id).localeCompare(String(right.change_id)))
+      .slice(0, limit);
+  }
+
+  async currentSessionCatalogCursor(userID) {
+    return (await this.sessionCatalogCursorBounds(userID)).latest;
+  }
+
+  async sessionCatalogCursorBounds(userID) {
+    const cursors = this.sessionCatalogChanges
+      .filter((change) => change.user_id === userID)
+      .map((change) => String(change.change_id))
+      .sort((left, right) => left.localeCompare(right));
+    return {
+      oldest: cursors[0] || "",
+      latest: cursors[cursors.length - 1] || emptyCatalogChangeCursor(),
+    };
   }
 
   async listDeviceSessionSyncSnapshots(userID, deviceID) {
@@ -391,6 +457,76 @@ export class InMemoryNexusStore {
     for (const turn of turns) await this.upsertTurn(turn);
   }
 
+  async pruneHotTurnCache(options = {}) {
+    const perSession = positiveInteger(options.perSession ?? options.per_session, 0);
+    const perUser = positiveInteger(options.perUser ?? options.per_user, 0);
+    const inactiveBefore = String(options.inactiveBefore ?? options.inactive_before ?? "");
+    const userIDs = new Set((options.userIDs ?? options.user_ids ?? []).map((id) => String(id)).filter(Boolean));
+    const sessionKeys = new Set((options.sessionKeys ?? options.session_keys ?? []).map((key) => String(key)).filter(Boolean));
+    const affected = new Map();
+    const markAffected = (turn) => {
+      const key = sessionKey(turn.user_id, turn.device_id, turn.session_id);
+      affected.set(key, {
+        user_id: turn.user_id,
+        device_id: turn.device_id,
+        session_id: turn.session_id,
+      });
+    };
+    if (inactiveBefore) {
+      const staleSessions = new Set([...this.sessions.values()]
+        .filter((session) => (!userIDs.size || userIDs.has(String(session.user_id))) && String(session.updated_at || "") < inactiveBefore)
+        .map((session) => sessionKey(session.user_id, session.device_id, session.session_id)));
+      if (staleSessions.size) {
+        for (const [key, turn] of [...this.turns.entries()]) {
+          if (staleSessions.has(sessionKey(turn.user_id, turn.device_id, turn.session_id))) {
+            markAffected(turn);
+            this.turns.delete(key);
+          }
+        }
+      }
+    }
+    if (perSession > 0) {
+      const groups = new Map();
+      for (const turn of this.turns.values()) {
+        if (userIDs.size && !userIDs.has(String(turn.user_id))) continue;
+        const key = sessionKey(turn.user_id, turn.device_id, turn.session_id);
+        if (sessionKeys.size && !sessionKeys.has(key)) continue;
+        const group = groups.get(key) || [];
+        group.push(turn);
+        groups.set(key, group);
+      }
+      for (const group of groups.values()) {
+        group.sort((left, right) => Number(left.seq) - Number(right.seq));
+        for (const turn of group.slice(0, Math.max(0, group.length - perSession))) {
+          markAffected(turn);
+          this.turns.delete(turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq));
+        }
+      }
+    }
+    if (perUser > 0) {
+      const groups = new Map();
+      const sessionUpdatedAt = new Map([...this.sessions.values()].map((session) => [
+        sessionKey(session.user_id, session.device_id, session.session_id),
+        session.updated_at,
+      ]));
+      for (const turn of this.turns.values()) {
+        if (userIDs.size && !userIDs.has(String(turn.user_id))) continue;
+        const key = sessionKey(turn.user_id, turn.device_id, turn.session_id);
+        const group = groups.get(turn.user_id) || [];
+        group.push({ ...turn, session_updated_at: sessionUpdatedAt.get(key) || turn.updated_at });
+        groups.set(turn.user_id, group);
+      }
+      for (const group of groups.values()) {
+        group.sort(compareTurnsForHotCachePrune);
+        for (const turn of group.slice(0, Math.max(0, group.length - perUser))) {
+          markAffected(turn);
+          this.turns.delete(turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq));
+        }
+      }
+    }
+    return [...affected.values()];
+  }
+
   async listExistingTurnPayloads(turns = []) {
     const out = new Map();
     for (const turn of turns) {
@@ -399,6 +535,28 @@ export class InMemoryNexusStore {
       if (existing?.payload !== undefined) out.set(key, existing.payload);
     }
     return out;
+  }
+
+  async listTurnPayloadsForWindow(userID, deviceID, sessionID, minSeq, maxSeq) {
+    const min = Number(minSeq) || 0;
+    const max = Number(maxSeq) || 0;
+    if (min <= 0 || max < min) return [];
+    return [...this.turns.values()]
+      .filter((turn) =>
+        turn.user_id === userID &&
+        turn.device_id === deviceID &&
+        turn.session_id === sessionID &&
+        Number(turn.seq ?? 0) >= min &&
+        Number(turn.seq ?? 0) <= max)
+      .sort((left, right) => Number(left.seq) - Number(right.seq))
+      .map((turn) => ({
+        session_id: turn.session_id,
+        seq: turn.seq,
+        agent: turn.agent,
+        kind: turn.kind,
+        timestamp: turn.timestamp,
+        payload: turn.payload,
+      }));
   }
 
   async listTurnPayloadPointers(userID, deviceID, sessionIDs = []) {
@@ -410,6 +568,9 @@ export class InMemoryNexusStore {
       .map((turn) => ({
         session_id: turn.session_id,
         seq: turn.seq,
+        agent: turn.agent,
+        kind: turn.kind,
+        timestamp: turn.timestamp,
         payload: turn.payload,
       }));
   }
@@ -456,8 +617,13 @@ export class InMemoryNexusStore {
 
   async listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit) {
     const after = Number(afterSeq) || 0;
-    return (await this.listTurns(userID, deviceID, sessionID))
-      .filter((turn) => Number(turn.seq) > after)
+    return [...this.turns.values()]
+      .filter((turn) =>
+        turn.user_id === userID &&
+        turn.device_id === deviceID &&
+        turn.session_id === sessionID &&
+        Number(turn.seq) > after)
+      .sort((left, right) => Number(left.seq) - Number(right.seq))
       .slice(0, clampLimit(limit, 100));
   }
 
@@ -468,10 +634,25 @@ export class InMemoryNexusStore {
       payload: typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload ?? {}),
     };
     this.sessionEvents.push(next);
-    if (this.sessionEvents.length > 5000) {
-      this.sessionEvents.splice(0, this.sessionEvents.length - 5000);
-    }
+    this.pruneInMemorySessionEvents(next.user_id, next.device_id, next.session_id);
     return next;
+  }
+
+  pruneInMemorySessionEvents(userID, deviceID, sessionID) {
+    const forSession = this.sessionEvents
+      .filter((event) => event.user_id === userID && event.device_id === deviceID && event.session_id === sessionID)
+      .sort((left, right) => String(right.event_id).localeCompare(String(left.event_id)));
+    const keepSession = new Set(forSession.slice(0, maxSessionEventsPerSession).map((event) => event.event_id));
+    this.sessionEvents = this.sessionEvents.filter((event) =>
+      event.user_id !== userID ||
+      event.device_id !== deviceID ||
+      event.session_id !== sessionID ||
+      keepSession.has(event.event_id));
+    const forUser = this.sessionEvents
+      .filter((event) => event.user_id === userID)
+      .sort((left, right) => String(right.event_id).localeCompare(String(left.event_id)));
+    const keepUser = new Set(forUser.slice(0, maxSessionEventsPerUser).map((event) => event.event_id));
+    this.sessionEvents = this.sessionEvents.filter((event) => event.user_id !== userID || keepUser.has(event.event_id));
   }
 
   async listSessionEvents(userID, deviceID, sessionID, options = {}) {
@@ -684,6 +865,27 @@ export class SQLNexusStore {
       SELECT * FROM devices WHERE user_id = ? ORDER BY updated_at DESC
     `).bind(userID).all();
     return (result.results ?? []).map(normalizeDeviceRow);
+  }
+
+  async countSessionsByDeviceForUser(userID, deviceIDs = []) {
+    const ids = [...new Set(deviceIDs.map((id) => String(id)).filter(Boolean))];
+    if (ids.length === 0) return new Map();
+    const out = new Map();
+    const CHUNK = 100;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const chunk = ids.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = await this.db.prepare(`
+        SELECT device_id, COUNT(*) AS session_count
+        FROM sessions
+        WHERE user_id = ? AND device_id IN (${placeholders})
+        GROUP BY device_id
+      `).bind(userID, ...chunk).all();
+      for (const row of result.results ?? []) {
+        out.set(String(row.device_id || ""), Number(row.session_count ?? row.count ?? 0) || 0);
+      }
+    }
+    return out;
   }
 
   async patchDevice(userID, deviceID, patch) {
@@ -1043,7 +1245,7 @@ export class SQLNexusStore {
     if (!deduped.length) return;
     // The default keeps the batch below SQLite's conservative 999
     // bind-parameter floor: sessions has 21 columns, so 40 rows => 840
-    // parameters. Managed runtimes with stricter limits can lower this via
+    // parameters. Runtime adapters with stricter limits can lower this via
     // the constructor without changing the sync path.
     const CHUNK = this.sessionUpsertBatchSize;
     for (let i = 0; i < deduped.length; i += CHUNK) {
@@ -1138,8 +1340,37 @@ export class SQLNexusStore {
 
   async listSessionsForUser(userID) {
     const result = await this.db.prepare(`
-      SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC
+      SELECT * FROM sessions WHERE user_id = ? ORDER BY updated_at DESC, device_id ASC, session_id ASC
     `).bind(userID).all();
+    return (result.results ?? []).map(normalizeSessionRow);
+  }
+
+  async listSessionCatalogPage(userID, options = {}) {
+    const limit = clampLimit(options.limit, 100);
+    const after = options.after ?? null;
+    const result = after
+      ? await this.db.prepare(`
+          SELECT * FROM sessions
+          WHERE user_id = ?
+            AND (
+              updated_at < ?
+              OR (
+                updated_at = ?
+                AND (
+                  device_id > ?
+                  OR (device_id = ? AND session_id > ?)
+                )
+              )
+            )
+          ORDER BY updated_at DESC, device_id ASC, session_id ASC
+          LIMIT ?
+        `).bind(userID, after.updated_at, after.updated_at, after.device_id, after.device_id, after.session_id, limit).all()
+      : await this.db.prepare(`
+          SELECT * FROM sessions
+          WHERE user_id = ?
+          ORDER BY updated_at DESC, device_id ASC, session_id ASC
+          LIMIT ?
+        `).bind(userID, limit).all();
     return (result.results ?? []).map(normalizeSessionRow);
   }
 
@@ -1148,6 +1379,91 @@ export class SQLNexusStore {
       SELECT * FROM sessions WHERE user_id = ? AND device_id = ? ORDER BY updated_at DESC
     `).bind(userID, deviceID).all();
     return (result.results ?? []).map(normalizeSessionRow);
+  }
+
+  async appendSessionCatalogChange(change) {
+    const row = normalizeSessionCatalogChange(change);
+    await this._appendSessionCatalogChangeStatement(row).run();
+    await this.pruneSessionCatalogChangesIfDue(row.user_id);
+    return row;
+  }
+
+  async appendSessionCatalogChanges(changes = []) {
+    if (!changes.length) return [];
+    const out = [];
+    const userIDs = new Set();
+    for (const change of changes) {
+      const row = normalizeSessionCatalogChange(change);
+      await this._appendSessionCatalogChangeStatement(row).run();
+      out.push(row);
+      if (row.user_id) userIDs.add(row.user_id);
+    }
+    for (const userID of userIDs) await this.pruneSessionCatalogChangesIfDue(userID);
+    return out;
+  }
+
+  _appendSessionCatalogChangeStatement(change) {
+    return this.db.prepare(`
+      INSERT INTO session_catalog_changes (change_id, user_id, device_id, session_id, change_type, session_row, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      change.change_id,
+      change.user_id,
+      change.device_id,
+      change.session_id,
+      change.change_type,
+      change.session_row,
+      change.created_at,
+    );
+  }
+
+  async listSessionCatalogChanges(userID, options = {}) {
+    const since = String(options.since ?? "");
+    const limit = clampLimit(options.limit, 100);
+    const result = await this.db.prepare(`
+      SELECT * FROM session_catalog_changes
+      WHERE user_id = ? AND change_id > ?
+      ORDER BY change_id ASC
+      LIMIT ?
+    `).bind(userID, since, limit).all();
+    return result.results ?? [];
+  }
+
+  async currentSessionCatalogCursor(userID) {
+    return (await this.sessionCatalogCursorBounds(userID)).latest;
+  }
+
+  async sessionCatalogCursorBounds(userID) {
+    const row = await this.db.prepare(`
+      SELECT MIN(change_id) AS oldest, MAX(change_id) AS latest
+      FROM session_catalog_changes
+      WHERE user_id = ?
+    `).bind(userID).first();
+    return {
+      oldest: String(row?.oldest || ""),
+      latest: String(row?.latest || "") || emptyCatalogChangeCursor(),
+    };
+  }
+
+  async pruneSessionCatalogChanges(userID) {
+    await this.db.prepare(`
+      DELETE FROM session_catalog_changes
+      WHERE user_id = ?
+        AND change_id NOT IN (
+          SELECT change_id FROM session_catalog_changes
+          WHERE user_id = ?
+          ORDER BY change_id DESC
+          LIMIT 10000
+        )
+    `).bind(userID, userID).run();
+  }
+
+  async pruneSessionCatalogChangesIfDue(userID, now = Date.now()) {
+    this.sessionCatalogPruneByUser ??= new Map();
+    const last = this.sessionCatalogPruneByUser.get(userID) ?? 0;
+    if (now - last < 60_000) return;
+    this.sessionCatalogPruneByUser.set(userID, now);
+    await this.pruneSessionCatalogChanges(userID);
   }
 
   async listDeviceSessionSyncSnapshots(userID, deviceID) {
@@ -1357,6 +1673,143 @@ export class SQLNexusStore {
     }
   }
 
+  async pruneHotTurnCache(options = {}) {
+    const perSession = positiveInteger(options.perSession ?? options.per_session, 0);
+    const perUser = positiveInteger(options.perUser ?? options.per_user, 0);
+    const inactiveBefore = String(options.inactiveBefore ?? options.inactive_before ?? "");
+    const userIDs = [...new Set((options.userIDs ?? options.user_ids ?? []).map((id) => String(id)).filter(Boolean))];
+    const sessionKeys = parseSessionKeys(options.sessionKeys ?? options.session_keys ?? []);
+    const affected = new Map();
+    const addAffectedRows = (rows = []) => {
+      for (const row of rows) {
+        const key = sessionKey(row.user_id, row.device_id, row.session_id);
+        affected.set(key, {
+          user_id: row.user_id,
+          device_id: row.device_id,
+          session_id: row.session_id,
+        });
+      }
+    };
+    if (inactiveBefore) {
+      const userClause = userIDs.length ? `AND user_id IN (${userIDs.map(() => "?").join(", ")})` : "";
+      const stale = await this.db.prepare(`
+        SELECT user_id, device_id, session_id
+        FROM session_turns
+        WHERE (user_id, device_id, session_id) IN (
+          SELECT user_id, device_id, session_id
+          FROM sessions
+          WHERE updated_at < ?
+          ${userClause}
+        )
+        GROUP BY user_id, device_id, session_id
+      `).bind(inactiveBefore, ...userIDs).all();
+      addAffectedRows(stale.results ?? []);
+      await this.db.prepare(`
+        DELETE FROM session_turns
+        WHERE (user_id, device_id, session_id) IN (
+          SELECT user_id, device_id, session_id
+          FROM sessions
+          WHERE updated_at < ?
+          ${userClause}
+        )
+      `).bind(inactiveBefore, ...userIDs).run();
+    }
+    if (perSession > 0) {
+      const scoped = sessionScopeSQL("session_turns", { userIDs, sessionKeys });
+      const clauses = scoped.where ? `WHERE ${scoped.where}` : "";
+      const stale = await this.db.prepare(`
+        SELECT user_id, device_id, session_id
+        FROM (
+          SELECT
+            user_id,
+            device_id,
+            session_id,
+            seq,
+            ROW_NUMBER() OVER (
+              PARTITION BY user_id, device_id, session_id
+              ORDER BY seq DESC
+            ) AS rn
+          FROM session_turns
+          ${clauses}
+        )
+        WHERE rn > ?
+        GROUP BY user_id, device_id, session_id
+      `).bind(...scoped.binds, perSession).all();
+      addAffectedRows(stale.results ?? []);
+      await this.db.prepare(`
+        DELETE FROM session_turns
+        WHERE (user_id, device_id, session_id, seq) IN (
+          SELECT user_id, device_id, session_id, seq
+          FROM (
+            SELECT
+              user_id,
+              device_id,
+              session_id,
+              seq,
+              ROW_NUMBER() OVER (
+                PARTITION BY user_id, device_id, session_id
+                ORDER BY seq DESC
+              ) AS rn
+            FROM session_turns
+            ${clauses}
+          )
+          WHERE rn > ?
+        )
+      `).bind(...scoped.binds, perSession).run();
+    }
+    if (perUser > 0) {
+      const clauses = userIDs.length ? `WHERE turns.user_id IN (${userIDs.map(() => "?").join(", ")})` : "";
+      const stale = await this.db.prepare(`
+        SELECT user_id, device_id, session_id
+        FROM (
+          SELECT
+            turns.user_id,
+            turns.device_id,
+            turns.session_id,
+            turns.seq,
+            ROW_NUMBER() OVER (
+              PARTITION BY turns.user_id
+              ORDER BY COALESCE(sessions.updated_at, turns.updated_at) DESC, turns.seq DESC
+            ) AS rn
+          FROM session_turns turns
+          LEFT JOIN sessions
+            ON sessions.user_id = turns.user_id
+           AND sessions.device_id = turns.device_id
+           AND sessions.session_id = turns.session_id
+          ${clauses}
+        )
+        WHERE rn > ?
+        GROUP BY user_id, device_id, session_id
+      `).bind(...userIDs, perUser).all();
+      addAffectedRows(stale.results ?? []);
+      await this.db.prepare(`
+        DELETE FROM session_turns
+        WHERE (user_id, device_id, session_id, seq) IN (
+          SELECT user_id, device_id, session_id, seq
+          FROM (
+            SELECT
+              turns.user_id,
+              turns.device_id,
+              turns.session_id,
+              turns.seq,
+              ROW_NUMBER() OVER (
+                PARTITION BY turns.user_id
+                ORDER BY COALESCE(sessions.updated_at, turns.updated_at) DESC, turns.seq DESC
+              ) AS rn
+            FROM session_turns turns
+            LEFT JOIN sessions
+              ON sessions.user_id = turns.user_id
+             AND sessions.device_id = turns.device_id
+             AND sessions.session_id = turns.session_id
+            ${clauses}
+          )
+          WHERE rn > ?
+        )
+      `).bind(...userIDs, perUser).run();
+    }
+    return [...affected.values()];
+  }
+
   async listExistingTurnPayloads(turns = []) {
     const deduped = dedupeTurnRows(turns);
     if (!deduped.length) return new Map();
@@ -1392,6 +1845,19 @@ export class SQLNexusStore {
     return out;
   }
 
+  async listTurnPayloadsForWindow(userID, deviceID, sessionID, minSeq, maxSeq) {
+    const min = Number(minSeq) || 0;
+    const max = Number(maxSeq) || 0;
+    if (min <= 0 || max < min) return [];
+    const result = await this.db.prepare(`
+      SELECT session_id, seq, agent, kind, timestamp, payload
+      FROM session_turns
+      WHERE user_id = ? AND device_id = ? AND session_id = ? AND seq >= ? AND seq <= ?
+      ORDER BY seq ASC
+    `).bind(userID, deviceID, sessionID, min, max).all();
+    return result.results ?? [];
+  }
+
   async listTurnPayloadPointers(userID, deviceID, sessionIDs = []) {
     const ids = [...new Set(sessionIDs.map((id) => String(id)).filter(Boolean))];
     if (!ids.length) return [];
@@ -1400,7 +1866,7 @@ export class SQLNexusStore {
       const chunk = ids.slice(i, i + this.turnUpsertBatchSize);
       const placeholders = chunk.map(() => "?").join(", ");
       const result = await this.db.prepare(`
-        SELECT session_id, seq, payload
+        SELECT session_id, seq, agent, kind, timestamp, payload
         FROM session_turns
         WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
         ORDER BY session_id ASC, seq ASC
@@ -1583,11 +2049,29 @@ export class SQLNexusStore {
     await this.db.prepare(`
       DELETE FROM session_events
       WHERE user_id = ?
+        AND event_id IN (
+          SELECT event_id
+          FROM (
+            SELECT
+              event_id,
+              ROW_NUMBER() OVER (
+                PARTITION BY user_id, device_id, session_id
+                ORDER BY event_id DESC
+              ) AS rn
+            FROM session_events
+            WHERE user_id = ?
+          )
+          WHERE rn > ${maxSessionEventsPerSession}
+        )
+    `).bind(userID, userID).run();
+    await this.db.prepare(`
+      DELETE FROM session_events
+      WHERE user_id = ?
         AND event_id NOT IN (
           SELECT event_id FROM session_events
           WHERE user_id = ?
           ORDER BY event_id DESC
-          LIMIT 5000
+          LIMIT ${maxSessionEventsPerUser}
         )
     `).bind(userID, userID).run();
   }
@@ -1698,6 +2182,36 @@ export const InMemoryRelayStore = InMemoryNexusStore;
 
 function sessionKey(userID, deviceID, sessionID) {
   return `${userID}\x00${deviceID}\x00${sessionID}`;
+}
+
+function parseSessionKeys(keys = []) {
+  const out = [];
+  const seen = new Set();
+  for (const key of keys) {
+    const parts = String(key || "").split("\x00");
+    if (parts.length !== 3 || parts.some((part) => !part)) continue;
+    const normalized = sessionKey(parts[0], parts[1], parts[2]);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push({ user_id: parts[0], device_id: parts[1], session_id: parts[2] });
+  }
+  return out;
+}
+
+function sessionScopeSQL(tableAlias, options = {}) {
+  const prefix = tableAlias ? `${tableAlias}.` : "";
+  const clauses = [];
+  const binds = [];
+  const userIDs = options.userIDs ?? [];
+  const sessionKeys = options.sessionKeys ?? [];
+  if (sessionKeys.length) {
+    clauses.push(`(${sessionKeys.map(() => `(${prefix}user_id = ? AND ${prefix}device_id = ? AND ${prefix}session_id = ?)`).join(" OR ")})`);
+    for (const key of sessionKeys) binds.push(key.user_id, key.device_id, key.session_id);
+  } else if (userIDs.length) {
+    clauses.push(`${prefix}user_id IN (${userIDs.map(() => "?").join(", ")})`);
+    binds.push(...userIDs);
+  }
+  return { where: clauses.join(" AND "), binds };
 }
 
 function bindingKey(daemonDeviceID, browserDeviceID) {
@@ -1839,8 +2353,67 @@ function eventID() {
   const millis = String(Date.now()).padStart(13, "0");
   nextEventCounter = (nextEventCounter + 1) % 1_000_000;
   const suffix = String(nextEventCounter).padStart(6, "0");
-  const random = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
+  const random = cursorRandomSuffix();
   return `ev_${millis}_${suffix}_${random}`;
+}
+
+function catalogChangeID() {
+  const millis = String(Date.now()).padStart(13, "0");
+  nextEventCounter = (nextEventCounter + 1) % 1_000_000;
+  const suffix = String(nextEventCounter).padStart(6, "0");
+  const random = cursorRandomSuffix();
+  return `sc_${millis}_${suffix}_${random}`;
+}
+
+function cursorRandomSuffix() {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") {
+    return webCrypto.randomUUID().replaceAll("-", "").slice(0, 12);
+  }
+  if (typeof webCrypto?.getRandomValues === "function") {
+    const bytes = new Uint8Array(6);
+    webCrypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+  return `${Date.now().toString(36)}${nextEventCounter.toString(36)}`.slice(0, 12).padEnd(12, "0");
+}
+
+function normalizeSessionCatalogChange(change) {
+  return {
+    ...change,
+    change_id: change.change_id || catalogChangeID(),
+    session_row: typeof change.session_row === "string" || change.session_row == null
+      ? change.session_row ?? null
+      : JSON.stringify(change.session_row),
+  };
+}
+
+function emptyCatalogChangeCursor() {
+  return "sc_0000000000000_000000_000000";
+}
+
+function compareSessionCatalogRows(left, right) {
+  const updatedDiff = String(right.updated_at || "").localeCompare(String(left.updated_at || ""));
+  if (updatedDiff !== 0) return updatedDiff;
+  const deviceDiff = String(left.device_id || "").localeCompare(String(right.device_id || ""));
+  if (deviceDiff !== 0) return deviceDiff;
+  return String(left.session_id || "").localeCompare(String(right.session_id || ""));
+}
+
+function sessionCatalogRowAfterCursor(session, cursor) {
+  const row = {
+    updated_at: String(session.updated_at || ""),
+    device_id: String(session.device_id || ""),
+    session_id: String(session.session_id || ""),
+  };
+  const after = {
+    updated_at: String(cursor.updated_at || ""),
+    device_id: String(cursor.device_id || ""),
+    session_id: String(cursor.session_id || ""),
+  };
+  if (row.updated_at !== after.updated_at) return row.updated_at < after.updated_at;
+  if (row.device_id !== after.device_id) return row.device_id > after.device_id;
+  return row.session_id > after.session_id;
 }
 
 function shouldPersistDeviceTouch(previous, next) {
@@ -1904,6 +2477,16 @@ function filterTurnWindow(turns, options = {}) {
     out = out.slice(-clampLimit(limit, 100));
   }
   return out;
+}
+
+function compareTurnsForHotCachePrune(left, right) {
+  const leftUpdated = Date.parse(left.session_updated_at || left.updated_at || "") || 0;
+  const rightUpdated = Date.parse(right.session_updated_at || right.updated_at || "") || 0;
+  if (leftUpdated !== rightUpdated) return leftUpdated - rightUpdated;
+  const leftSeq = Number(left.seq ?? 0) || 0;
+  const rightSeq = Number(right.seq ?? 0) || 0;
+  if (leftSeq !== rightSeq) return leftSeq - rightSeq;
+  return String(left.session_id).localeCompare(String(right.session_id));
 }
 
 function sessionUpsertValues(session) {

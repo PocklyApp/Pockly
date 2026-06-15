@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,7 +14,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +94,93 @@ func TestSyncTelemetryMetricsCarriesLowCardinalityCounters(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("syncTelemetryMetrics() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSyncRequestSerializesEmptyKnownWindowSessionIDs(t *testing.T) {
+	ids := []string{}
+	raw, err := json.Marshal(pair.SyncRequest{
+		Hello:                 pair.HelloMessage{DeviceID: "dd_test"},
+		Sessions:              []pair.SyncSession{},
+		KnownWindowSessionIDs: &ids,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"known_window_session_ids":[]`) {
+		t.Fatalf("known_window_session_ids empty slice was not serialized: %s", raw)
+	}
+}
+
+func TestShouldProbeKnownWindowsOnlyWhenProbeCanAvoidUpload(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	ids := []string{"active", "hinted"}
+	lastHistory := map[string]string{"active": "sig"}
+	hints := map[string]syncHint{"hinted": {Reason: "recently_opened"}}
+
+	if !shouldProbeKnownWindows(ids, hints, lastHistory, map[string]time.Time{}, now, time.Minute) {
+		t.Fatal("expected probe when a hinted session has no server hash and no local signature")
+	}
+	if !shouldProbeKnownWindows([]string{"active"}, nil, map[string]string{}, map[string]time.Time{}, now, time.Minute) {
+		t.Fatal("expected probe after daemon restart when local lastHistorySync is empty")
+	}
+	if shouldProbeKnownWindows([]string{"active"}, nil, lastHistory, map[string]time.Time{}, now, time.Minute) {
+		t.Fatal("did not expect probe when local signature already proves the window was uploaded")
+	}
+	if shouldProbeKnownWindows([]string{"active"}, nil, map[string]string{}, map[string]time.Time{"active": now.Add(-10 * time.Second)}, now, time.Minute) {
+		t.Fatal("did not expect probe inside the known-window probe floor")
+	}
+}
+
+func TestProbeKnownWindowsSendsMetadataOnlySync(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seen pair.SyncRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_probe",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			if err := json.NewDecoder(r.Body).Decode(&seen); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{
+				OK: true,
+				KnownWindows: []pair.SyncKnownWindow{{
+					SessionID:       "sess_probe",
+					SyncedMinSeq:    41,
+					SyncedMaxSeq:    60,
+					SyncedTurnCount: 20,
+					WindowHash:      "sha256:probe",
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	got := probeKnownWindows(context.Background(), pair.NewClient(srv.URL), identity, []string{"sess_probe"})
+	if len(seen.Sessions) != 0 || len(seen.Turns) != 0 || seen.KnownWindowSessionIDs == nil || strings.Join(*seen.KnownWindowSessionIDs, ",") != "sess_probe" {
+		t.Fatalf("probe request = %+v, want metadata-only known-window sync", seen)
+	}
+	if got["sess_probe"].WindowHash != "sha256:probe" || got["sess_probe"].SyncedMinSeq != 41 || got["sess_probe"].SyncedMaxSeq != 60 {
+		t.Fatalf("probeKnownWindows = %+v", got)
 	}
 }
 
@@ -335,6 +425,825 @@ func TestHistorySyncSignatureTracksTurnsWhenCatalogSignatureIsStable(t *testing.
 	}
 }
 
+func TestHintMatchesWindowHashRequiresRangeAndHash(t *testing.T) {
+	req := pair.SyncRequest{
+		Sessions: []pair.SyncSession{{
+			SessionID:  "sid_hash",
+			MinSeq:     41,
+			MaxSeq:     60,
+			WindowHash: "sha256:abc",
+		}},
+	}
+	if !hintMatchesWindowHash(syncHint{SyncedMinSeq: 41, SyncedMaxSeq: 60, WindowHash: "sha256:abc"}, req) {
+		t.Fatal("matching range/hash should skip upload")
+	}
+	if hintMatchesWindowHash(syncHint{SyncedMinSeq: 40, SyncedMaxSeq: 60, WindowHash: "sha256:abc"}, req) {
+		t.Fatal("different min seq must not skip upload")
+	}
+	if hintMatchesWindowHash(syncHint{SyncedMinSeq: 41, SyncedMaxSeq: 60, WindowHash: "sha256:other"}, req) {
+		t.Fatal("different hash must not skip upload")
+	}
+	if hintMatchesWindowHash(syncHint{SyncedMinSeq: 41, SyncedMaxSeq: 60}, req) {
+		t.Fatal("missing hash must not skip upload")
+	}
+}
+
+func TestShouldSkipWindowUploadUsesLocalSignatureForRepeatedHintedWindow(t *testing.T) {
+	req := pair.SyncRequest{
+		Sessions: []pair.SyncSession{{
+			SessionID:     "sid_hint",
+			LastTimestamp: "2026-06-12T09:59:00Z",
+			TurnCount:     60,
+			MinSeq:        41,
+			MaxSeq:        60,
+			WindowHash:    "sha256:current",
+		}},
+		Turns: []pair.SyncTurn{{
+			SessionID: "sid_hint",
+			Seq:       60,
+			Agent:     "claude-code",
+			Kind:      "assistant_text",
+			Timestamp: "2026-06-12T10:00:00Z",
+			Payload:   json.RawMessage(`{"text":"current"}`),
+		}},
+	}
+	lastSignature := historySyncSignature(req)
+	if !shouldSkipWindowUpload(false, syncHint{}, nil, "sid_hint", req, lastSignature) {
+		t.Fatal("unhinted matching local signature should skip upload")
+	}
+	if !shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", req, lastSignature) {
+		t.Fatal("hinted session with matching local signature should skip repeated upload")
+	}
+	metadataOnlyChange := req
+	metadataOnlyChange.Sessions = []pair.SyncSession{req.Sessions[0]}
+	metadataOnlyChange.Sessions[0].LastTimestamp = "2026-06-12T10:01:00Z"
+	metadataOnlyChange.Sessions[0].ChannelLastSeenAt = "2026-06-12T10:01:00Z"
+	metadataOnlyChange.Sessions[0].TurnCount = 61
+	metadataOnlyChange.Sessions[0].LastSeq = 61
+	if historySyncSignature(metadataOnlyChange) != lastSignature {
+		t.Fatal("window signature should ignore catalog-only metadata changes")
+	}
+	if !shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", metadataOnlyChange, lastSignature) {
+		t.Fatal("metadata-only catalog changes must not re-upload an unchanged hot window")
+	}
+	if shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", req, "") {
+		t.Fatal("hinted session without local signature should upload the first window")
+	}
+	if !shouldSkipWindowUpload(true, syncHint{SyncedMinSeq: 41, SyncedMaxSeq: 60, WindowHash: "sha256:current"}, nil, "sid_hint", req, lastSignature) {
+		t.Fatal("hinted matching server hash should skip upload")
+	}
+	if !shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, map[string]syncHint{
+		"sid_hint": {SyncedMinSeq: 41, SyncedMaxSeq: 60, WindowHash: "sha256:current"},
+	}, "sid_hint", req, lastSignature) {
+		t.Fatal("known window matching server hash should skip upload")
+	}
+	if shouldSkipWindowUpload(false, syncHint{}, map[string]syncHint{
+		"sid_hint": {SyncedMinSeq: 41, SyncedMaxSeq: 60, WindowHash: "sha256:stale"},
+	}, "sid_hint", req, lastSignature) {
+		t.Fatal("mismatched known server window must force upload even when local signature matches")
+	}
+	if !shouldSkipWindowUpload(false, syncHint{}, map[string]syncHint{
+		"sid_hint": {SyncedMinSeq: 40, SyncedMaxSeq: 60, WindowHash: "sha256:current"},
+	}, "sid_hint", req, lastSignature) {
+		t.Fatal("known server tail that covers the local hot window should skip upload")
+	}
+	if !shouldSkipWindowUpload(false, syncHint{}, map[string]syncHint{
+		"sid_hint": {SyncedMinSeq: 21, SyncedMaxSeq: 60, WindowHash: "sha256:larger-tail"},
+	}, "sid_hint", req, "") {
+		t.Fatal("known server window covering local hot window should skip upload without local signature")
+	}
+	if shouldSkipWindowUpload(false, syncHint{}, map[string]syncHint{
+		"sid_hint": {SyncedMinSeq: 21, SyncedMaxSeq: 59, WindowHash: "sha256:partial-tail"},
+	}, "sid_hint", req, lastSignature) {
+		t.Fatal("known server window that does not cover local max seq must force upload")
+	}
+}
+
+func TestTrimKnownUploadedTurnsKeepsOnlyNewTail(t *testing.T) {
+	req := pair.SyncRequest{
+		Sessions: []pair.SyncSession{{
+			SessionID:  "sid_tail",
+			MinSeq:     81,
+			MaxSeq:     100,
+			WindowHash: "sha256:local",
+		}},
+	}
+	for seq := 81; seq <= 100; seq++ {
+		req.Turns = append(req.Turns, pair.SyncTurn{
+			SessionID: "sid_tail",
+			Seq:       seq,
+			Agent:     "claude-code",
+			Kind:      "assistant_text",
+			Payload:   json.RawMessage(fmt.Sprintf(`{"seq":%d}`, seq)),
+		})
+	}
+
+	trimmed := trimKnownUploadedTurns(req, syncHint{SyncedMinSeq: 1, SyncedMaxSeq: 97, SyncedTurnCount: 97})
+	if len(trimmed.Turns) != 3 {
+		t.Fatalf("trimmed turns = %d, want 3", len(trimmed.Turns))
+	}
+	if trimmed.Turns[0].Seq != 98 || trimmed.Turns[2].Seq != 100 {
+		t.Fatalf("trimmed seq range = %d..%d, want 98..100", trimmed.Turns[0].Seq, trimmed.Turns[2].Seq)
+	}
+	if len(trimmed.Sessions) != 1 || trimmed.Sessions[0].MinSeq != 81 || trimmed.Sessions[0].MaxSeq != 100 {
+		t.Fatalf("session metadata was changed: %+v", trimmed.Sessions)
+	}
+}
+
+func TestTrimKnownUploadedTurnsKeepsDisjointOrCompleteWindow(t *testing.T) {
+	req := pair.SyncRequest{
+		Sessions: []pair.SyncSession{{
+			SessionID: "sid_tail",
+			MinSeq:    81,
+			MaxSeq:    100,
+		}},
+		Turns: []pair.SyncTurn{
+			{SessionID: "sid_tail", Seq: 81},
+			{SessionID: "sid_tail", Seq: 100},
+		},
+	}
+	if got := trimKnownUploadedTurns(req, syncHint{SyncedMaxSeq: 60}); len(got.Turns) != len(req.Turns) {
+		t.Fatalf("disjoint known window should not trim: %+v", got.Turns)
+	}
+	if got := trimKnownUploadedTurns(req, syncHint{SyncedMaxSeq: 100}); len(got.Turns) != len(req.Turns) {
+		t.Fatalf("complete known window should be handled by skip path, not trim: %+v", got.Turns)
+	}
+}
+
+func TestSyncChangedNexusSessionsSkipsUploadWhenHintWindowHashMatches(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_hash_skip",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 100},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windowReq.Sessions) != 1 || windowReq.Sessions[0].WindowHash == "" {
+		t.Fatalf("fixture did not produce window hash: %+v", windowReq.Sessions)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "hash skip")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_hash_skip",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	hints := newPushedHintStore()
+	now := time.Now()
+	hints.Add(sessionID, syncHint{
+		Reason:          "recently_opened",
+		PreferredMin:    100,
+		SyncedTurnCount: meta.TurnCount,
+		SyncedMinSeq:    meta.MinSeq,
+		SyncedMaxSeq:    meta.MaxSeq,
+		NextBeforeSeq:   0,
+		TotalTurnCount:  meta.TurnCount,
+		HasOlderTurns:   meta.HasOlder,
+		WindowHash:      meta.WindowHash,
+	}, now)
+
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     time.Now().UTC().Format(time.RFC3339),
+			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
+			TurnCount:         meta.TurnCount,
+		}},
+		map[string]string{},
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		hints.Snapshot(now),
+		hints,
+		nil,
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 0 || syncedTurns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	}
+	if got := syncPosts.Load(); got != 0 {
+		t.Fatalf("sync POST count = %d, want 0", got)
+	}
+}
+
+func TestSyncChangedNexusSessionsSkipsUploadWhenKnownWindowHashMatches(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_known_skip",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 20},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windowReq.Sessions) != 1 || windowReq.Sessions[0].WindowHash == "" {
+		t.Fatalf("fixture did not produce window hash: %+v", windowReq.Sessions)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "known skip")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_known_skip",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     time.Now().UTC().Format(time.RFC3339),
+			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
+			TurnCount:         meta.TurnCount,
+		}},
+		map[string]string{},
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		nil,
+		newPushedHintStore(),
+		map[string]syncHint{
+			sessionID: {
+				SyncedTurnCount: meta.TurnCount,
+				SyncedMinSeq:    meta.MinSeq,
+				SyncedMaxSeq:    meta.MaxSeq,
+				WindowHash:      meta.WindowHash,
+			},
+		},
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 0 || syncedTurns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	}
+	if got := syncPosts.Load(); got != 0 {
+		t.Fatalf("sync POST count = %d, want 0", got)
+	}
+}
+
+func TestSyncChangedNexusSessionsSkipsUploadWhenKnownServerTailCoversLocalWindow(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_known_cover",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 20},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windowReq.Sessions) != 1 || windowReq.Sessions[0].WindowHash == "" {
+		t.Fatalf("fixture did not produce window hash: %+v", windowReq.Sessions)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "known cover")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_known_cover",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     time.Now().UTC().Format(time.RFC3339),
+			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
+			TurnCount:         meta.TurnCount,
+		}},
+		map[string]string{},
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		nil,
+		newPushedHintStore(),
+		map[string]syncHint{
+			sessionID: {
+				SyncedTurnCount: meta.MaxSeq,
+				SyncedMinSeq:    maxInt(1, meta.MinSeq-20),
+				SyncedMaxSeq:    meta.MaxSeq,
+				WindowHash:      "sha256:larger-contiguous-tail",
+			},
+		},
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 0 || syncedTurns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	}
+	if got := syncPosts.Load(); got != 0 {
+		t.Fatalf("sync POST count = %d, want 0", got)
+	}
+}
+
+func TestDaemonRestartKnownWindowProbeAvoidsWindowReupload(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_probe_restart",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 20},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windowReq.Sessions) != 1 || windowReq.Sessions[0].WindowHash == "" {
+		t.Fatalf("fixture did not produce window hash: %+v", windowReq.Sessions)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "known probe restart")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncPosts atomic.Int64
+	var windowUploads atomic.Int64
+	var probeRequests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_probe_restart",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			var req pair.SyncRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode sync request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if len(req.Turns) > 0 {
+				windowUploads.Add(1)
+			}
+			if req.KnownWindowSessionIDs != nil && len(req.Sessions) == 0 && len(req.Turns) == 0 {
+				probeRequests.Add(1)
+				_ = json.NewEncoder(w).Encode(pair.SyncResponse{
+					OK: true,
+					KnownWindows: []pair.SyncKnownWindow{{
+						SessionID:       sessionID,
+						SyncedTurnCount: meta.TurnCount,
+						SyncedMinSeq:    meta.MinSeq,
+						SyncedMaxSeq:    meta.MaxSeq,
+						WindowHash:      meta.WindowHash,
+					}},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true, SessionCount: len(req.Sessions), TurnCount: len(req.Turns)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	lastHistorySync := map[string]string{}
+	lastProbeAt := map[string]time.Time{}
+	candidates := []pair.SyncSession{{
+		SessionID:         sessionID,
+		Agent:             "claude-code",
+		RunnerAlias:       "claude",
+		Cwd:               meta.Cwd,
+		LastTimestamp:     now.Format(time.RFC3339),
+		ChannelLastSeenAt: now.Format(time.RFC3339),
+		TurnCount:         meta.TurnCount,
+	}}
+	hints := map[string]syncHint{}
+	knownWindowSessionIDs := knownWindowSessionIDsForCatalog(
+		candidates,
+		nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100},
+		hints,
+		now,
+	)
+	if !shouldProbeKnownWindows(knownWindowSessionIDs, hints, lastHistorySync, lastProbeAt, now, time.Minute) {
+		t.Fatal("daemon restart with empty lastHistorySync should probe known windows before uploading")
+	}
+	knownWindows := probeKnownWindows(context.Background(), pair.NewClient(srv.URL), identity, knownWindowSessionIDs)
+	if got := probeRequests.Load(); got != 1 {
+		t.Fatalf("known-window probe requests = %d, want 1", got)
+	}
+	if knownWindows[sessionID].WindowHash != meta.WindowHash {
+		t.Fatalf("known window hash = %q, want %q", knownWindows[sessionID].WindowHash, meta.WindowHash)
+	}
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		candidates,
+		lastHistorySync,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		hints,
+		newPushedHintStore(),
+		knownWindows,
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 0 || syncedTurns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	}
+	if got := windowUploads.Load(); got != 0 {
+		t.Fatalf("window upload requests = %d, want 0", got)
+	}
+	if got := syncPosts.Load(); got != 1 {
+		t.Fatalf("total sync POSTs = %d, want only the metadata probe", got)
+	}
+}
+
+func TestSyncChangedNexusSessionsSkipsRepeatedHintedWindowWhenLocalSignatureMatches(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_hint_resync",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: defaultPriorityTurnLimit},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windowReq.Sessions) != 1 {
+		t.Fatalf("fixture did not produce session metadata: %+v", windowReq.Sessions)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "hint skip repeated")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_hint_resync",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true, SessionCount: 1, TurnCount: len(windowReq.Turns)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	lastHistorySync := map[string]string{sessionID: historySyncSignature(windowReq)}
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     meta.LastTimestamp,
+			ChannelLastSeenAt: meta.ChannelLastSeenAt,
+			TurnCount:         meta.TurnCount,
+		}},
+		lastHistorySync,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		map[string]syncHint{
+			sessionID: {Reason: "recently_opened", PreferredMin: 20},
+		},
+		newPushedHintStore(),
+		nil,
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 0 || syncedTurns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	}
+	if got := syncPosts.Load(); got != 0 {
+		t.Fatalf("sync POST count = %d, want 0", got)
+	}
+}
+
+func TestSyncChangedNexusSessionsUploadsFirstHintedWindowWithoutLocalSignature(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_hint_first",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: defaultPriorityTurnLimit},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windowReq.Sessions) != 1 {
+		t.Fatalf("fixture did not produce session metadata: %+v", windowReq.Sessions)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "hint first upload")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_hint_first",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			var req pair.SyncRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode sync request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			if len(req.Turns) != len(windowReq.Turns) {
+				t.Errorf("turns uploaded = %d, want %d", len(req.Turns), len(windowReq.Turns))
+			}
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true, SessionCount: 1, TurnCount: len(req.Turns)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	lastHistorySync := map[string]string{}
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     meta.LastTimestamp,
+			ChannelLastSeenAt: meta.ChannelLastSeenAt,
+			TurnCount:         meta.TurnCount,
+		}},
+		lastHistorySync,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		map[string]syncHint{
+			sessionID: {Reason: "recently_opened", PreferredMin: 20},
+		},
+		newPushedHintStore(),
+		nil,
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 1 || syncedTurns != len(windowReq.Turns) {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/%d", syncedSessions, syncedTurns, len(windowReq.Turns))
+	}
+	if got := syncPosts.Load(); got != 1 {
+		t.Fatalf("sync POST count = %d, want 1", got)
+	}
+	if lastHistorySync[sessionID] == "" {
+		t.Fatal("first hinted upload should seed local history signature")
+	}
+}
+
+func TestSyncChangedNexusSessionsUploadsOnlyNewTailWhenServerWindowOverlaps(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
+	windowReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_tail_delta",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 20},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := windowReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "tail delta")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadedSeqs []int
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_tail_delta",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			var req pair.SyncRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode sync request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			for _, turn := range req.Turns {
+				uploadedSeqs = append(uploadedSeqs, turn.Seq)
+			}
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true, SessionCount: 1, TurnCount: len(req.Turns)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     time.Now().UTC().Format(time.RFC3339),
+			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
+			TurnCount:         meta.TurnCount,
+		}},
+		map[string]string{},
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		nil,
+		newPushedHintStore(),
+		map[string]syncHint{
+			sessionID: {SyncedMinSeq: 1, SyncedMaxSeq: 57, SyncedTurnCount: 57, WindowHash: "sha256:older"},
+		},
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 1 || syncedTurns != 3 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/3", syncedSessions, syncedTurns)
+	}
+	if got := syncPosts.Load(); got != 1 {
+		t.Fatalf("sync POST count = %d, want 1", got)
+	}
+	if strings.Trim(strings.Join(intsToStrings(uploadedSeqs), ","), ",") != "58,59,60" {
+		t.Fatalf("uploaded seqs = %v, want [58 59 60]", uploadedSeqs)
+	}
+}
+
 func TestCatalogSyncSignatureIgnoresHelloButTracksCatalogChanges(t *testing.T) {
 	req := pair.SyncRequest{
 		Hello:         pair.HelloMessage{DeviceID: "dd_test", Version: "v1"},
@@ -421,10 +1330,10 @@ func TestDefaultNexusSyncPolicyAllowsNeutralOverrides(t *testing.T) {
 	}
 }
 
-func TestSyncHintsPollIntervalDefaultsToLowFrequencyFallback(t *testing.T) {
+func TestSyncHintsPollIntervalDefaultsToDisabledFallback(t *testing.T) {
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "")
-	if got := syncHintsPollInterval(); got != 10*time.Minute {
-		t.Fatalf("syncHintsPollInterval() = %v, want low-frequency fallback", got)
+	if got := syncHintsPollInterval(); got != 0 {
+		t.Fatalf("syncHintsPollInterval() = %v, want disabled by default", got)
 	}
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "10m")
 	if got := syncHintsPollInterval(); got != 10*time.Minute {
@@ -437,6 +1346,98 @@ func TestSyncHintsPollIntervalDefaultsToLowFrequencyFallback(t *testing.T) {
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
 	if got := syncHintsPollInterval(); got != 0 {
 		t.Fatalf("explicit zero syncHintsPollInterval() = %v, want disabled", got)
+	}
+}
+
+func TestNexusSyncHintsDoesNotPollByDefault(t *testing.T) {
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "")
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "sync hints default")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncHintsCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/daemon/sync-hints":
+			syncHintsCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(pair.SyncHintsResponse{
+				Sessions: []pair.SyncSessionHint{{SessionID: "polled", Reason: "opened"}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	got := nexusSyncHints(context.Background(), pair.NewClient(srv.URL), identity, &syncHintCache{}, nil)
+	if len(got) != 0 {
+		t.Fatalf("nexusSyncHints() = %+v, want no hints when polling is disabled by default", got)
+	}
+	if calls := syncHintsCalls.Load(); calls != 0 {
+		t.Fatalf("sync-hints calls = %d, want 0 by default", calls)
+	}
+}
+
+func TestNexusSyncHintsPollsWhenExplicitlyEnabled(t *testing.T) {
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "10m")
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "sync hints opt in")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var syncHintsCalls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_sync_hints",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync-hints":
+			syncHintsCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(pair.SyncHintsResponse{
+				Sessions: []pair.SyncSessionHint{{
+					SessionID:       "polled",
+					Reason:          "recently_opened",
+					PreferredMin:    100,
+					SyncedTurnCount: 20,
+					SyncedMinSeq:    41,
+					SyncedMaxSeq:    60,
+					NextBeforeSeq:   41,
+					TotalTurnCount:  60,
+					HasOlderTurns:   true,
+					WindowHash:      "sha256:polled",
+				}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	got := nexusSyncHints(context.Background(), pair.NewClient(srv.URL), identity, &syncHintCache{}, nil)
+	if calls := syncHintsCalls.Load(); calls != 1 {
+		t.Fatalf("sync-hints calls = %d, want 1 when explicitly enabled", calls)
+	}
+	hint, ok := got["polled"]
+	if !ok {
+		t.Fatalf("nexusSyncHints() = %+v, want polled hint", got)
+	}
+	if hint.Reason != "recently_opened" || hint.PreferredMin != 100 || hint.SyncedMinSeq != 41 || hint.SyncedMaxSeq != 60 || hint.NextBeforeSeq != 41 || !hint.HasOlderTurns || hint.WindowHash != "sha256:polled" {
+		t.Fatalf("polled hint = %+v, want response fields preserved", hint)
 	}
 }
 
@@ -531,6 +1532,45 @@ func TestRecentNexusSessionsIncludesPriorityHintsOutsideWindow(t *testing.T) {
 	want := []string{"pinned_old"}
 	if strings.Join(ids, ",") != strings.Join(want, ",") {
 		t.Fatalf("recentNexusSessions ids = %v, want %v", ids, want)
+	}
+}
+
+func TestKnownWindowSessionIDsForCatalogOnlyRequestsUploadCandidates(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := []pair.SyncSession{
+		{SessionID: "active", LastTimestamp: now.Add(-2 * time.Minute).Format(time.RFC3339)},
+		{SessionID: "old_hint", LastTimestamp: now.Add(-30 * 24 * time.Hour).Format(time.RFC3339)},
+		{SessionID: "old_no_hint", LastTimestamp: now.Add(-31 * 24 * time.Hour).Format(time.RFC3339)},
+	}
+	got := knownWindowSessionIDsForCatalog(
+		sessions,
+		nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100},
+		map[string]syncHint{"old_hint": {Reason: "recently_opened"}},
+		now,
+	)
+	want := []string{"active", "old_hint"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("knownWindowSessionIDsForCatalog = %v, want %v", got, want)
+	}
+}
+
+func TestKnownWindowSessionIDsForCatalogCapsLargeCandidateSets(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := make([]pair.SyncSession, 0, maxNexusHistorySessionsPerTick+4)
+	for i := 0; i < maxNexusHistorySessionsPerTick+4; i++ {
+		sessions = append(sessions, pair.SyncSession{
+			SessionID:     fmt.Sprintf("active_%02d", i),
+			LastTimestamp: now.Add(-time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	got := knownWindowSessionIDsForCatalog(
+		sessions,
+		nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100},
+		nil,
+		now,
+	)
+	if len(got) != maxNexusHistorySessionsPerTick {
+		t.Fatalf("knownWindowSessionIDsForCatalog len = %d, want %d: %v", len(got), maxNexusHistorySessionsPerTick, got)
 	}
 }
 
@@ -879,6 +1919,42 @@ func writeClaudeJSONLForCatalogTest(t *testing.T, dir, sessionID, cwd string, ts
 	if err := os.Chtimes(path, ts, ts); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func relayFixtureIndexWithTurns(t *testing.T, count int) (*index.Index, string) {
+	t.Helper()
+	claudeHome := filepath.Join(t.TempDir(), ".claude", "projects")
+	projectDir := filepath.Join(claudeHome, "-tmp-hash-skip")
+	if err := os.MkdirAll(projectDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := "77777777-7777-7777-7777-777777777777"
+	base := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	lines := make([]string, 0, count)
+	for seq := 1; seq <= count; seq++ {
+		ts := base.Add(time.Duration(seq) * time.Second).Format(time.RFC3339)
+		if seq%2 == 1 {
+			lines = append(lines, fmt.Sprintf(`{"sessionId":%q,"cwd":"/tmp/hash-skip","timestamp":%q,"type":"user","message":{"role":"user","content":%q}}`, sessionID, ts, fmt.Sprintf("user %02d", seq)))
+			continue
+		}
+		lines = append(lines, fmt.Sprintf(`{"sessionId":%q,"cwd":"/tmp/hash-skip","timestamp":%q,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":%q}]}}`, sessionID, ts, fmt.Sprintf("assistant %02d", seq)))
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, sessionID+".jsonl"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idx := index.New(index.Config{ClaudeHome: claudeHome, RefreshInterval: time.Minute})
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	return idx, sessionID
+}
+
+func intsToStrings(values []int) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, strconv.Itoa(value))
+	}
+	return out
 }
 
 func TestPushedHintStoreAddSnapshotAndTTL(t *testing.T) {

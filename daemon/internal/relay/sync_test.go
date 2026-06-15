@@ -142,6 +142,17 @@ func TestBuildSingleSessionSyncRequestEmitsLocalPlaintextTurns(t *testing.T) {
 			t.Fatalf("local turns missing %q: %s", want, raw)
 		}
 	}
+	if got := req.Sessions[0].WindowHash; !strings.HasPrefix(got, "sha256:") {
+		t.Fatalf("window_hash = %q, want sha256 hash", got)
+	}
+
+	req2, err := BuildSingleSessionSyncRequest(idx, "dd_test", "11111111-1111-1111-1111-111111111111", claudeProfile, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Sessions[0].WindowHash != req2.Sessions[0].WindowHash {
+		t.Fatalf("window hash should be stable: %q vs %q", req.Sessions[0].WindowHash, req2.Sessions[0].WindowHash)
+	}
 }
 
 func TestBuildSingleSessionSyncRequestWireShape(t *testing.T) {

@@ -1157,6 +1157,7 @@ func runServe(args []string) (err error) {
 								NextBeforeSeq:   hint.NextBeforeSeq,
 								TotalTurnCount:  hint.TotalTurnCount,
 								HasOlderTurns:   hint.HasOlderTurns,
+								WindowHash:      hint.WindowHash,
 							}, time.Now())
 						},
 						SessionDelete: agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
@@ -2264,6 +2265,7 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 	var lastCatalogPushAt time.Time
 	lastCatalogMembership := ""
 	lastWindowPushAt := map[string]time.Time{}
+	lastKnownWindowProbeAt := map[string]time.Time{}
 	runSync := func() {
 		if !idx.FirstScanComplete() {
 			return
@@ -2297,7 +2299,13 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		signature := catalogSyncSignature(req)
 		membership := catalogMembershipSignature(req.Sessions)
 		now := time.Now()
+		historyCandidates := historySyncCatalogSessions(idx, profile, req)
+		policy := defaultNexusSyncPolicy()
+		hints := nexusSyncHints(ctx, client, id, hintCache, pushedHints)
+		knownWindowSessionIDs := knownWindowSessionIDsForCatalog(historyCandidates, policy, hints, now)
+		req.KnownWindowSessionIDs = &knownWindowSessionIDs
 		var syncMetrics map[string]int64
+		knownWindows := map[string]syncHint{}
 		if (signature == "" || signature != lastCatalogSyncSignature) &&
 			shouldPushCatalog(now, lastCatalogPushAt, catalogMinInterval, membership != lastCatalogMembership) {
 			res, err := client.SyncHistory(id, req)
@@ -2328,13 +2336,18 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 				lastLoggedAt = time.Now()
 			}
 			syncMetrics = syncTelemetryMetrics(res)
+			knownWindows = knownWindowHintsFromSyncResponse(res)
+		} else if shouldProbeKnownWindows(knownWindowSessionIDs, hints, lastHistorySync, lastKnownWindowProbeAt, now, windowMinInterval) {
+			knownWindows = probeKnownWindows(ctx, client, id, knownWindowSessionIDs)
+			for _, sessionID := range knownWindowSessionIDs {
+				lastKnownWindowProbeAt[sessionID] = now
+			}
 		}
 		// Push the default lazy window for changed recent sessions. The
 		// catalog above carries metadata + snippets for every session; this
 		// only uploads the bounded turn window the web reader needs by
 		// default. Older windows are pulled through explicit lazy backfill.
-		historyCandidates := historySyncCatalogSessions(idx, profile, req)
-		if syncedSessions, syncedTurns := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, profile, hintCache, pushedHints, lastWindowPushAt, windowMinInterval); syncedSessions > 0 || syncedTurns > 0 {
+		if syncedSessions, syncedTurns := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, profile, hints, pushedHints, knownWindows, lastWindowPushAt, windowMinInterval); syncedSessions > 0 || syncedTurns > 0 {
 			log.Printf("Nexus history sync ok: sessions=%d turns=%d device=%s", syncedSessions, syncedTurns, id.DeviceID)
 		}
 		// Success telemetry is a liveness signal, not metrics: every 30 minutes
@@ -2468,6 +2481,7 @@ type syncHint struct {
 	NextBeforeSeq   int
 	TotalTurnCount  int
 	HasOlderTurns   bool
+	WindowHash      string
 }
 
 type syncHintCache struct {
@@ -2635,9 +2649,8 @@ func windowSyncMinInterval() time.Duration {
 	return envDuration("POCKLY_WINDOW_SYNC_MIN_INTERVAL", 60*time.Second, 0, time.Hour)
 }
 
-func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hintCache *syncHintCache, pushedHints *pushedHintStore, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) (int, int) {
+func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hints map[string]syncHint, pushedHints *pushedHintStore, knownWindows map[string]syncHint, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) (int, int) {
 	policy := defaultNexusSyncPolicy()
-	hints := nexusSyncHints(ctx, client, id, hintCache, pushedHints)
 	now := time.Now()
 	candidates := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now)
 	if len(candidates) == 0 {
@@ -2650,12 +2663,14 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		if err := ctx.Err(); err != nil {
 			return syncedSessions, syncedTurns
 		}
-		if !shouldPushWindow(now, lastWindowPushAt[session.SessionID], windowMinInterval, pushedHints.PushedWithin(session.SessionID, now, pushedHintFreshFor)) {
+		freshlyHinted := pushedHints != nil && pushedHints.PushedWithin(session.SessionID, now, pushedHintFreshFor)
+		if !shouldPushWindow(now, lastWindowPushAt[session.SessionID], windowMinInterval, freshlyHinted) {
 			continue
 		}
 		limit := policy.InitialTurnLimit
 		beforeSeq := 0
-		if hint, ok := hints[session.SessionID]; ok {
+		hint, hasHint := hints[session.SessionID]
+		if hasHint {
 			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
 			beforeSeq = beforeSeqForHint(hint)
 		}
@@ -2670,8 +2685,25 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 			continue
 		}
 		signature := historySyncSignature(req)
-		if signature == "" || lastHistorySync[session.SessionID] == signature {
+		if signature == "" {
 			lastWindowPushAt[session.SessionID] = now
+			continue
+		}
+		if shouldSkipWindowUpload(hasHint, hint, knownWindows, session.SessionID, req, lastHistorySync[session.SessionID]) {
+			lastHistorySync[session.SessionID] = signature
+			lastWindowPushAt[session.SessionID] = now
+			if hasHint && pushedHints != nil && len(req.Sessions) > 0 {
+				pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
+			}
+			continue
+		}
+		req = trimKnownUploadedTurns(req, knownWindows[strings.TrimSpace(session.SessionID)])
+		if len(req.Turns) == 0 {
+			lastHistorySync[session.SessionID] = signature
+			lastWindowPushAt[session.SessionID] = now
+			if hasHint && pushedHints != nil && len(req.Sessions) > 0 {
+				pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
+			}
 			continue
 		}
 		res, err := client.SyncHistoryContext(ctx, id, req)
@@ -2681,13 +2713,177 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		}
 		lastHistorySync[session.SessionID] = signature
 		lastWindowPushAt[session.SessionID] = now
-		if len(req.Sessions) > 0 {
+		if pushedHints != nil && len(req.Sessions) > 0 {
 			pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
 		}
 		syncedSessions += res.SessionCount
 		syncedTurns += res.TurnCount
 	}
 	return syncedSessions, syncedTurns
+}
+
+func candidateSessionIDs(sessions []pair.SyncSession) []string {
+	out := make([]string, 0, len(sessions))
+	seen := map[string]struct{}{}
+	for _, session := range sessions {
+		sessionID := strings.TrimSpace(session.SessionID)
+		if sessionID == "" {
+			continue
+		}
+		if _, ok := seen[sessionID]; ok {
+			continue
+		}
+		seen[sessionID] = struct{}{}
+		out = append(out, sessionID)
+	}
+	return out
+}
+
+func knownWindowSessionIDsForCatalog(sessions []pair.SyncSession, policy nexusSyncPolicy, hints map[string]syncHint, now time.Time) []string {
+	return candidateSessionIDs(recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now))
+}
+
+func knownWindowHintsFromSyncResponse(res pair.SyncResponse) map[string]syncHint {
+	if len(res.KnownWindows) == 0 {
+		return nil
+	}
+	out := make(map[string]syncHint, len(res.KnownWindows))
+	for _, window := range res.KnownWindows {
+		sessionID := strings.TrimSpace(window.SessionID)
+		if sessionID == "" || strings.TrimSpace(window.WindowHash) == "" {
+			continue
+		}
+		out[sessionID] = syncHint{
+			SyncedTurnCount: window.SyncedTurnCount,
+			SyncedMinSeq:    window.SyncedMinSeq,
+			SyncedMaxSeq:    window.SyncedMaxSeq,
+			WindowHash:      window.WindowHash,
+		}
+	}
+	return out
+}
+
+func probeKnownWindows(ctx context.Context, client *pair.Client, id device.Identity, sessionIDs []string) map[string]syncHint {
+	if len(sessionIDs) == 0 {
+		return nil
+	}
+	req := pair.SyncRequest{
+		Hello: pair.HelloMessage{
+			DeviceID: id.DeviceID,
+			Version:  version.String(),
+		},
+		KnownWindowSessionIDs: &sessionIDs,
+	}
+	res, err := client.SyncHistoryContext(ctx, id, req)
+	if err != nil {
+		log.Printf("Nexus known-window probe skipped: %v", err)
+		return nil
+	}
+	return knownWindowHintsFromSyncResponse(res)
+}
+
+func shouldProbeKnownWindows(sessionIDs []string, hints map[string]syncHint, lastHistorySync map[string]string, lastProbeAt map[string]time.Time, now time.Time, minInterval time.Duration) bool {
+	for _, rawID := range sessionIDs {
+		sessionID := strings.TrimSpace(rawID)
+		if sessionID == "" {
+			continue
+		}
+		if minInterval > 0 {
+			if last := lastProbeAt[sessionID]; !last.IsZero() && now.Sub(last) < minInterval {
+				continue
+			}
+		}
+		hint, hasHint := hints[sessionID]
+		if lastHistorySync[sessionID] == "" {
+			return true
+		}
+		if hasHint && strings.TrimSpace(hint.WindowHash) == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func knownWindowMatches(known map[string]syncHint, sessionID string, req pair.SyncRequest) bool {
+	if len(known) == 0 {
+		return false
+	}
+	hint, ok := known[strings.TrimSpace(sessionID)]
+	if !ok {
+		return false
+	}
+	return hintMatchesWindowHash(hint, req)
+}
+
+func shouldSkipWindowUpload(hasHint bool, hint syncHint, knownWindows map[string]syncHint, sessionID string, req pair.SyncRequest, lastSignature string) bool {
+	if hasHint && hintMatchesWindowHash(hint, req) {
+		return true
+	}
+	if len(knownWindows) > 0 {
+		if serverWindow, ok := knownWindows[strings.TrimSpace(sessionID)]; ok {
+			// A server-known window is stronger evidence than the daemon's
+			// in-memory lastHistorySync cache. A sparse hot cache can make Nexus
+			// return a larger contiguous tail than the daemon's local hot window;
+			// that still proves the local window is already durable.
+			return hintMatchesWindowHash(serverWindow, req) || knownWindowCoversLocalWindow(serverWindow, req)
+		}
+	}
+	// Hints are demand signals, not permission to re-upload the same durable
+	// hot window forever. If Nexus did not provide contradictory server-window
+	// proof, trust the daemon's local signature after the first upload. A daemon
+	// restart still probes Nexus before reaching this path.
+	return lastSignature != "" && lastSignature == historySyncSignature(req)
+}
+
+func knownWindowCoversLocalWindow(hint syncHint, req pair.SyncRequest) bool {
+	if strings.TrimSpace(hint.WindowHash) == "" || len(req.Sessions) == 0 {
+		return false
+	}
+	session := req.Sessions[0]
+	if session.MinSeq <= 0 || session.MaxSeq <= 0 || hint.SyncedMinSeq <= 0 || hint.SyncedMaxSeq <= 0 {
+		return false
+	}
+	if hint.SyncedMinSeq == session.MinSeq && hint.SyncedMaxSeq == session.MaxSeq {
+		return false
+	}
+	return hint.SyncedMinSeq <= session.MinSeq && hint.SyncedMaxSeq >= session.MaxSeq
+}
+
+func trimKnownUploadedTurns(req pair.SyncRequest, known syncHint) pair.SyncRequest {
+	if len(req.Turns) == 0 || known.SyncedMaxSeq <= 0 || len(req.Sessions) == 0 {
+		return req
+	}
+	session := req.Sessions[0]
+	// Only trim when the server-known durable tail overlaps this local hot
+	// window. If the server range is disjoint or older backfill is in progress,
+	// keep the request intact so Nexus can repair or extend the window.
+	if session.MinSeq <= 0 || session.MaxSeq <= 0 || known.SyncedMaxSeq < session.MinSeq || known.SyncedMaxSeq >= session.MaxSeq {
+		return req
+	}
+	trimmedTurns := make([]pair.SyncTurn, 0, len(req.Turns))
+	for _, turn := range req.Turns {
+		if turn.Seq > known.SyncedMaxSeq {
+			trimmedTurns = append(trimmedTurns, turn)
+		}
+	}
+	if len(trimmedTurns) == len(req.Turns) {
+		return req
+	}
+	req.Turns = trimmedTurns
+	return req
+}
+
+func hintMatchesWindowHash(hint syncHint, req pair.SyncRequest) bool {
+	if strings.TrimSpace(hint.WindowHash) == "" || len(req.Sessions) == 0 {
+		return false
+	}
+	session := req.Sessions[0]
+	if session.MinSeq <= 0 || session.MaxSeq <= 0 {
+		return false
+	}
+	return hint.SyncedMinSeq == session.MinSeq &&
+		hint.SyncedMaxSeq == session.MaxSeq &&
+		hint.WindowHash == session.WindowHash
 }
 
 func beforeSeqForHint(hint syncHint) int {
@@ -2801,6 +2997,7 @@ func polledNexusSyncHints(ctx context.Context, client *pair.Client, id device.Id
 			NextBeforeSeq:   entry.NextBeforeSeq,
 			TotalTurnCount:  entry.TotalTurnCount,
 			HasOlderTurns:   entry.HasOlderTurns,
+			WindowHash:      entry.WindowHash,
 		}
 	}
 	if cache != nil {
@@ -2811,7 +3008,10 @@ func polledNexusSyncHints(ctx context.Context, client *pair.Client, id device.Id
 }
 
 func syncHintsPollInterval() time.Duration {
-	return envDuration("POCKLY_SYNC_HINTS_POLL_INTERVAL", 10*time.Minute, 0, 24*time.Hour)
+	// SYNC_HINT control messages are the primary low-cost path. Polling is an
+	// opt-in compatibility fallback for older Nexus deployments; keeping it
+	// disabled by default avoids fixed daemon-side remote reads while idle.
+	return envDuration("POCKLY_SYNC_HINTS_POLL_INTERVAL", 0, 0, 24*time.Hour)
 }
 
 func recentNexusSessions(sessions []pair.SyncSession, max int, policy nexusSyncPolicy, hints map[string]syncHint, now time.Time) []pair.SyncSession {
@@ -2996,20 +3196,19 @@ func historySyncSignature(req pair.SyncRequest) string {
 		return ""
 	}
 	session := req.Sessions[0]
+	// Window uploads are expensive because they carry turn payloads. Catalog
+	// metadata changes are already handled by catalog sync; do not let fields
+	// such as TurnCount or LastTimestamp force re-uploading an unchanged hot
+	// window every sync interval.
 	parts := []string{
 		session.SessionID,
-		session.Agent,
-		session.RunnerAlias,
-		session.Cwd,
-		session.LastTimestamp,
-		session.ChannelLastSeenAt,
-		strconv.Itoa(session.TurnCount),
 		strconv.Itoa(session.MinSeq),
 		strconv.Itoa(session.MaxSeq),
 		strconv.FormatBool(session.HasOlder),
+		session.WindowHash,
 		strconv.Itoa(len(req.Turns)),
 	}
-	if len(req.Turns) > 0 {
+	if session.WindowHash == "" && len(req.Turns) > 0 {
 		last := req.Turns[len(req.Turns)-1]
 		parts = append(parts,
 			strconv.Itoa(last.Seq),

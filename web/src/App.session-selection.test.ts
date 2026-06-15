@@ -6,7 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import type { Device, HostSummary, SessionListItem } from "./api";
+import { ApiError, SESSION_TURNS_WINDOW_LIMIT, type Device, type HostSummary, type SessionListItem } from "./api";
 import {
   AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT,
   bestContinuationCandidate,
@@ -15,18 +15,34 @@ import {
   findCreatedSessionForDraft,
   groupSessions,
   hasEarlierTurns,
+  injectPollOptionsForSession,
   isLargeSessionForAutomaticBackfill,
+  LARGE_SESSION_ACTIVE_EVENT_POLL_MS,
+  LARGE_SESSION_CATALOG_REFRESH_MS,
   mergeHostPresenceIntoSessions,
   nextLazyBackfillBeforeSeq,
   offlineLazyBackfillMessage,
   pickSelection,
+  BACKGROUND_PRESENCE_PAUSE_AFTER_MS,
   PRESENCE_REFRESH_BACKGROUND_MS,
   PRESENCE_REFRESH_FOREGROUND_MS,
+  SESSION_CATALOG_PAGE_LIMIT,
+  SESSION_CATALOG_PREFETCH_PX,
   SESSION_CATALOG_REFRESH_MS,
+  sessionCatalogRefreshIntervalForSession,
+  shouldLoadMoreSessionCatalogFromScroll,
+  shouldPollWorkspacePresence,
   shouldRefreshSessionCatalog,
+  shouldFallbackToFullSessionCatalog,
+  shouldRefreshPersistentTurnsAfterSync,
+  shouldScheduleInjectRefreshAfterStream,
   shouldSyncSessionOnOpen,
+  shouldAutoAttachReaderTerminalBridge,
   shouldUseBrowserRealtime,
   shouldGateAuthenticatedWorkspaceSplash,
+  sessionTurnsFetchOptionsForCachedOpen,
+  shouldFetchHotTailAfterIncremental,
+  transientTurnsHydration,
   workspaceHomeEmptyState,
   type ReaderSelection,
   type Route,
@@ -411,9 +427,10 @@ test("findCreatedSessionForDraft still binds a draft with explicit cwd to a matc
 });
 
 test("presence polling refreshes session catalog only on interval or forced resume", () => {
-  assert.equal(PRESENCE_REFRESH_FOREGROUND_MS, 10_000);
+  assert.equal(PRESENCE_REFRESH_FOREGROUND_MS, 15_000);
   assert.equal(PRESENCE_REFRESH_BACKGROUND_MS, 60_000);
   assert.equal(SESSION_CATALOG_REFRESH_MS, 60_000);
+  assert.equal(SESSION_CATALOG_PAGE_LIMIT, 50);
   assert.equal(shouldRefreshSessionCatalog({
     now: 5_000,
     lastSessionRefreshAt: 0,
@@ -441,11 +458,215 @@ test("presence polling refreshes session catalog only on interval or forced resu
   }), true);
 });
 
+test("session catalog pagination loads more only near the drawer bottom", () => {
+  assert.equal(SESSION_CATALOG_PREFETCH_PX, 240);
+  assert.equal(shouldLoadMoreSessionCatalogFromScroll({
+    scrollTop: 1_270,
+    scrollHeight: 2_000,
+    clientHeight: 500,
+    hasMore: true,
+    loading: false,
+  }), true);
+  assert.equal(shouldLoadMoreSessionCatalogFromScroll({
+    scrollTop: 800,
+    scrollHeight: 2_000,
+    clientHeight: 500,
+    hasMore: true,
+    loading: false,
+  }), false);
+  assert.equal(shouldLoadMoreSessionCatalogFromScroll({
+    scrollTop: 1_300,
+    scrollHeight: 2_000,
+    clientHeight: 500,
+    hasMore: false,
+    loading: false,
+  }), false);
+  assert.equal(shouldLoadMoreSessionCatalogFromScroll({
+    scrollTop: 1_300,
+    scrollHeight: 2_000,
+    clientHeight: 500,
+    hasMore: true,
+    loading: true,
+  }), false);
+});
+
+test("session catalog delta failures do not fall back to full catalog when cache exists", () => {
+  assert.equal(shouldFallbackToFullSessionCatalog(new Error("network"), true), false);
+  assert.equal(shouldFallbackToFullSessionCatalog(new ApiError("server_error", 500, { code: "internal" }), true), false);
+  assert.equal(shouldFallbackToFullSessionCatalog(new ApiError("unsupported", 501, { code: "unsupported_runtime" }), true), true);
+  assert.equal(shouldFallbackToFullSessionCatalog(new ApiError("missing", 404, { code: "not_found" }), true), true);
+  assert.equal(shouldFallbackToFullSessionCatalog(new Error("first load needs compatibility fallback"), false), true);
+});
+
+test("cached session reopen uses incremental turns before falling back to the hot tail", () => {
+  assert.deepEqual(sessionTurnsFetchOptionsForCachedOpen([]), {
+    limit: SESSION_TURNS_WINDOW_LIMIT,
+  });
+  assert.deepEqual(sessionTurnsFetchOptionsForCachedOpen([
+    {
+      device_id: "dd_test",
+      session_id: "sess_cached",
+      seq: 101,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: "2026-06-13T00:00:00.000Z",
+      payload: { text: "cached" },
+    },
+    {
+      device_id: "dd_test",
+      session_id: "sess_cached",
+      seq: 120,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: "2026-06-13T00:00:01.000Z",
+      payload: { text: "cached latest" },
+    },
+    {
+      device_id: "dd_test",
+      session_id: "sess_cached",
+      seq: 900_000_001,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: "2026-06-13T00:00:02.000Z",
+      payload: { text: "optimistic live ghost" },
+    },
+  ]), {
+    limit: SESSION_TURNS_WINDOW_LIMIT,
+    afterSeq: 120,
+  });
+});
+
+test("cached session reopen fetches hot tail only when incremental reads may miss the latest window", () => {
+  const session = {
+    session_id: "sess_cached",
+    device_id: "dd_test",
+    agent: "claude-code",
+    cwd: "/tmp",
+    snippet: "",
+    last_seq: 260,
+    last_timestamp: "2026-06-13T00:00:00.000Z",
+    synced_max_seq: 260,
+    turn_count: 260,
+  } satisfies SessionListItem;
+
+  assert.equal(shouldFetchHotTailAfterIncremental({
+    cachedMaxSeq: 120,
+    response: {
+      session_id: "sess_cached",
+      turns: [{ session_id: "sess_cached", seq: 121, agent: "claude-code", kind: "assistant_text", timestamp: "2026-06-13T00:00:01.000Z", payload: { text: "121" } }],
+      after_seq: 120,
+      latest_seq: 121,
+      synced_max_seq: 121,
+    },
+    session: { ...session, last_seq: 121, synced_max_seq: 121, turn_count: 121 },
+    limit: 100,
+  }), false);
+
+  assert.equal(shouldFetchHotTailAfterIncremental({
+    cachedMaxSeq: 120,
+    response: {
+      session_id: "sess_cached",
+      turns: Array.from({ length: 100 }, (_, index) => ({
+        session_id: "sess_cached",
+        seq: 121 + index,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-13T00:00:01.000Z",
+        payload: { text: String(121 + index) },
+      })),
+      after_seq: 120,
+      latest_seq: 220,
+      synced_max_seq: 260,
+    },
+    session,
+    limit: 100,
+  }), true);
+
+  assert.equal(shouldFetchHotTailAfterIncremental({
+    cachedMaxSeq: 120,
+    response: {
+      session_id: "sess_cached",
+      turns: Array.from({ length: 100 }, (_, index) => ({
+        session_id: "sess_cached",
+        seq: 121 + index,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: "2026-06-13T00:00:01.000Z",
+        payload: { text: String(121 + index) },
+      })),
+      after_seq: 120,
+      latest_seq: 220,
+      synced_max_seq: 220,
+    },
+    session: { ...session, last_seq: 220, synced_max_seq: 220, turn_count: 220 },
+    limit: 100,
+  }), false);
+
+  assert.equal(shouldFetchHotTailAfterIncremental({
+    cachedMaxSeq: 120,
+    response: {
+      session_id: "sess_cached",
+      turns: [{ session_id: "sess_cached", seq: 121, agent: "claude-code", kind: "assistant_text", timestamp: "2026-06-13T00:00:01.000Z", payload: { text: "121" } }],
+      after_seq: 120,
+      latest_seq: 121,
+      synced_max_seq: 260,
+    },
+    session,
+    limit: 100,
+  }), true);
+});
+
+test("successful inject stream does not start a duplicate turn-refresh poll", () => {
+  assert.equal(shouldScheduleInjectRefreshAfterStream("completed"), false);
+  assert.equal(shouldScheduleInjectRefreshAfterStream("failed"), false);
+  assert.equal(shouldScheduleInjectRefreshAfterStream("cancelled"), false);
+  assert.equal(shouldScheduleInjectRefreshAfterStream("idle"), true);
+  assert.equal(shouldScheduleInjectRefreshAfterStream("started"), true);
+  assert.equal(shouldScheduleInjectRefreshAfterStream("streaming"), true);
+});
+
+test("workspace presence polling pauses after a tab has been backgrounded for ten minutes", () => {
+  assert.equal(BACKGROUND_PRESENCE_PAUSE_AFTER_MS, 600_000);
+  assert.equal(shouldPollWorkspacePresence({
+    now: 1_000,
+    visible: true,
+    hiddenSinceAt: 0,
+  }), true);
+  assert.equal(shouldPollWorkspacePresence({
+    now: 60_000,
+    visible: false,
+    hiddenSinceAt: 0,
+  }), true);
+  assert.equal(shouldPollWorkspacePresence({
+    now: 9 * 60_000,
+    visible: false,
+    hiddenSinceAt: 1_000,
+  }), true);
+  assert.equal(shouldPollWorkspacePresence({
+    now: 11 * 60_000,
+    visible: false,
+    hiddenSinceAt: 1_000,
+  }), false);
+  assert.equal(shouldPollWorkspacePresence({
+    now: 11 * 60_000,
+    visible: false,
+    hiddenSinceAt: 1_000,
+    force: true,
+  }), true);
+});
+
 test("session websocket requires explicit runtime support", () => {
   assert.equal(shouldUseBrowserRealtime(null), false);
   assert.equal(shouldUseBrowserRealtime({ runtime: "self_hosted" }), false);
   assert.equal(shouldUseBrowserRealtime({ runtime: "self_hosted", browser_realtime: false }), false);
   assert.equal(shouldUseBrowserRealtime({ runtime: "self_hosted", browser_realtime: true }), true);
+});
+
+test("reader terminal bridge auto-attach is self-hosted only", () => {
+  assert.equal(shouldAutoAttachReaderTerminalBridge(null), false);
+  assert.equal(shouldAutoAttachReaderTerminalBridge({ runtime: "managed", terminal_streaming: true }), false);
+  assert.equal(shouldAutoAttachReaderTerminalBridge({ runtime: "managed", browser_realtime: true, terminal_streaming: true }), false);
+  assert.equal(shouldAutoAttachReaderTerminalBridge({ runtime: "self_hosted" }), true);
 });
 
 test("host-only presence refresh updates session writability without catalog refresh", () => {
@@ -559,6 +780,34 @@ test("opening large catalog-only sessions does not auto backfill", () => {
 
   assert.equal(isLargeSessionForAutomaticBackfill(large), true);
   assert.equal(shouldSyncSessionOnOpen(large, []), false);
+});
+
+test("large active sessions use a slower polling fallback", () => {
+  const normal = session("sess_normal", "dd_a", {
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT,
+  });
+  const large = session("sess_large", "dd_a", {
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT + 1,
+  });
+
+  assert.equal(LARGE_SESSION_ACTIVE_EVENT_POLL_MS, 3_000);
+  assert.deepEqual(injectPollOptionsForSession(normal, false), {});
+  assert.deepEqual(injectPollOptionsForSession(large, false), { pollIntervalMs: LARGE_SESSION_ACTIVE_EVENT_POLL_MS });
+  assert.deepEqual(injectPollOptionsForSession(large, true), { pollIntervalMs: 5_000 });
+});
+
+test("large open sessions use a slower catalog safety refresh", () => {
+  const normal = session("sess_normal", "dd_a", {
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT,
+  });
+  const large = session("sess_large", "dd_a", {
+    turn_count: AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT + 1,
+  });
+
+  assert.equal(LARGE_SESSION_CATALOG_REFRESH_MS, 120_000);
+  assert.equal(sessionCatalogRefreshIntervalForSession(null), SESSION_CATALOG_REFRESH_MS);
+  assert.equal(sessionCatalogRefreshIntervalForSession(normal), SESSION_CATALOG_REFRESH_MS);
+  assert.equal(sessionCatalogRefreshIntervalForSession(large), LARGE_SESSION_CATALOG_REFRESH_MS);
 });
 
 test("large session guard clears after the catalog is fully synced", () => {
@@ -710,4 +959,50 @@ test("load-earlier cursor uses zero for the first manual window", () => {
   });
 
   assert.equal(nextLazyBackfillBeforeSeq(null, [], selected), 0);
+});
+
+test("transient daemon history windows keep load-earlier cursor without remote persistence", () => {
+  const selected = session("sess_transient", "dd_a", {
+    sync_state: "partial",
+    turn_count: 240,
+    synced_turn_count: 100,
+    synced_min_seq: 141,
+    synced_max_seq: 240,
+    has_older_turns: true,
+  });
+  const hydration = transientTurnsHydration("sess_transient", [{
+    session_id: "sess_transient",
+    device_id: "dd_a",
+    seq: 121,
+    agent: "claude-code",
+    kind: "assistant_text",
+    timestamp: "2026-06-06T00:00:00Z",
+    payload: { text: "older window" },
+  }, {
+    session_id: "sess_transient",
+    device_id: "dd_a",
+    seq: 140,
+    agent: "claude-code",
+    kind: "assistant_text",
+    timestamp: "2026-06-06T00:00:01Z",
+    payload: { text: "older window tail" },
+  }], {
+    request_id: "sync_1",
+    session_id: "sess_transient",
+    stage: "completed",
+    status: "completed",
+    has_older: true,
+    total_turn_count: 240,
+  });
+
+  assert.equal(hydration.source, "local_transient");
+  assert.equal(hydration.next_loaded_before_seq, 0);
+  assert.equal(hydration.next_before_seq, 121);
+  assert.equal(nextLazyBackfillBeforeSeq(hydration, [], selected), 121);
+  assert.equal(hasEarlierTurns(hydration, [], selected), true);
+});
+
+test("transient sync turns are not overwritten by an empty persisted remote window", () => {
+  assert.equal(shouldRefreshPersistentTurnsAfterSync(true), false);
+  assert.equal(shouldRefreshPersistentTurnsAfterSync(false), true);
 });

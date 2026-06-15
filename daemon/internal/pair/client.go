@@ -155,6 +155,7 @@ type SyncSession struct {
 	MinSeq            int    `json:"min_seq,omitempty"`
 	MaxSeq            int    `json:"max_seq,omitempty"`
 	HasOlder          bool   `json:"has_older,omitempty"`
+	WindowHash        string `json:"window_hash,omitempty"`
 }
 
 type SyncTurn struct {
@@ -170,6 +171,11 @@ type SyncRequest struct {
 	Hello    HelloMessage  `json:"hello"`
 	Sessions []SyncSession `json:"sessions"`
 	Turns    []SyncTurn    `json:"turns,omitempty"`
+	// KnownWindowSessionIDs asks Nexus to return server-known hot-window hashes
+	// only for sessions the daemon is about to consider uploading. The daemon
+	// sends an explicit empty list when there are no candidates, so Nexus can
+	// skip hot-window reads instead of guessing from the full catalog.
+	KnownWindowSessionIDs *[]string `json:"known_window_session_ids,omitempty"`
 	// CatalogComplete is daemon-local metadata. When false, Sessions was
 	// byte-capped and must not be treated as an authoritative deletion list.
 	CatalogComplete bool `json:"-"`
@@ -197,6 +203,15 @@ type SyncResponse struct {
 	DaemonDevice         string             `json:"daemon_device"`
 	DaemonVersion        string             `json:"daemon_version"`
 	TimingsMS            map[string]float64 `json:"timings_ms,omitempty"`
+	KnownWindows         []SyncKnownWindow  `json:"known_windows,omitempty"`
+}
+
+type SyncKnownWindow struct {
+	SessionID       string `json:"session_id"`
+	SyncedMinSeq    int    `json:"synced_min_seq,omitempty"`
+	SyncedMaxSeq    int    `json:"synced_max_seq,omitempty"`
+	SyncedTurnCount int    `json:"synced_turn_count,omitempty"`
+	WindowHash      string `json:"window_hash,omitempty"`
 }
 
 type SyncHintsResponse struct {
@@ -213,6 +228,7 @@ type SyncSessionHint struct {
 	NextBeforeSeq   int    `json:"next_before_seq,omitempty"`
 	TotalTurnCount  int    `json:"total_turn_count,omitempty"`
 	HasOlderTurns   bool   `json:"has_older_turns,omitempty"`
+	WindowHash      string `json:"window_hash,omitempty"`
 }
 
 type DaemonLoginResponse struct {

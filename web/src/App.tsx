@@ -24,6 +24,7 @@ import {
   getVAPIDPublicKey,
   getSession,
   getDaemonSessionBlocks,
+  getSessionCatalogItem,
   getSessionTurns,
   listDaemonDirectory,
   listDevices,
@@ -31,6 +32,7 @@ import {
   listDevTerminalSessions,
   listOnlineHosts,
   listSessions,
+  listSessionsDelta,
   listTerminalSessions,
   loginWithPassword,
   logout,
@@ -52,6 +54,7 @@ import {
   getPrefs,
   markSessionOpened,
   setAgentSettings,
+  setActiveWorkspaceRealtime,
   setSessionPref,
   setProjectPref,
   deleteSession,
@@ -70,6 +73,7 @@ import {
   submitFeedback,
   transcribeVoice,
   verifyRegistration,
+  ApiError,
   AuthExpiredError,
   InjectControlError,
   type AgentModelOption,
@@ -91,6 +95,21 @@ import {
   type TerminalSession,
   type SessionTurn,
 } from "./api";
+import {
+  clearSessionCatalogCache,
+  loadSessionCatalogCache,
+  mergeSessionCatalogDelta,
+  mergeSessionCatalogPage,
+  replaceSessionCatalogPage,
+  saveSessionCatalogCache,
+  type SessionCatalogSnapshot,
+} from "./session-catalog-cache";
+import {
+  clearSessionTurnsCache,
+  loadSessionTurnsCache,
+  mergeSessionTurnsCache,
+  saveSessionTurnsCache,
+} from "./session-turns-cache";
 import { clearBrowserDeviceState, ensureBrowserDeviceState, loadBrowserDeviceState, persistBrowserTokens } from "./crypto";
 import { AppShell, Workspace } from "./components/layout/app-shell";
 import { ThemeToggle } from "./components/layout/theme-toggle";
@@ -323,12 +342,18 @@ const SSE_RECONNECT_MAX_BACKOFF_MS = 30000;
 // After this many attempts we soften the UI copy to "still reconnecting"
 // so the user knows we haven't silently spun forever, but we keep trying.
 const SSE_RECONNECT_PERSISTENT_AFTER = 12;
-export const PRESENCE_REFRESH_FOREGROUND_MS = 10000;
+export const PRESENCE_REFRESH_FOREGROUND_MS = 15000;
 export const PRESENCE_REFRESH_BACKGROUND_MS = 60000;
+export const BACKGROUND_PRESENCE_PAUSE_AFTER_MS = 10 * 60_000;
+const REALTIME_HIDDEN_IDLE_CLOSE_AFTER_MS = 10 * 60_000;
 // While the realtime socket is live, HOST_STATUS pushes carry presence and
 // the poll drops to a slow safety net.
 export const PRESENCE_REFRESH_REALTIME_MS = 60000;
 export const SESSION_CATALOG_REFRESH_MS = 60000;
+export const LARGE_SESSION_CATALOG_REFRESH_MS = 120000;
+export const SESSION_CATALOG_PAGE_LIMIT = 50;
+export const SESSION_CATALOG_PREFETCH_PX = 240;
+export const LARGE_SESSION_ACTIVE_EVENT_POLL_MS = 3000;
 const MANUAL_LAZY_BACKFILL_TURN_LIMIT = 100;
 
 // isDaemonOutdated returns true if currentVer < recommendedVer, parsing
@@ -529,6 +554,7 @@ export function App() {
   const [resendAfterSeconds, setResendAfterSeconds] = useState(0);
   const [devices, setDevices] = useState<Device[]>([]);
   const [hosts, setHosts] = useState<HostSummary[]>([]);
+  const hostsRef = useRef<HostSummary[]>([]);
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [runtimeCapabilities, setRuntimeCapabilities] = useState<NexusRuntimeCapabilities | null>(null);
   const [draftConversation, setDraftConversation] = useState<DraftConversation | null>(null);
@@ -622,8 +648,10 @@ export function App() {
   const [mobileJoinState, setMobileJoinState] = useState<MobileJoinState>({ phase: "claiming", message: tx("mobileJoin.joining") });
   const [cliAuthorization, setCliAuthorization] = useState<DaemonDeviceAuthorization | null>(null);
   const [cliStatus, setCliStatus] = useState("");
+  const [realtimeVisibilityTick, setRealtimeVisibilityTick] = useState(0);
   const injectRefreshRef = useRef<number | null>(null);
   const subscriptionRef = useRef<SessionSubscription | null>(null);
+  const realtimeSessionSubscriptionRef = useRef<{ sessionId: string; deviceId: string } | null>(null);
   // True while the realtime browser socket is live. Presence pushes and TURN
   // pushes then cover what polling otherwise does, so the presence loop drops
   // to a slow safety cadence and inject polls relax to lifecycle-only.
@@ -659,6 +687,8 @@ export function App() {
   // messages-per-session is small.
   const messageUUIDSeqRef = useRef<Map<string, number>>(new Map());
   const turnsRef = useRef<SessionTurn[]>([]);
+  const turnsHydrationRef = useRef<SessionTurnsResponse | null>(null);
+  const selectedSessionRef = useRef<SessionListItem | null>(null);
   // Live mirror of `selected` for event handlers that fire from stale
   // closures / long-lived refs (the live SSE bridge, the inject onEvent
   // callback). Those handlers must gate rendering on the CURRENTLY-displayed
@@ -671,6 +701,10 @@ export function App() {
   const lastPresenceTelemetryAtRef = useRef(0);
   const autoConnectGenerationRef = useRef(0);
   const workspaceMetadataGenerationRef = useRef(0);
+  const sessionCatalogSnapshotRef = useRef<SessionCatalogSnapshot | null>(null);
+  const sessionCatalogCacheLoadedForRef = useRef("");
+  const [sessionCatalogHasMore, setSessionCatalogHasMore] = useState(false);
+  const [sessionCatalogLoadingMore, setSessionCatalogLoadingMore] = useState(false);
 
   const selectedSession = useMemo(
     () => {
@@ -886,6 +920,14 @@ export function App() {
   }, [turns]);
 
   useEffect(() => {
+    turnsHydrationRef.current = turnsHydration;
+  }, [turnsHydration]);
+
+  useEffect(() => {
+    selectedSessionRef.current = selectedSession;
+  }, [selectedSession]);
+
+  useEffect(() => {
     selectedRef.current = selected;
   }, [selected]);
 
@@ -921,6 +963,7 @@ export function App() {
 
   useEffect(() => {
     if (auth.status !== "authenticated" || !isReaderRoute(route) || !selectedSession || selectedSession.agent !== "claude-code") return;
+    if (!shouldAutoAttachReaderTerminalBridge(runtimeCapabilities)) return;
     const key = liveSessionBridgeKey(selectedSession);
     void attachExistingLiveSessionBridge(selectedSession);
     // Detach THIS session's bridge when the selection changes or we unmount —
@@ -929,7 +972,7 @@ export function App() {
     return () => {
       detachLiveSessionBridge(key);
     };
-  }, [auth.status, route.view, selectedSession?.device_id, selectedSession?.session_id, selectedSession?.agent]);
+  }, [auth.status, route.view, runtimeCapabilities?.runtime, selectedSession?.device_id, selectedSession?.session_id, selectedSession?.agent]);
 
   // #47 recovery: re-attach the live SSE bridge after a session_disconnected.
   // handleLiveSessionEvent tears the bridge down when Nexus reports the host
@@ -947,10 +990,11 @@ export function App() {
   // (e.g. on a switch where both fire).
   useEffect(() => {
     if (auth.status !== "authenticated" || !isReaderRoute(route) || !selectedSession || selectedSession.agent !== "claude-code") return;
+    if (!shouldAutoAttachReaderTerminalBridge(runtimeCapabilities)) return;
     if (selectedSession.writable !== true) return;
     if (liveSessionBridgesRef.current.has(liveSessionBridgeKey(selectedSession))) return;
     void attachExistingLiveSessionBridge(selectedSession);
-  }, [auth.status, route.view, selectedSession?.device_id, selectedSession?.session_id, selectedSession?.agent, selectedSession?.writable, selectedSession?.connection_mode]);
+  }, [auth.status, route.view, runtimeCapabilities?.runtime, selectedSession?.device_id, selectedSession?.session_id, selectedSession?.agent, selectedSession?.writable, selectedSession?.connection_mode]);
 
   // Opt-in test hooks for local browser automation. Activated only
   // when the URL has `?test=1`, so production users never see this
@@ -1064,25 +1108,31 @@ export function App() {
     };
   }, [auth, turns.length, injectStatus, sessionLivenessHint, selectedSession]);
 
+  function updateHosts(nextHosts: HostSummary[]) {
+    hostsRef.current = nextHosts;
+    setHosts(nextHosts);
+  }
+
+  function clearHosts() {
+    updateHosts([]);
+  }
+
   useEffect(() => {
     subscriptionRef.current?.close();
     subscriptionRef.current = null;
+    realtimeSessionSubscriptionRef.current = null;
     if (
       !shouldUseBrowserRealtime(runtimeCapabilities) ||
-      !isReaderRoute(route) ||
-      !selected ||
-      turnsStatus === "loading" ||
       auth.status !== "authenticated"
     ) {
       return;
     }
-    const lastSeq = turns.at(-1)?.seq ?? 0;
     const subscription = subscribeToSession({
-      sessionId: selected.sessionId,
-      deviceId: selected.deviceId,
-      afterSeq: lastSeq,
       onTurn: (turn) => {
-        const hydratedTurn = { ...turn, device_id: selected.deviceId };
+        const current = selectedRef.current;
+        if (!current) return;
+        if (turn.session_id !== current.sessionId || (turn.device_id && turn.device_id !== current.deviceId)) return;
+        const hydratedTurn = { ...turn, device_id: current.deviceId };
         // The realtime WS push and the live SSE bridge are independent,
         // unordered writers of the same reply. For SDK sessions the bridge
         // adds an optimistic assistant turn (seq >= 9e8) and this push later
@@ -1109,17 +1159,62 @@ export function App() {
                 ...(status.app_version ? { app_version: status.app_version } : {}),
               }
             : host);
+          hostsRef.current = next;
           queueMicrotask(() => setSessions((sessions) => mergeHostPresenceIntoSessions(sessions, next)));
           return next;
         });
       },
     });
     subscriptionRef.current = subscription;
+    setActiveWorkspaceRealtime(subscription);
     return () => {
       realtimeLiveRef.current = false;
+      if (subscriptionRef.current === subscription) setActiveWorkspaceRealtime(null);
+      if (subscriptionRef.current === subscription) realtimeSessionSubscriptionRef.current = null;
       subscription.close();
     };
-  }, [auth.status, route.view, runtimeCapabilities?.browser_realtime, selected?.deviceId, selected?.sessionId, turnsStatus]);
+  }, [auth.status, runtimeCapabilities?.browser_realtime, runtimeCapabilities?.browser_realtime_control, realtimeVisibilityTick]);
+
+  useEffect(() => {
+    const subscription = subscriptionRef.current;
+    const previous = realtimeSessionSubscriptionRef.current;
+    const next = isReaderRoute(route) && selected && turnsStatus !== "loading"
+      ? { sessionId: selected.sessionId, deviceId: selected.deviceId, afterSeq: turns.at(-1)?.seq ?? 0 }
+      : null;
+    if (previous && (!next || previous.sessionId !== next.sessionId || previous.deviceId !== next.deviceId)) {
+      subscription?.unsubscribeSession?.(previous.sessionId, previous.deviceId);
+      realtimeSessionSubscriptionRef.current = null;
+    }
+    if (next && (!previous || previous.sessionId !== next.sessionId || previous.deviceId !== next.deviceId)) {
+      subscription?.subscribeSession?.(next.sessionId, next.deviceId, next.afterSeq);
+      realtimeSessionSubscriptionRef.current = { sessionId: next.sessionId, deviceId: next.deviceId };
+    }
+  }, [route.view, selected?.deviceId, selected?.sessionId, turnsStatus]);
+
+  useEffect(() => {
+    if (!realtimeLiveRef.current || document.visibilityState !== "hidden") return;
+    if (activeInjectID || isWorkspaceLiveRoute(route) || summarizePendingPermissions(turns).count > 0) return;
+    const timer = window.setTimeout(() => {
+      if (document.visibilityState !== "hidden") return;
+      if (activeInjectID || isWorkspaceLiveRoute(route) || summarizePendingPermissions(turnsRef.current).count > 0) return;
+      subscriptionRef.current?.close();
+      subscriptionRef.current = null;
+      realtimeSessionSubscriptionRef.current = null;
+      realtimeLiveRef.current = false;
+      setActiveWorkspaceRealtime(null);
+    }, REALTIME_HIDDEN_IDLE_CLOSE_AFTER_MS);
+    return () => window.clearTimeout(timer);
+  }, [activeInjectID, route.view, turns]);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "visible" && shouldUseBrowserRealtime(runtimeCapabilities)) {
+        setRealtimeVisibilityTick((value) => value + 1);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [runtimeCapabilities?.browser_realtime, runtimeCapabilities?.browser_realtime_control]);
 
   // Derive a session title from the loaded turns once they land. This keeps
   // opened sessions labeled consistently with catalog snippets.
@@ -1327,7 +1422,7 @@ export function App() {
       setSelected((current) => {
         if (current?.sessionId === deleteTarget.sessionId && current.deviceId === deleteTarget.deviceId) {
           setTurns([]);
-          setTurnsHydration(null);
+          setTurnsHydrationState(null);
           setTurnsStatus("");
           replaceRoute({ view: "workspaceSessions" });
           return null;
@@ -1348,7 +1443,7 @@ export function App() {
     setAuth({ status: "anonymous" });
     setWorkspaceBootstrapped(false);
     setDevices([]);
-    setHosts([]);
+    clearHosts();
     setSessions([]);
     // Tear down live bridges on auth expiry (Nexus redeploy / session expiry).
     // clearReaderState doesn't touch them, so without this each orphaned
@@ -1369,9 +1464,10 @@ export function App() {
     const startedAt = Date.now();
     const browserDeviceID = loadBrowserDeviceState()?.deviceId;
     const includeSessions = options.includeSessions === true;
+    const userKey = auth.status === "authenticated" ? auth.email : "";
     const [hostResult, sessionResult] = await Promise.allSettled([
       listOnlineHosts(browserDeviceID),
-      includeSessions ? listSessions() : Promise.resolve(null),
+      includeSessions && userKey ? refreshSessionCatalog(userKey) : Promise.resolve(null),
     ]);
     for (const result of [hostResult, sessionResult]) {
       if (result.status === "rejected" && result.reason instanceof AuthExpiredError) {
@@ -1399,16 +1495,161 @@ export function App() {
   function applyWorkspacePresence(snapshot: Awaited<ReturnType<typeof refreshWorkspacePresence>>) {
     workspaceMetadataGenerationRef.current += 1;
     if (snapshot.hosts) {
-      setHosts(snapshot.hosts);
+      updateHosts(snapshot.hosts);
       if (!snapshot.sessions) {
         setSessions((current) => mergeHostPresenceIntoSessions(current, snapshot.hosts ?? []));
       }
     }
     if (!snapshot.sessions) return;
-    const listedSessions = snapshot.sessions;
-    setSessions(listedSessions);
-    setDraftConversation((current) => current && hasSession(listedSessions, { sessionId: current.session_id, deviceId: current.device_id }) ? null : current);
+    applyListedSessions(snapshot.sessions);
+  }
+
+  function applyListedSessions(listedSessions: SessionListItem[]) {
+    const sessionsWithPresence = mergeHostPresenceIntoSessions(listedSessions, hostsRef.current);
+    setSessions(sessionsWithPresence);
+    setDraftConversation((current) => current && hasSession(sessionsWithPresence, { sessionId: current.session_id, deviceId: current.device_id }) ? null : current);
     setSessionsStatus("");
+  }
+
+  async function refreshSessionCatalog(userKey: string, options: { useCachedSnapshot?: boolean } = {}) {
+    if (options.useCachedSnapshot !== false) {
+      await ensureSessionCatalogCacheLoaded(userKey);
+    }
+    const current = sessionCatalogSnapshotRef.current ?? { sessions, cursor: "", updated_at: 0 };
+    if (current.cursor) {
+      try {
+        const delta = await listSessionsDelta({ since: current.cursor, limit: SESSION_CATALOG_PAGE_LIMIT });
+        const merged = mergeSessionCatalogDelta(current, delta);
+        setSessionCatalogSnapshot(userKey, merged);
+        void saveSessionCatalogCache(userKey, merged);
+        return { sessions: merged.sessions };
+      } catch (error) {
+        if (!shouldFallbackToFullSessionCatalog(error, Boolean(current.sessions.length))) {
+          return { sessions: current.sessions };
+        }
+        // Old Nexus builds fall back to the compatibility full list. Transient
+        // managed-runtime failures keep the cached catalog instead of turning a
+        // short delta outage into a high-cost full catalog request.
+      }
+    }
+    try {
+      const initialDelta = await listSessionsDelta({ limit: SESSION_CATALOG_PAGE_LIMIT });
+      const snapshot = replaceSessionCatalogPage(initialDelta);
+      setSessionCatalogSnapshot(userKey, snapshot);
+      void saveSessionCatalogCache(userKey, snapshot);
+      return { sessions: snapshot.sessions };
+    } catch (error) {
+      if (!shouldFallbackToFullSessionCatalog(error, Boolean(current.sessions.length))) {
+        return { sessions: current.sessions };
+      }
+      const full = await listSessions();
+      const snapshot: SessionCatalogSnapshot = {
+        sessions: full.sessions ?? [],
+        cursor: "",
+        page_cursor: "",
+        has_more_pages: false,
+        updated_at: Date.now(),
+      };
+      setSessionCatalogSnapshot(userKey, snapshot);
+      void saveSessionCatalogCache(userKey, snapshot);
+      return full;
+    }
+  }
+
+  async function ensureSessionCatalogCacheLoaded(userKey: string) {
+    const normalizedUserKey = userKey.trim().toLowerCase();
+    if (!normalizedUserKey || sessionCatalogCacheLoadedForRef.current === normalizedUserKey) return;
+    sessionCatalogSnapshotRef.current = null;
+    sessionCatalogCacheLoadedForRef.current = normalizedUserKey;
+    const cached = await loadSessionCatalogCache(normalizedUserKey);
+    if (!cached) return;
+    setSessionCatalogSnapshot(normalizedUserKey, cached);
+    setSessions((current) => current.length > 0 ? current : mergeHostPresenceIntoSessions(cached.sessions, hostsRef.current));
+  }
+
+  async function loadSessionCatalogItem(userKey: string, selection: ReaderSelection) {
+    const item = await getSessionCatalogItem(selection.sessionId, selection.deviceId);
+    const session = item.session;
+    const current = sessionCatalogSnapshotRef.current ?? { sessions, cursor: "", updated_at: 0 };
+    const snapshot = mergeSessionCatalogDelta(current, {
+      upserts: [session],
+      deletes: [],
+      next_cursor: current.cursor || "",
+      has_more: false,
+    });
+    setSessionCatalogSnapshot(userKey, snapshot);
+    void saveSessionCatalogCache(userKey, snapshot);
+    return session;
+  }
+
+  function setSessionCatalogSnapshot(userKey: string, snapshot: SessionCatalogSnapshot | null) {
+    sessionCatalogSnapshotRef.current = snapshot;
+    setSessionCatalogHasMore(Boolean(snapshot?.has_more_pages && snapshot.page_cursor));
+    if (!snapshot && userKey) {
+      void clearSessionCatalogCache(userKey);
+    }
+  }
+
+  function cacheTurnsSnapshot(selection: ReaderSelection, nextTurns: SessionTurn[], hydration: SessionTurnsResponse | null) {
+    if (auth.status !== "authenticated" || selection.sessionId.startsWith("draft_")) return;
+    const snapshot = mergeSessionTurnsCache(null, {
+      deviceId: selection.deviceId,
+      sessionId: selection.sessionId,
+      turns: nextTurns,
+      hydration,
+    });
+    void saveSessionTurnsCache(auth.email, snapshot);
+  }
+
+  function setTurnsHydrationState(next: SessionTurnsResponse | null | ((current: SessionTurnsResponse | null) => SessionTurnsResponse | null)) {
+    if (typeof next === "function") {
+      setTurnsHydration((current) => {
+        const updated = next(current);
+        turnsHydrationRef.current = updated;
+        return updated;
+      });
+      return;
+    }
+    turnsHydrationRef.current = next;
+    setTurnsHydration(next);
+  }
+
+  function replaceSessionTurns(selection: ReaderSelection, nextTurns: SessionTurn[], hydration: SessionTurnsResponse | null) {
+    turnsRef.current = nextTurns;
+    setTurns(nextTurns);
+    setTurnsHydrationState(hydration);
+    cacheTurnsSnapshot(selection, nextTurns, hydration);
+  }
+
+  function mergeSessionTurnsIntoState(selection: ReaderSelection, incoming: SessionTurn[], hydration: SessionTurnsResponse | null, authoritative = false) {
+    const merged = reconcileHydratedTurns(turnsRef.current, incoming, authoritative);
+    const mergedHydration = hydration
+      ? incrementalTurnsHydration(turnsHydrationRef.current, hydration, merged)
+      : turnsHydrationRef.current
+        ? { ...turnsHydrationRef.current, turns: merged }
+        : null;
+    turnsRef.current = merged;
+    setTurns(merged);
+    if (mergedHydration) setTurnsHydrationState(mergedHydration);
+    cacheTurnsSnapshot(selection, merged, mergedHydration);
+  }
+
+  async function loadMoreSessionCatalogPage() {
+    if (auth.status !== "authenticated" || sessionCatalogLoadingMore) return;
+    const current = sessionCatalogSnapshotRef.current;
+    if (!current?.page_cursor || !current.has_more_pages) return;
+    setSessionCatalogLoadingMore(true);
+    try {
+      const page = await listSessionsDelta({ limit: SESSION_CATALOG_PAGE_LIMIT, pageCursor: current.page_cursor });
+      const merged = mergeSessionCatalogPage(current, page);
+      setSessionCatalogSnapshot(auth.email, merged);
+      applyListedSessions(merged.sessions);
+      void saveSessionCatalogCache(auth.email, merged);
+    } catch (error) {
+      setSessionsStatus(error instanceof Error ? error.message : tx("errors.failedLoadSessions"));
+    } finally {
+      setSessionCatalogLoadingMore(false);
+    }
   }
 
   async function autoConnectWorkspaceHosts(connectableHosts: HostSummary[], autoConnectGeneration: number, metadataGeneration: number) {
@@ -1426,9 +1667,10 @@ export function App() {
         persistBrowserTokens({ browserDeviceId: connected.browser_device_id });
       }
       if (autoConnectGeneration !== autoConnectGenerationRef.current) return;
+      const userKey = auth.status === "authenticated" ? auth.email : "";
       const [hostSnapshot, sessionSnapshot] = await Promise.allSettled([
         listOnlineHosts(loadBrowserDeviceState()?.deviceId),
-        listSessions(),
+        userKey ? refreshSessionCatalog(userKey) : listSessions(),
       ]);
       if (
         autoConnectGeneration !== autoConnectGenerationRef.current ||
@@ -1438,13 +1680,11 @@ export function App() {
       }
       workspaceMetadataGenerationRef.current += 1;
       if (hostSnapshot.status === "fulfilled") {
-        setHosts(hostSnapshot.value.hosts ?? []);
+        updateHosts(hostSnapshot.value.hosts ?? []);
       }
       if (sessionSnapshot.status === "fulfilled") {
         const listedSessions = sessionSnapshot.value.sessions ?? [];
-        setSessions(listedSessions);
-        setDraftConversation((current) => current && hasSession(listedSessions, { sessionId: current.session_id, deviceId: current.device_id }) ? null : current);
-        setSessionsStatus("");
+        applyListedSessions(listedSessions);
       }
       for (const result of [hostSnapshot, sessionSnapshot]) {
         if (result.status === "rejected" && result.reason instanceof AuthExpiredError) {
@@ -1469,25 +1709,38 @@ export function App() {
     let inFlight = false;
     let lastSessionRefreshAt = 0;
     let lastPresenceRunAt = 0;
+    let hiddenSinceAt = document.visibilityState === "hidden" ? Date.now() : 0;
     const run = (options: { forceSessions?: boolean } = {}) => {
       if (stopped || inFlight) return;
+      const now = Date.now();
+      const visible = document.visibilityState === "visible";
+      const force = options.forceSessions === true;
+      if (!shouldPollWorkspacePresence({
+        now,
+        visible,
+        hiddenSinceAt,
+        force,
+      })) {
+        return;
+      }
       // With a live realtime socket, presence arrives as HOST_STATUS pushes;
       // keep only a slow safety poll (and never skip an explicit force).
       if (
         realtimeLiveRef.current &&
-        options.forceSessions !== true &&
-        Date.now() - lastPresenceRunAt < PRESENCE_REFRESH_REALTIME_MS
+        !force &&
+        now - lastPresenceRunAt < PRESENCE_REFRESH_REALTIME_MS
       ) {
         return;
       }
-      lastPresenceRunAt = Date.now();
+      lastPresenceRunAt = now;
       const includeSessions = shouldRefreshSessionCatalog({
-        now: Date.now(),
+        now,
         lastSessionRefreshAt,
-        visible: document.visibilityState === "visible",
-        force: options.forceSessions === true,
+        visible,
+        force,
+        intervalMs: sessionCatalogRefreshIntervalForSession(selectedSessionRef.current),
       });
-      if (includeSessions) lastSessionRefreshAt = Date.now();
+      if (includeSessions) lastSessionRefreshAt = now;
       inFlight = true;
       void refreshWorkspacePresence({ includeSessions })
         .then((snapshot) => {
@@ -1506,6 +1759,7 @@ export function App() {
       refreshTimer = window.setInterval(run, intervalMs);
     };
     const onVisibilityChange = () => {
+      hiddenSinceAt = document.visibilityState === "hidden" ? Date.now() : 0;
       schedule();
       if (document.visibilityState === "visible") run({ forceSessions: true });
     };
@@ -1598,7 +1852,7 @@ export function App() {
       // workspace before this user's list calls land.
       setWorkspaceBootstrapped(false);
       setDevices([]);
-      setHosts([]);
+      clearHosts();
       setSessions([]);
       clearReaderState();
       if (!isPublicRoute(targetRoute) && targetRoute.view !== "login") {
@@ -1638,11 +1892,12 @@ export function App() {
     }
     void timed("browser_announce", announceCurrentBrowserDevice).catch(() => undefined);
 
+    const authenticatedUser = session.user;
     const browserDeviceID = loadBrowserDeviceState()?.deviceId;
     const [deviceResult, hostResult, sessionResult] = await Promise.allSettled([
       timed("devices", listDevices),
       timed("hosts", () => listOnlineHosts(browserDeviceID)),
-      timed("sessions", listSessions),
+      timed("sessions", () => refreshSessionCatalog(authenticatedUser.email)),
     ]);
     for (const result of [deviceResult, hostResult, sessionResult]) {
       if (result.status === "rejected" && result.reason instanceof AuthExpiredError) {
@@ -1666,7 +1921,7 @@ export function App() {
     let listedHosts: HostSummary[] = hosts;
     if (hostResult.status === "fulfilled") {
       listedHosts = hostResult.value.hosts ?? [];
-      setHosts(listedHosts);
+      updateHosts(listedHosts);
       connectableHosts = listedHosts.filter((host) =>
         !host.connected &&
         host.remote_access_enabled &&
@@ -1680,9 +1935,11 @@ export function App() {
     let listedSessions: SessionListItem[] = sessions;
     if (sessionResult.status === "fulfilled") {
       listedSessions = sessionResult.value.sessions ?? [];
-      setSessions(listedSessions);
-      setDraftConversation((current) => current && hasSession(listedSessions, { sessionId: current.session_id, deviceId: current.device_id }) ? null : current);
-      setSessionsStatus("");
+      if (targetRoute.view === "workspaceSession" && !hasSession(listedSessions, { sessionId: targetRoute.sessionId, deviceId: targetRoute.deviceId })) {
+        const selectedItem = await loadSessionCatalogItem(session.user.email, { sessionId: targetRoute.sessionId, deviceId: targetRoute.deviceId });
+        listedSessions = mergeHostPresenceIntoSessions([...listedSessions, selectedItem], hostsRef.current);
+      }
+      applyListedSessions(listedSessions);
       reportBootstrap("ok", "complete");
     } else {
       setSessions([]);
@@ -1766,49 +2023,86 @@ export function App() {
     setSelected(next);
     setSyncProgress(null);
     setSyncingEarlier(false);
-    setTurnsHydration(null);
+    setTurnsHydrationState(null);
     if (draftConversation && next.sessionId === draftConversation.session_id && next.deviceId === draftConversation.device_id) {
       if (push) {
         pushRoute({ view: "workspaceSessions" });
       }
       setTurnsStatus("");
-      setTurnsHydration({ session_id: draftConversation.session_id, turns: [], synced_turn_count: 0, total_turn_count: 0, has_older_turns: false });
+      setTurnsHydrationState({ session_id: draftConversation.session_id, turns: [], synced_turn_count: 0, total_turn_count: 0, has_older_turns: false });
       return;
     }
     if (push) {
       pushRoute({ view: "workspaceSession", sessionId: next.sessionId, deviceId: next.deviceId });
     }
     const initialSession = sessionHint ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
-    markSessionOpened({ sessionId: next.sessionId, deviceId: next.deviceId, openedAt: new Date().toISOString() })
+    markSessionOpened({
+      sessionId: next.sessionId,
+      deviceId: next.deviceId,
+      openedAt: new Date().toISOString(),
+      realtime: shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
+    })
       .catch(() => {
         // This hint only helps the daemon prioritize future lazy windows.
       });
+    const cached = auth.status === "authenticated"
+      ? await loadSessionTurnsCache(auth.email, next.deviceId, next.sessionId).catch(() => null)
+      : null;
+    if (requestID !== loadRequestRef.current) return;
+    if (cached?.turns.length) {
+      replaceSessionTurns(next, cached.turns, cached.hydration);
+      setTurnsStatus("");
+    } else {
+      replaceSessionTurns(next, [], null);
+    }
     try {
-      setTurnsStatus("loading");
-      const data = await getSessionTurns(next.sessionId, next.deviceId, { limit: SESSION_TURNS_WINDOW_LIMIT });
-      if (requestID !== loadRequestRef.current) return;
-      const hydrated = data.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
-      setTurns(hydrated);
-      setTurnsHydration(data);
+      if (!cached?.turns.length) setTurnsStatus("loading");
       const session = initialSession ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
+      const cachedTurns = cached?.turns ?? [];
+      const hasCachedTurns = cachedTurns.length > 0;
+      const cachedMaxSeq = lastConfirmedSeq(cachedTurns);
+      let data = await getSessionTurns(next.sessionId, next.deviceId, hasCachedTurns
+        ? sessionTurnsFetchOptionsForCachedOpen(cachedTurns)
+        : { limit: SESSION_TURNS_WINDOW_LIMIT });
+      if (requestID !== loadRequestRef.current) return;
+      let hydrated = data.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
+      let nextTurns = hasCachedTurns ? reconcileHydratedTurns(cachedTurns, hydrated, false) : hydrated;
+      let nextHydration = hasCachedTurns && cached
+        ? incrementalTurnsHydration(cached.hydration, data, nextTurns)
+        : data;
+      if (hasCachedTurns && shouldFetchHotTailAfterIncremental({
+        cachedMaxSeq,
+        response: data,
+        session,
+        limit: SESSION_TURNS_WINDOW_LIMIT,
+      })) {
+        data = await getSessionTurns(next.sessionId, next.deviceId, {
+          limit: SESSION_TURNS_WINDOW_LIMIT,
+        });
+        if (requestID !== loadRequestRef.current) return;
+        hydrated = data.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
+        nextTurns = reconcileHydratedTurns(nextTurns, hydrated, false);
+        nextHydration = incrementalTurnsHydration(nextHydration, data, nextTurns);
+      }
+      replaceSessionTurns(next, nextTurns, nextHydration);
       logSessionHydration("openSession loaded turns", {
         sessionId: next.sessionId,
         deviceId: next.deviceId,
-        hydratedTurns: hydrated.length,
+        hydratedTurns: nextTurns.length,
         expectedTurns: session?.turn_count || session?.last_seq || 0,
         lastSeq: session?.last_seq ?? null,
         syncState: session ? sessionSyncState(session) : "unknown",
       });
-      if (hydrated.length > 0) {
+      if (nextTurns.length > 0) {
         setTurnsStatus("");
         return;
       }
-      if (!session || shouldSyncSessionOnOpen(session, hydrated)) {
+      if (!session || shouldSyncSessionOnOpen(session, nextTurns)) {
         logSessionHydration("openSession requesting sync", {
           sessionId: next.sessionId,
           deviceId: next.deviceId,
           reason: session ? "empty_window" : "missing_session_hint",
-          hydratedTurns: hydrated.length,
+          hydratedTurns: nextTurns.length,
           expectedTurns: session?.turn_count || session?.last_seq || 0,
         });
         await syncSelectedSession(next, requestID, 0);
@@ -1833,7 +2127,7 @@ export function App() {
       );
       if (isLargeSessionForAutomaticBackfill(sessionMeta)) {
         setTurnsStatus("");
-        setTurnsHydration({
+        setTurnsHydrationState({
           session_id: next.sessionId,
           turns: [],
           synced_turn_count: sessionMeta?.synced_turn_count ?? 0,
@@ -1847,7 +2141,7 @@ export function App() {
         && (sessionMeta.turn_count ?? 0) === 0;
       if (isFreshSession && isSessionNotFoundMessage(errMessage)) {
         setTurnsStatus("");
-        setTurnsHydration({
+        setTurnsHydrationState({
           session_id: next.sessionId,
           turns: [],
           synced_turn_count: 0,
@@ -1894,22 +2188,22 @@ export function App() {
       running = true;
       try {
         remaining -= 1;
-        const listedSessions = await refreshSessionsList();
-        const session = listedSessions.find((item) => item.session_id === selection.sessionId && item.device_id === selection.deviceId);
-        const knownLastSeq = session?.last_seq ?? baselineSeq;
         try {
-          const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, { limit: SESSION_TURNS_WINDOW_LIMIT });
+          const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, {
+            limit: SESSION_TURNS_WINDOW_LIMIT,
+            afterSeq: lastConfirmedSeq(turnsRef.current),
+          });
           const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
           const hydratedLastSeq = hydrated.at(-1)?.seq ?? 0;
           const hasAgentResponse = hydrated.some((turn) => isAgentResponseTurnAfter(turn, baselineSeq));
           if (hydratedLastSeq > baselineSeq) {
-            setTurns((current) => reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(refreshed)));
-            setTurnsHydration(refreshed);
+            mergeSessionTurnsIntoState(selection, hydrated, refreshed, isCompleteTurnsResponse(refreshed));
           }
-          if (hasAgentResponse && (knownLastSeq <= baselineSeq || hydratedLastSeq >= knownLastSeq)) {
+          if (hasAgentResponse) {
             settled = true;
             stop();
             setInjectStatus("Background run finished. Synced latest session updates.");
+            void refreshSessionsList();
             onSettled?.();
             return;
           }
@@ -1924,6 +2218,7 @@ export function App() {
             return;
           }
           setInjectStatus(tx("errors.backgroundFinished"));
+          void refreshSessionsList();
           onSettled?.();
         }
       } finally {
@@ -1957,12 +2252,14 @@ export function App() {
       const sel = selectedRef.current;
       if (!sel || sel.sessionId !== selection.sessionId || sel.deviceId !== selection.deviceId) return;
       try {
-        const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, { limit: SESSION_TURNS_WINDOW_LIMIT });
+        const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, {
+          limit: SESSION_TURNS_WINDOW_LIMIT,
+          afterSeq: lastConfirmedSeq(turnsRef.current),
+        });
         const stillOn = selectedRef.current;
         if (!stillOn || stillOn.sessionId !== selection.sessionId || stillOn.deviceId !== selection.deviceId) return;
         const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
-        setTurns((current) => reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(refreshed)));
-        setTurnsHydration(refreshed);
+        mergeSessionTurnsIntoState(selection, hydrated, refreshed, isCompleteTurnsResponse(refreshed));
       } catch {
         // Transient (sync still catching up / link blip) — keep retrying.
       }
@@ -1987,7 +2284,7 @@ export function App() {
     setSelected((selection) => {
       if (selection?.sessionId === draft.session_id && selection.deviceId === draft.device_id) {
         setTurns([]);
-        setTurnsHydration(null);
+        setTurnsHydrationState(null);
         setTurnsStatus("");
         return null;
       }
@@ -2005,7 +2302,7 @@ export function App() {
     setSelected((current) => {
       if (current?.sessionId === selection.sessionId && current.deviceId === selection.deviceId) {
         setTurns([]);
-        setTurnsHydration(null);
+        setTurnsHydrationState(null);
         setTurnsStatus("");
         replaceRoute({ view: "workspaceSessions" });
         return null;
@@ -2021,7 +2318,7 @@ export function App() {
       ? { sessionId: match.session_id, deviceId: match.device_id }
       : selection);
     replaceRoute({ view: "workspaceSession", sessionId: match.session_id, deviceId: match.device_id });
-    setTurnsHydration((hydration) => hydration ? { ...hydration, session_id: match.session_id } : hydration);
+    setTurnsHydrationState((hydration) => hydration ? { ...hydration, session_id: match.session_id } : hydration);
     setTurns((existing) => existing.map((turn) => turn.session_id === draft.session_id ? { ...turn, session_id: match.session_id } : turn));
   }
 
@@ -2058,8 +2355,11 @@ export function App() {
       const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
       const session = sessionHint ?? sessions.find((item) => item.session_id === next.sessionId && item.device_id === next.deviceId);
       if (hydrated.length > 0 || session?.turn_count === 0 || attempt === 2) {
-        setTurns((current) => mergeWithCurrent ? reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(refreshed)) : hydrated);
-        setTurnsHydration(refreshed);
+        if (mergeWithCurrent) {
+          mergeSessionTurnsIntoState(next, hydrated, refreshed, isCompleteTurnsResponse(refreshed));
+        } else {
+          replaceSessionTurns(next, hydrated, refreshed);
+        }
         setTurnsStatus(hydrated.length === 0 ? "empty" : "");
         setSyncProgress(null);
         void refreshSessionsList();
@@ -2072,6 +2372,7 @@ export function App() {
 
   async function syncSelectedSession(next: ReaderSelection, requestID: number, beforeSeq: number) {
     let failed = "";
+    let receivedTransientTurns = false;
     const controller = new AbortController();
     syncAbortRef.current = controller;
     try {
@@ -2095,8 +2396,15 @@ export function App() {
         ...(beforeSeq > 0 ? { limit: MANUAL_LAZY_BACKFILL_TURN_LIMIT } : {}),
         beforeSeq,
         signal: controller.signal,
+        realtime: shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
         onEvent: (event) => {
           if (requestID !== loadRequestRef.current) return;
+          if (Array.isArray(event.turns) && event.turns.length > 0) {
+            const hydrated = event.turns.map((turn) => ({ ...turn, device_id: next.deviceId }));
+            receivedTransientTurns = true;
+            const hydration = mergeTurnHydration(turnsHydration, transientTurnsHydration(next.sessionId, hydrated, event));
+            mergeSessionTurnsIntoState(next, hydrated, hydration, false);
+          }
           logSessionHydration("syncSelectedSession event", {
             sessionId: next.sessionId,
             deviceId: next.deviceId,
@@ -2119,6 +2427,14 @@ export function App() {
       if (requestID !== loadRequestRef.current) return;
       if (failed) {
         void refreshSessionsList();
+        return;
+      }
+      if (!shouldRefreshPersistentTurnsAfterSync(receivedTransientTurns)) {
+        void refreshSessionsList();
+        setSyncProgress(null);
+        if (!loadingEarlier) {
+          setTurnsStatus("");
+        }
         return;
       }
       const listedSessions = await refreshSessionsList();
@@ -2188,8 +2504,7 @@ export function App() {
         });
         if (requestID !== loadRequestRef.current) return;
         const hydrated = earlier.turns.map((turn) => ({ ...turn, device_id: selected.deviceId }));
-        setTurns((current) => reconcileHydratedTurns(current, hydrated, isCompleteTurnsResponse(earlier)));
-        setTurnsHydration(mergeTurnHydration(turnsHydration, earlier));
+        mergeSessionTurnsIntoState(selected, hydrated, mergeTurnHydration(turnsHydration, earlier), isCompleteTurnsResponse(earlier));
         return;
       }
       await syncSelectedSession(selected, requestID, beforeSeq);
@@ -2201,8 +2516,10 @@ export function App() {
 
   async function refreshSessionsList() {
     try {
-      const listedSessions = (await listSessions()).sessions ?? [];
-      setSessions(listedSessions);
+      const listedSessions = auth.status === "authenticated"
+        ? (await refreshSessionCatalog(auth.email)).sessions ?? []
+        : sessions;
+      applyListedSessions(listedSessions);
       const draft = pendingDraftRef.current ?? draftConversation;
       if (draft) {
         if (hasSession(listedSessions, { sessionId: draft.session_id, deviceId: draft.device_id })) {
@@ -2313,13 +2630,17 @@ export function App() {
     cleanupVoiceRecorder();
     setAuth({ status: "anonymous" });
     setDevices([]);
-    setHosts([]);
+    clearHosts();
     setSessions([]);
     setInjectStatus("");
     setPairStatus("");
     setSessionTitles({});
     if (previousEmail) {
       clearSessionTitlesInStorage(previousEmail);
+      sessionCatalogSnapshotRef.current = null;
+      sessionCatalogCacheLoadedForRef.current = "";
+      void clearSessionCatalogCache(previousEmail);
+      void clearSessionTurnsCache(previousEmail);
     }
     clearReaderState();
     replaceRoute({ view: "login" });
@@ -2605,9 +2926,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     setDevices(listedDevices.length > 0 ? listedDevices : (current) => current.map((device) => device.device_id === deviceId ? result.device : device));
     try {
       const browserDeviceID = loadBrowserDeviceState()?.deviceId;
-      setHosts((await listOnlineHosts(browserDeviceID)).hosts ?? []);
+      updateHosts((await listOnlineHosts(browserDeviceID)).hosts ?? []);
     } catch {
-      setHosts([]);
+      clearHosts();
     }
   }
 
@@ -2617,7 +2938,14 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     await revokeDevice(deviceId);
 
     if (deviceId === currentBrowserID) {
+      const previousEmail = auth.status === "authenticated" ? auth.email : "";
       await clearBrowserDeviceState();
+      if (previousEmail) {
+        sessionCatalogSnapshotRef.current = null;
+        sessionCatalogCacheLoadedForRef.current = "";
+        void clearSessionCatalogCache(previousEmail);
+        void clearSessionTurnsCache(previousEmail);
+      }
       let listedDevices: Device[] = [];
       try {
         listedDevices = (await listDevices()).devices ?? [];
@@ -2626,9 +2954,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         setDevices([]);
       }
       try {
-        setHosts((await listOnlineHosts()).hosts ?? []);
+        updateHosts((await listOnlineHosts()).hosts ?? []);
       } catch {
-        setHosts([]);
+        clearHosts();
       }
       const nextDaemonID = preferredDaemonDeviceID(listedDevices, deviceId);
       setExplicitDeviceFilter("");
@@ -2653,14 +2981,13 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     }
     try {
       const browserDeviceID = loadBrowserDeviceState()?.deviceId;
-      setHosts((await listOnlineHosts(browserDeviceID)).hosts ?? []);
+      updateHosts((await listOnlineHosts(browserDeviceID)).hosts ?? []);
     } catch {
-      setHosts([]);
+      clearHosts();
     }
     try {
-      const listedSessions = (await listSessions()).sessions ?? [];
-      setSessions(listedSessions);
-      setSessionsStatus("");
+      const listedSessions = await refreshSessionsList();
+      applyListedSessions(listedSessions);
     } catch (error) {
       setSessions([]);
       setSessionsStatus(error instanceof Error ? error.message : tx("errors.deviceSetupFailed"));
@@ -2690,6 +3017,12 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       await revokeDevice(currentBrowserID).catch(() => undefined);
     }
     await clearBrowserDeviceState();
+    if (auth.status === "authenticated") {
+      sessionCatalogSnapshotRef.current = null;
+      sessionCatalogCacheLoadedForRef.current = "";
+      void clearSessionCatalogCache(auth.email);
+      void clearSessionTurnsCache(auth.email);
+    }
     setPushStatus("not_enabled");
     setPushDetail("");
     await refreshApp(route, true);
@@ -2879,6 +3212,8 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
 
     void streamTerminalSession({
       terminalSessionId: terminalSession.terminal_session_id,
+      daemonDeviceId: terminalSession.daemon_device_id || session.device_id,
+      realtime: shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
       signal: abort.signal,
       onEvent: (event) => handleLiveSessionEvent(session, event),
     }).then(() => {
@@ -3393,7 +3728,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
     setDraftConversation(draft);
     setSelected({ sessionId: draft.session_id, deviceId: draft.device_id });
     setTurns([]);
-    setTurnsHydration({ session_id: draft.session_id, turns: [], synced_turn_count: 0, total_turn_count: 0, has_older_turns: false });
+    setTurnsHydrationState({ session_id: draft.session_id, turns: [], synced_turn_count: 0, total_turn_count: 0, has_older_turns: false });
     setTurnsStatus("");
     setSyncProgress(null);
     setComposerModel("");
@@ -3465,7 +3800,8 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           cwd: session.cwd,
           text,
           signal: ctrl.signal,
-	          onEvent: (event) => {
+          realtime: shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
+		          onEvent: (event) => {
 	            if (event.type === "session_created" && event.session_id) {
 	              promotedInline = true;
 	              promotedSessionId = event.session_id;
@@ -3535,10 +3871,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           text,
           ...(files.length > 0 ? { files } : {}),
           afterSeq: lastRealSeq,
-          // With the realtime socket live, TURN pushes carry the content and
-          // this poll only tracks lifecycle — relax it.
-          ...(realtimeLiveRef.current ? { pollIntervalMs: CONTROL_EVENT_POLL_RELAXED_MS } : {}),
-	          signal: ctrl.signal,
+          ...injectPollOptionsForSession(session, realtimeLiveRef.current),
+          realtime: files.length === 0 && shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
+		          signal: ctrl.signal,
 	          onEvent: (event) => {
 	            if (event.type === "stream_event" || event.type === "inject_completed") {
 	              reachedDurableAgentEvent = true;
@@ -3556,6 +3891,11 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         // still shows syncing + polls for the reply.
         if (injectPhaseRef.current.phase === "failed" || injectPhaseRef.current.phase === "cancelled") {
           restoreFailedSend();
+          setActiveInjectID("");
+        } else if (!shouldScheduleInjectRefreshAfterStream(injectPhaseRef.current.phase)) {
+          // inject_completed already triggered the authoritative turn backfill.
+          // Starting scheduleInjectRefresh here would double-poll the same
+          // session for normal successful turns.
           setActiveInjectID("");
         } else {
           setInjectStatus(tx("errors.backgroundCompletedSyncing"));
@@ -3801,7 +4141,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
             setDraftConversation(created);
             setSelected({ sessionId: created.session_id, deviceId: created.device_id });
             replaceRoute({ view: "workspaceSession", sessionId: created.session_id, deviceId: created.device_id });
-            setTurnsHydration((current) => current ? { ...current, session_id: created.session_id } : current);
+            setTurnsHydrationState((current) => current ? { ...current, session_id: created.session_id } : current);
             setTurns((current) => current.map((turn) => turn.session_id === draft.session_id ? { ...turn, session_id: created.session_id } : turn));
           }
         }
@@ -4053,6 +4393,10 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         onDeleteSession={(sessionId, deviceId, title) => setDeleteTarget({ sessionId, deviceId, title })}
         drawerOpen={railDrawerOpen}
         onDrawerOpenChange={setRailDrawerOpen}
+        catalogHasMore={sessionCatalogHasMore}
+        catalogLoadingMore={sessionCatalogLoadingMore}
+        catalogPrefetchPx={SESSION_CATALOG_PREFETCH_PX}
+        onLoadMoreCatalog={() => void loadMoreSessionCatalogPage()}
       />
       <Workspace view={route.view}>
         {route.view === "workspaceConnect" ? (
@@ -4093,6 +4437,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
             devices={daemonDevices}
             hosts={hosts}
             sessions={sessionsForSelectedDevice}
+            realtime={shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null}
             onBack={() => void navigate({ view: "workspaceSessions" })}
           />
         ) : route.view === "routeError" ? (
@@ -4131,6 +4476,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
             voiceStatus={voiceStatus}
             voiceAnalyser={voiceAnalyser}
             voiceError={voiceError}
+            realtime={shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null}
             onComposerText={setComposerText}
             composerEffort={effectiveComposerEffort}
             onComposerEffort={handleComposerEffortChange}
@@ -4866,6 +5212,10 @@ function Rail({
   onDeleteSession,
   drawerOpen,
   onDrawerOpenChange,
+  catalogHasMore,
+  catalogLoadingMore,
+  catalogPrefetchPx,
+  onLoadMoreCatalog,
 }: {
   auth: Extract<AuthState, { status: "authenticated" }>;
   route: Route;
@@ -4884,6 +5234,10 @@ function Rail({
   onDeleteSession: (sessionId: string, deviceId: string, title: string) => void;
   drawerOpen: boolean;
   onDrawerOpenChange: (open: boolean) => void;
+  catalogHasMore: boolean;
+  catalogLoadingMore: boolean;
+  catalogPrefetchPx: number;
+  onLoadMoreCatalog: () => void;
 }) {
   // Drawer-open state is lifted to App so the workspace header's hamburger
   // (which lives in SessionsPage, a sibling) can open this rail's drawer.
@@ -5045,7 +5399,21 @@ function Rail({
             <span>{auth.email}</span>
           </span>
         </button>
-        <div className="drawer-scroll">
+        <div
+          className="drawer-scroll"
+          onScroll={(event) => {
+            if (shouldLoadMoreSessionCatalogFromScroll({
+              scrollTop: event.currentTarget.scrollTop,
+              scrollHeight: event.currentTarget.scrollHeight,
+              clientHeight: event.currentTarget.clientHeight,
+              hasMore: catalogHasMore,
+              loading: catalogLoadingMore,
+              prefetchPx: catalogPrefetchPx,
+            })) {
+              onLoadMoreCatalog();
+            }
+          }}
+        >
           <RailDevicePicker
             devices={devices}
             hosts={hosts}
@@ -5173,6 +5541,16 @@ function Rail({
               <p className="drawer-empty">{tx("workspace.noLooseConversations")}</p>
             )}
           </section>
+          {catalogHasMore ? (
+            <button
+              type="button"
+              className="drawer-show-more"
+              disabled={catalogLoadingMore}
+              onClick={onLoadMoreCatalog}
+            >
+              {catalogLoadingMore ? tx("common.loading") : tx("workspace.loadOlderSessions")}
+            </button>
+          ) : null}
         </div>
 
         <div className="drawer-footer nav-stack">
@@ -5232,6 +5610,7 @@ function SessionsPage({
   onSendPrompt,
   onCancelInject,
   onToggleVoiceInput,
+  realtime,
 }: {
   sessions: SessionListItem[];
   sessionGroups: SessionGroup[];
@@ -5274,6 +5653,7 @@ function SessionsPage({
   onSendPrompt: () => void;
   onCancelInject: () => void;
   onToggleVoiceInput: () => void;
+  realtime?: SessionSubscription | null;
 }) {
   const visibleTurns = selectedSession ? visibleConversationTurns(turns) : [];
   const hasOlderTurns = hasEarlierTurns(turnsHydration, visibleTurns, selectedSession);
@@ -5620,7 +6000,10 @@ function SessionsPage({
           </div>
           <footer className="agent-composer pockly-empty-composer-zone">
             {showConversationView ? (
-              <PermissionRequestsPanel turns={turns} />
+              <PermissionRequestsPanel
+                turns={turns}
+                realtime={realtime ?? null}
+              />
             ) : null}
             {selectedSession && canControlSession(selectedSession) ? (
               <ClaudeCodePillsRow
@@ -6145,6 +6528,25 @@ function WorkspaceComposerDock({
 //
 // Only mounted when the selected session's agent === "claude-code" so
 // Codex / future agents don't render an unsupported control surface.
+const AGENT_SETTINGS_RETRY_BASE_MS = 4000;
+const AGENT_SETTINGS_RETRY_MAX_MS = 60000;
+const SESSION_DIFF_RETRYABLE_ERROR_COOLDOWN_MS = 60000;
+
+function isRetryableDaemonReadError(error: unknown): boolean {
+  if (error instanceof AuthExpiredError) return false;
+  if (error instanceof DOMException && error.name === "AbortError") return false;
+  if (error instanceof ApiError) {
+    return error.status === 0 || error.status === 408 || error.status === 429 || error.status >= 500;
+  }
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /failed to fetch|load failed|network|timeout|temporar|offline/i.test(message);
+}
+
+function daemonReadRetryDelayMs(attempt: number): number {
+  const cappedAttempt = Math.max(0, Math.min(10, attempt));
+  return Math.min(AGENT_SETTINGS_RETRY_MAX_MS, AGENT_SETTINGS_RETRY_BASE_MS * 2 ** cappedAttempt);
+}
+
 export function ClaudeCodePillsRow({
   sessionId,
   deviceId,
@@ -6188,6 +6590,7 @@ export function ClaudeCodePillsRow({
   // stale "daemon offline" error self-heals once it's back, instead of sticking
   // under the run-config pills forever.
   const [retryTick, setRetryTick] = useState(0);
+  const agentSettingsRetryAttemptRef = useRef(0);
   const [busyField, setBusyField] = useState<"" | "model" | "effort" | "permission_mode">("");
   // The model/effort/permission settings live in one combined "Run config"
   // pill whose popover is a 3-column panel; this tracks its open state.
@@ -6199,9 +6602,17 @@ export function ClaudeCodePillsRow({
   // change, after activity settles (debounced), and when the drawer opens.
   const [sheetDiffs, setSheetDiffs] = useState<SessionFileDiff[]>([]);
   const [diffsOpen, setDiffsOpen] = useState(false);
+  const diffFailureCooldownRef = useRef<{ key: string; retryAfterMs: number } | null>(null);
   useEffect(() => {
     if (draftMode || !sessionId || !deviceId) {
       setSheetDiffs([]);
+      return;
+    }
+    const diffKey = `${deviceId}:${sessionId}`;
+    const cooldown = diffFailureCooldownRef.current;
+    if (cooldown && cooldown.key !== diffKey) {
+      diffFailureCooldownRef.current = null;
+    } else if (cooldown && Date.now() < cooldown.retryAfterMs) {
       return;
     }
     let cancelled = false;
@@ -6210,11 +6621,22 @@ export function ClaudeCodePillsRow({
       void getSessionDiff({ sessionId, deviceId, signal: ctrl.signal })
         .then((res) => {
           if (cancelled) return;
+          if (diffFailureCooldownRef.current?.key === diffKey) {
+            diffFailureCooldownRef.current = null;
+          }
           setSheetDiffs(res.status === "ok" ? parseUnifiedDiff(res.diff || "") : []);
         })
-        .catch(() => {
+        .catch((err: unknown) => {
+          if (cancelled || ctrl.signal.aborted) return;
           // Keep the last known diff on a transient error (daemon momentarily
-          // offline, request aborted) — don't flicker the pill to empty.
+          // offline) — don't flicker the pill to empty or hammer a 503ing
+          // daemon-backed endpoint on every render/turn update.
+          diffFailureCooldownRef.current = {
+            key: diffKey,
+            retryAfterMs: isRetryableDaemonReadError(err)
+              ? Date.now() + SESSION_DIFF_RETRYABLE_ERROR_COOLDOWN_MS
+              : Number.POSITIVE_INFINITY,
+          };
         });
     }, 500);
     return () => {
@@ -6311,6 +6733,7 @@ export function ClaudeCodePillsRow({
     if (!sessionId || !deviceId || draftMode) return;
     setSnapshot(null);
     setError("");
+    agentSettingsRetryAttemptRef.current = 0;
     // Reset effort/model/permission so sendPromptForSession never inherits a
     // stale choice from a prior session; draft-session start_task consumes
     // these before a real agent-settings row exists.
@@ -6328,6 +6751,7 @@ export function ClaudeCodePillsRow({
       .then((data) => {
         setSnapshot(data);
         setError("");
+        agentSettingsRetryAttemptRef.current = 0;
         // Sync local model/effort/permission up to App.tsx so the send path
         // uses the remembered choice without waiting for the user to re-pick.
         onModelChange?.(data.current.model ?? "");
@@ -6341,7 +6765,11 @@ export function ClaudeCodePillsRow({
         // — see the composer-pills-error gate — so a background-refresh blip
         // after the pills loaded never flashes the alarm.
         setError(err instanceof Error ? err.message : String(err));
-        retryTimer = window.setTimeout(() => setRetryTick((t) => t + 1), 4000);
+        if (isRetryableDaemonReadError(err)) {
+          const delayMs = daemonReadRetryDelayMs(agentSettingsRetryAttemptRef.current);
+          agentSettingsRetryAttemptRef.current += 1;
+          retryTimer = window.setTimeout(() => setRetryTick((t) => t + 1), delayMs);
+        }
       })
       .finally(() => {
         if (!ctrl.signal.aborted) setLoading(false);
@@ -7075,11 +7503,13 @@ function LiveTerminalPage({
   devices,
   hosts,
   sessions,
+  realtime,
   onBack,
 }: {
   devices: Device[];
   hosts: HostSummary[];
   sessions: SessionListItem[];
+  realtime: SessionSubscription | null;
   onBack: () => void;
 }) {
   const cwdOptions = uniqueValues(sessions.map((session) => session.cwd).filter(Boolean));
@@ -7166,6 +7596,8 @@ function LiveTerminalPage({
     setStatus(nextStatus);
     void streamTerminalSession({
       terminalSessionId: session.terminal_session_id,
+      daemonDeviceId: session.daemon_device_id,
+      realtime,
       signal: controller.signal,
       onEvent: applyTerminalEvent,
     }).catch((error) => {
@@ -7187,6 +7619,7 @@ function LiveTerminalPage({
         sessionId: selectedSessionId || undefined,
         agent: "claude-code",
         cwd: cwd.trim(),
+        realtime,
       });
       attachTerminalStream(created.terminal_session, "Terminal connected. Waiting for Claude prompt...", true);
     } catch (error) {
@@ -7202,7 +7635,7 @@ function LiveTerminalPage({
     setInput("");
     setStatus("Sent. Waiting for Claude output...");
     try {
-      await sendTerminalInput(terminalSession.terminal_session_id, text);
+      await sendTerminalInput(terminalSession.terminal_session_id, text, realtime, terminalSession.daemon_device_id);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to send input.");
     }
@@ -7213,7 +7646,7 @@ function LiveTerminalPage({
     setOpeningTerminal(true);
     setStatus("Opening Terminal.app...");
     try {
-      await openTerminalSession(terminalSession.terminal_session_id);
+      await openTerminalSession(terminalSession.terminal_session_id, realtime, terminalSession.daemon_device_id);
       setStatus("Terminal.app is attaching to this live session.");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to open Terminal.app.");
@@ -7225,7 +7658,7 @@ function LiveTerminalPage({
   async function stopLiveTerminal() {
     if (!terminalSession) return;
     try {
-      await stopTerminalSession(terminalSession.terminal_session_id);
+      await stopTerminalSession(terminalSession.terminal_session_id, realtime, terminalSession.daemon_device_id);
       setStatus("Stop requested. Waiting for terminal exit...");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Failed to stop terminal.");
@@ -7544,6 +7977,8 @@ function MinimalLiveTerminalTest({
     setStatus(nextStatus);
     void streamTerminalSession({
       terminalSessionId: session.terminal_session_id,
+      daemonDeviceId: session.daemon_device_id,
+      realtime: null,
       signal: controller.signal,
       onEvent: (event) => {
         setEvents((current) => [...current, event]);
@@ -7623,6 +8058,7 @@ function MinimalLiveTerminalTest({
         sessionId: sessions[0]?.session_id,
         agent: "claude-code",
         cwd: cwd.trim(),
+        realtime: null,
       });
       attachTerminalStream(created.terminal_session, "Connected. Waiting for Claude...");
     } catch (error) {
@@ -7667,7 +8103,7 @@ function MinimalLiveTerminalTest({
       if (devTerminalRef.current) {
         await sendDevTerminalInput(terminalSession.terminal_session_id, text);
       } else {
-        await sendTerminalInput(terminalSession.terminal_session_id, text);
+        await sendTerminalInput(terminalSession.terminal_session_id, text, null, terminalSession.daemon_device_id);
       }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Send failed");
@@ -7677,7 +8113,7 @@ function MinimalLiveTerminalTest({
   async function stopLiveTerminal() {
     if (!terminalSession) return;
     try {
-      await stopTerminalSession(terminalSession.terminal_session_id);
+      await stopTerminalSession(terminalSession.terminal_session_id, null, terminalSession.daemon_device_id);
       setStatus("Stopping...");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Stop failed");
@@ -9330,7 +9766,7 @@ export function pendingPermissionPayloads(turns: SessionTurn[]): ToolPayload[] {
 // Permission requests are transient agent controls, not conversation content.
 // Render them close to the composer and suppress immediately after a local
 // decision so an approval never leaves behind an "Allowed..." history card.
-export function PermissionRequestsPanel({ turns }: { turns: SessionTurn[] }) {
+export function PermissionRequestsPanel({ turns, realtime }: { turns: SessionTurn[]; realtime?: SessionSubscription | null }) {
   const [locallyResolved, setLocallyResolved] = useState<Set<string>>(() => new Set());
   const pending = useMemo(() => pendingPermissionPayloads(turns), [turns]);
 
@@ -9363,6 +9799,7 @@ export function PermissionRequestsPanel({ turns }: { turns: SessionTurn[] }) {
         <PermissionRequestCard
           key={payload.permission_request_id}
           payload={payload}
+          realtime={realtime ?? null}
           onResolved={(requestId) => {
             setLocallyResolved((current) => {
               if (current.has(requestId)) return current;
@@ -10235,9 +10672,11 @@ function parsePermissionPreview(raw: string): { command: string; description: st
 
 function PermissionRequestCard({
   payload,
+  realtime,
   onResolved,
 }: {
   payload: ToolPayload;
+  realtime?: SessionSubscription | null;
   onResolved?: (requestId: string) => void;
 }) {
   const requestId = payload.permission_request_id ?? "";
@@ -10257,7 +10696,7 @@ function PermissionRequestCard({
     setSubmitting(choice);
     setError("");
     try {
-      const ack = await decidePermissionRequest(requestId, daemonDeviceId, choice);
+      const ack = await decidePermissionRequest(requestId, daemonDeviceId, choice, realtime ?? null);
       if (ack.status === "accepted") {
         if (requestId) onResolved?.(requestId);
       } else if (ack.status === "not_found") {
@@ -12474,6 +12913,10 @@ function isReaderRoute(route: Route) {
   return route.view === "workspaceSessions" || route.view === "workspaceSession";
 }
 
+function isWorkspaceLiveRoute(route: Route) {
+  return route.view === "workspaceLive";
+}
+
 function isPublicRoute(route: Route) {
   return route.view === "duplexTest" || route.view === "mobileJoin";
 }
@@ -12872,6 +13315,36 @@ function lastConfirmedSeq(turns: SessionTurn[]) {
   return max;
 }
 
+export function sessionTurnsFetchOptionsForCachedOpen(turns: SessionTurn[]) {
+  const cachedMaxSeq = lastConfirmedSeq(turns);
+  return {
+    limit: SESSION_TURNS_WINDOW_LIMIT,
+    ...(cachedMaxSeq > 0 ? { afterSeq: cachedMaxSeq } : {}),
+  };
+}
+
+export function shouldFetchHotTailAfterIncremental({
+  cachedMaxSeq,
+  response,
+  session,
+  limit = SESSION_TURNS_WINDOW_LIMIT,
+}: {
+  cachedMaxSeq: number;
+  response: SessionTurnsResponse;
+  session?: SessionListItem | null | undefined;
+  limit?: number;
+}) {
+  if (cachedMaxSeq <= 0) return false;
+  const responseLatestSeq = Number(response.latest_seq ?? response.turns.at(-1)?.seq ?? 0) || 0;
+  const syncedMaxSeq = Number(response.synced_max_seq ?? session?.synced_max_seq ?? session?.last_seq ?? session?.turn_count ?? 0) || 0;
+  const expectedLatestSeq = Math.max(responseLatestSeq, syncedMaxSeq);
+  if (expectedLatestSeq <= cachedMaxSeq) return false;
+  const loadedIncremental = response.turns.length;
+  if (responseLatestSeq >= expectedLatestSeq) return false;
+  if (loadedIncremental >= limit) return true;
+  return expectedLatestSeq - cachedMaxSeq > loadedIncremental;
+}
+
 export function isAgentResponseTurnAfter(turn: SessionTurn, baselineSeq: number) {
   if (turn.seq <= baselineSeq || turn.seq >= 900_000_000) return false;
   if (turn.kind === "user_message" || turn.kind === "thinking") return false;
@@ -12952,6 +13425,10 @@ export function shouldRestoreFailedSendOnControlError(phase: InjectPhase, reache
   return phase === "idle" || phase === "started";
 }
 
+export function shouldScheduleInjectRefreshAfterStream(phase: InjectPhase) {
+  return phase !== "completed" && phase !== "failed" && phase !== "cancelled";
+}
+
 function hasSession(sessions: SessionListItem[], selection: ReaderSelection) {
   return sessions.some((session) => session.session_id === selection.sessionId && session.device_id === selection.deviceId);
 }
@@ -13020,10 +13497,28 @@ function shouldLazySyncSession(session: SessionListItem) {
 
 export const AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT = 1000;
 
-export function isLargeSessionForAutomaticBackfill(session: SessionListItem | null | undefined) {
+export function isLargeSession(session: SessionListItem | null | undefined) {
   const total = Number(session?.turn_count ?? session?.last_seq ?? 0) || 0;
+  return total > AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT;
+}
+
+export function isLargeSessionForAutomaticBackfill(session: SessionListItem | null | undefined) {
   const loaded = Number(session?.synced_turn_count ?? 0) || 0;
-  return total > AUTOMATIC_SESSION_BACKFILL_TURN_LIMIT && loaded < total;
+  const total = Number(session?.turn_count ?? session?.last_seq ?? 0) || 0;
+  return isLargeSession(session) && loaded < total;
+}
+
+export function sessionCatalogRefreshIntervalForSession(session: SessionListItem | null | undefined) {
+  return isLargeSession(session) ? LARGE_SESSION_CATALOG_REFRESH_MS : SESSION_CATALOG_REFRESH_MS;
+}
+
+export function injectPollOptionsForSession(session: SessionListItem | null | undefined, realtimeLive: boolean) {
+  // With the realtime socket live, TURN pushes carry the content and this poll
+  // only tracks lifecycle. Large local-first sessions also use a slower poll
+  // because their history reads are intentionally on-demand and cost-bounded.
+  if (realtimeLive) return { pollIntervalMs: CONTROL_EVENT_POLL_RELAXED_MS };
+  if (isLargeSession(session)) return { pollIntervalMs: LARGE_SESSION_ACTIVE_EVENT_POLL_MS };
+  return {};
 }
 
 export function shouldSyncSessionOnOpen(session: SessionListItem, turns: SessionTurn[]) {
@@ -13032,6 +13527,13 @@ export function shouldSyncSessionOnOpen(session: SessionListItem, turns: Session
   const state = sessionSyncState(session);
   if (state === "ready" || state === "fully_synced") return false;
   return shouldLazySyncSession(session);
+}
+
+export function shouldRefreshPersistentTurnsAfterSync(receivedTransientTurns: boolean) {
+  // SYNC_SESSION_EVENT turns are intentionally transient for local-first
+  // history windows. Re-reading /turns after receiving them can replace the
+  // in-memory window with an empty remote hot window for large sessions.
+  return !receivedTransientTurns;
 }
 
 export function nextLazyBackfillBeforeSeq(
@@ -13063,7 +13565,7 @@ export function hasEarlierTurns(
   session: SessionListItem | null,
 ) {
   if (Number(hydration?.next_loaded_before_seq ?? 0) > 1) return true;
-  if (Boolean(hydration?.has_older_turns || session?.has_older_turns)) return true;
+  if (hydration?.has_older_turns || session?.has_older_turns) return true;
   const total = Number(hydration?.total_turn_count ?? session?.turn_count ?? session?.last_seq ?? 0) || 0;
   return total > loadedTurnCount(hydration, turns);
 }
@@ -13074,7 +13576,7 @@ function isCompleteTurnsResponse(response: SessionTurnsResponse | null | undefin
 }
 
 function mergeTurnHydration(current: SessionTurnsResponse | null, incoming: SessionTurnsResponse): SessionTurnsResponse {
-  if (!current) return incoming;
+  if (!current) return { ...incoming, source: sessionTurnsHydrationSource(incoming) };
   const oldestSeq = Math.min(
     positiveSeq(current.oldest_seq, incoming.oldest_seq),
     positiveSeq(incoming.oldest_seq, current.oldest_seq),
@@ -13086,12 +13588,81 @@ function mergeTurnHydration(current: SessionTurnsResponse | null, incoming: Sess
     turns: mergeTurns(current.turns ?? [], incoming.turns ?? []),
     next_loaded_before_seq: incoming.next_loaded_before_seq ?? 0,
     has_older_turns: Boolean(incoming.has_older_turns || current.has_older_turns),
+    source: mergeSessionTurnsSources(current, incoming),
   };
   if (oldestSeq > 0) out.oldest_seq = oldestSeq;
   if (latestSeq > 0) out.latest_seq = latestSeq;
   const nextBeforeSeq = incoming.next_before_seq ?? current.next_before_seq;
   if (nextBeforeSeq !== undefined) out.next_before_seq = nextBeforeSeq;
   return out;
+}
+
+function incrementalTurnsHydration(
+  current: SessionTurnsResponse | null,
+  incoming: SessionTurnsResponse,
+  turns: SessionTurn[],
+): SessionTurnsResponse {
+  const oldest = Number(turns[0]?.seq ?? current?.oldest_seq ?? incoming.oldest_seq ?? 0) || 0;
+  const latest = Number(turns[turns.length - 1]?.seq ?? incoming.latest_seq ?? current?.latest_seq ?? 0) || 0;
+  const out: SessionTurnsResponse = {
+    ...(current ?? incoming),
+    ...incoming,
+    turns,
+    ...(oldest ? { oldest_seq: oldest } : {}),
+    ...(latest ? { latest_seq: latest } : {}),
+    next_loaded_before_seq: current?.next_loaded_before_seq ?? incoming.next_loaded_before_seq ?? 0,
+    has_older_turns: Boolean(incoming.has_older_turns || current?.has_older_turns),
+    source: mergeSessionTurnsSources(current, incoming),
+  };
+  const syncedTurnCount = incoming.synced_turn_count ?? current?.synced_turn_count;
+  const syncedMinSeq = incoming.synced_min_seq ?? current?.synced_min_seq;
+  const syncedMaxSeq = incoming.synced_max_seq ?? current?.synced_max_seq;
+  const latestContiguousMinSeq = incoming.latest_contiguous_min_seq ?? current?.latest_contiguous_min_seq;
+  const nextBeforeSeq = incoming.next_before_seq ?? current?.next_before_seq;
+  const totalTurnCount = incoming.total_turn_count ?? current?.total_turn_count;
+  if (syncedTurnCount !== undefined) out.synced_turn_count = syncedTurnCount;
+  if (syncedMinSeq !== undefined) out.synced_min_seq = syncedMinSeq;
+  if (syncedMaxSeq !== undefined) out.synced_max_seq = syncedMaxSeq;
+  if (latestContiguousMinSeq !== undefined) out.latest_contiguous_min_seq = latestContiguousMinSeq;
+  if (nextBeforeSeq !== undefined) out.next_before_seq = nextBeforeSeq;
+  if (totalTurnCount !== undefined) out.total_turn_count = totalTurnCount;
+  return out;
+}
+
+export function transientTurnsHydration(sessionId: string, turns: SessionTurn[], event: SyncSessionEvent): SessionTurnsResponse {
+  const sorted = [...turns].sort((a, b) => Number(a.seq) - Number(b.seq));
+  const oldest = Number(sorted[0]?.seq ?? 0) || 0;
+  const latest = Number(sorted[sorted.length - 1]?.seq ?? 0) || 0;
+  return {
+    session_id: sessionId,
+    turns: sorted,
+    source: "local_transient",
+    ...(oldest ? { oldest_seq: oldest } : {}),
+    ...(latest ? { latest_seq: latest } : {}),
+    window_limit: sorted.length,
+    next_loaded_before_seq: 0,
+    synced_turn_count: sorted.length,
+    synced_min_seq: oldest,
+    synced_max_seq: latest,
+    latest_contiguous_min_seq: oldest,
+    next_before_seq: oldest > 1 && (event.has_older || Number(event.total_turn_count ?? 0) > sorted.length) ? oldest : 0,
+    ...(event.total_turn_count !== undefined ? { total_turn_count: event.total_turn_count } : {}),
+    has_older_turns: Boolean(event.has_older || oldest > 1),
+  };
+}
+
+function sessionTurnsHydrationSource(response: SessionTurnsResponse | null | undefined): NonNullable<SessionTurnsResponse["source"]> {
+  return response?.source ?? "remote_hot_window";
+}
+
+function mergeSessionTurnsSources(
+  current: SessionTurnsResponse | null | undefined,
+  incoming: SessionTurnsResponse | null | undefined,
+): NonNullable<SessionTurnsResponse["source"]> {
+  const left = sessionTurnsHydrationSource(current);
+  const right = sessionTurnsHydrationSource(incoming);
+  if (left === right) return left;
+  return "mixed";
 }
 
 function positiveSeq(value: unknown, fallback: unknown) {
@@ -13163,6 +13734,18 @@ export function shouldUseBrowserRealtime(capabilities: NexusRuntimeCapabilities 
   return capabilities?.browser_realtime === true;
 }
 
+export function shouldUseBrowserRealtimeControl(capabilities: NexusRuntimeCapabilities | null | undefined) {
+  return capabilities?.browser_realtime === true && capabilities?.browser_realtime_control === true;
+}
+
+export function shouldAutoAttachReaderTerminalBridge(capabilities: NexusRuntimeCapabilities | null | undefined) {
+  // SaaS managed runtimes keep browser reader pages local-first and polling
+  // based; terminal streaming is an explicit user action, not an automatic
+  // read-screen side effect. Unknown runtime defaults closed so bootstrap does
+  // not briefly open a terminal poll before /api/runtime resolves.
+  return capabilities?.runtime === "self_hosted";
+}
+
 export function shouldRefreshSessionCatalog({
   now,
   lastSessionRefreshAt,
@@ -13177,6 +13760,52 @@ export function shouldRefreshSessionCatalog({
   intervalMs?: number;
 }) {
   return force || (visible && now - lastSessionRefreshAt >= intervalMs);
+}
+
+export function shouldLoadMoreSessionCatalogFromScroll({
+  scrollTop,
+  scrollHeight,
+  clientHeight,
+  hasMore,
+  loading,
+  prefetchPx = SESSION_CATALOG_PREFETCH_PX,
+}: {
+  scrollTop: number;
+  scrollHeight: number;
+  clientHeight: number;
+  hasMore: boolean;
+  loading: boolean;
+  prefetchPx?: number;
+}) {
+  if (!hasMore || loading) return false;
+  const remaining = Math.max(0, scrollHeight - scrollTop - clientHeight);
+  return remaining <= Math.max(0, prefetchPx);
+}
+
+export function shouldFallbackToFullSessionCatalog(error: unknown, hasCachedCatalog: boolean) {
+  if (!hasCachedCatalog) return true;
+  if (!(error instanceof ApiError)) return false;
+  if (error.status === 404 || error.status === 501) return true;
+  const code = error.data && typeof error.data === "object" ? String((error.data as { code?: unknown }).code || "") : "";
+  return code === "unsupported_runtime" || code === "not_supported";
+}
+
+export function shouldPollWorkspacePresence({
+  now,
+  visible,
+  hiddenSinceAt,
+  force = false,
+  pauseAfterMs = BACKGROUND_PRESENCE_PAUSE_AFTER_MS,
+}: {
+  now: number;
+  visible: boolean;
+  hiddenSinceAt: number;
+  force?: boolean;
+  pauseAfterMs?: number;
+}) {
+  if (force || visible) return true;
+  if (!hiddenSinceAt) return true;
+  return now - hiddenSinceAt <= pauseAfterMs;
 }
 
 export function mergeHostPresenceIntoSessions(sessions: SessionListItem[], hosts: HostSummary[]) {

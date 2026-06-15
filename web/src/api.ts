@@ -223,6 +223,7 @@ export type SyncSessionEvent = {
   message?: string;
   error?: string;
   streaming?: boolean;
+  turns?: SessionTurn[];
 };
 
 export type CursorEventResponse<TEvent> = {
@@ -249,9 +250,14 @@ export type SessionEventCursorResponse<TEvent extends InjectEvent | SyncSessionE
 export type SessionTurnsResponse = {
   session_id: string;
   turns: SessionTurn[];
+  // Distinguishes durable cloud hot-window rows from transient local daemon
+  // history windows. Transient windows are never proof that Nexus has persisted
+  // the full range.
+  source?: "remote_hot_window" | "local_transient" | "mixed";
   oldest_seq?: number;
   latest_seq?: number;
   window_limit?: number;
+  after_seq?: number;
   next_loaded_before_seq?: number;
   synced_turn_count?: number;
   synced_min_seq?: number;
@@ -338,7 +344,54 @@ export type DaemonSessionBlocks = {
 
 export type SessionSubscription = {
   close: () => void;
+  sendCommand?: <TEvent = unknown>(input: RealtimeCommandInput<TEvent>) => Promise<RealtimeCommandAccepted>;
+  subscribeSession?: (sessionId: string, deviceId: string, afterSeq?: number) => void;
+  unsubscribeSession?: (sessionId: string, deviceId: string) => void;
+  subscribeTerminal?: (terminalSessionId: string, onEvent: (event: TerminalEvent) => void, options?: { notifyServer?: boolean }) => Promise<void>;
+  unsubscribeTerminal?: (terminalSessionId: string) => Promise<void>;
 };
+
+export type RealtimeCommandAccepted = {
+  request_id: string;
+  command: string;
+  status: string;
+  session_id?: string;
+  device_id?: string;
+  terminal_session_id?: string;
+  terminal_session?: TerminalSession;
+};
+
+export type RealtimeCommandInput<TEvent = unknown> = {
+  requestId?: string;
+  command: string;
+  daemonDeviceId: string;
+  sessionId?: string;
+  terminalSessionId?: string;
+  payload?: Record<string, unknown>;
+  onEvent?: (event: TEvent) => void;
+  signal?: AbortSignal | undefined;
+  ackTimeoutMs?: number;
+};
+
+let activeWorkspaceRealtime: SessionSubscription | null = null;
+
+export function setActiveWorkspaceRealtime(subscription: SessionSubscription | null) {
+  activeWorkspaceRealtime = subscription;
+}
+
+function preferredRealtime(input?: SessionSubscription | null) {
+  return input ?? activeWorkspaceRealtime;
+}
+
+function realtimeSessionKey(sessionId: string, deviceId: string) {
+  return `${deviceId}:${sessionId}`;
+}
+
+function randomRealtimeID(prefix: string) {
+  const cryptoLike = globalThis.crypto as Crypto | undefined;
+  const randomUUID = cryptoLike && typeof cryptoLike.randomUUID === "function" ? cryptoLike.randomUUID.bind(cryptoLike) : null;
+  return `${prefix}_${randomUUID ? randomUUID() : Math.random().toString(36).slice(2)}`;
+}
 
 export type PushRegistration = {
   subscription_id: string;
@@ -361,6 +414,7 @@ export type NexusRuntimeCapabilities = {
   runtime: string;
   realtime?: boolean;
   browser_realtime?: boolean;
+  browser_realtime_control?: boolean;
   control_streaming?: boolean;
   terminal?: boolean;
   terminal_streaming?: boolean;
@@ -426,7 +480,7 @@ async function fetchJSON<T>(url: string, init?: RequestInit): Promise<T> {
       invalidateBrowserDeviceToken();
       throw new AuthExpiredError(message);
     }
-    throw new Error(message);
+    throw new ApiError(message, res.status, data);
   }
   if (!data) return undefined as T;
   return data as T;
@@ -471,6 +525,10 @@ function parseJSONBody(text: string): unknown {
   } catch {
     return null;
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
 export async function getSession() {
@@ -769,6 +827,36 @@ export async function listSessions() {
   return fetchWithBrowserDevice<{ sessions: SessionListItem[] }>("/api/sessions");
 }
 
+export type SessionCatalogDelete = {
+  device_id: string;
+  session_id: string;
+};
+
+export type SessionCatalogDelta = {
+  upserts: SessionListItem[];
+  deletes: SessionCatalogDelete[];
+  next_cursor: string;
+  next_page_cursor?: string;
+  has_more: boolean;
+  reset?: boolean;
+};
+
+export async function listSessionsDelta(input: { since?: string; limit?: number; pageCursor?: string } = {}) {
+  const params = new URLSearchParams();
+  if (input.since) params.set("since", input.since);
+  if (input.limit) params.set("limit", String(input.limit));
+  if (input.pageCursor) params.set("page_cursor", input.pageCursor);
+  const query = params.toString();
+  return fetchWithBrowserDevice<SessionCatalogDelta>(`/api/sessions/delta${query ? `?${query}` : ""}`);
+}
+
+export async function getSessionCatalogItem(sessionId: string, deviceId: string) {
+  return fetchWithBrowserDevice<{ session: SessionListItem }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}`,
+    { device_id: deviceId },
+  );
+}
+
 export async function registerCurrentBrowserDevice() {
   const browserState = await ensureBrowserDeviceState();
   const registered = await fetchJSON<{
@@ -792,13 +880,14 @@ export async function registerCurrentBrowserDevice() {
   return registered;
 }
 
-export async function getSessionTurns(sessionId: string, deviceId: string, options: { limit?: number; beforeSeq?: number } = {}) {
+export async function getSessionTurns(sessionId: string, deviceId: string, options: { limit?: number; beforeSeq?: number; afterSeq?: number } = {}) {
   return await fetchWithBrowserDevice<SessionTurnsResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/turns`,
     {
       device_id: deviceId,
       ...(options.limit !== undefined ? { limit: options.limit } : {}),
       ...(options.beforeSeq !== undefined ? { before_seq: options.beforeSeq } : {}),
+      ...(options.afterSeq !== undefined ? { after_seq: options.afterSeq } : {}),
     },
   );
 }
@@ -820,6 +909,7 @@ export async function streamSessionInject(input: {
   // Relaxed steady poll cadence (e.g. CONTROL_EVENT_POLL_RELAXED_MS) when a
   // live realtime subscription already carries the turns.
   pollIntervalMs?: number;
+  realtime?: SessionSubscription | null;
   onEvent: (event: InjectEvent) => void;
 }) {
   const url = `/api/sessions/${encodeURIComponent(input.sessionId)}/inject`;
@@ -834,6 +924,38 @@ export async function streamSessionInject(input: {
     if (input.model) form.set("model", input.model);
     for (const file of input.files) form.append("files", file, file.name);
     return streamControlMultipart<InjectEvent>(url, query, form, input.onEvent, input.signal, pollOptions);
+  }
+  const realtime = preferredRealtime(input.realtime);
+  if (realtime?.sendCommand) {
+    try {
+      const accepted = await realtime.sendCommand<InjectEvent>({
+        command: "inject_session",
+        daemonDeviceId: input.deviceId,
+        sessionId: input.sessionId,
+        payload: { session_id: input.sessionId, text: input.text, model: input.model },
+        onEvent: input.onEvent,
+        signal: input.signal,
+      });
+      input.onEvent({
+        request_id: accepted.request_id,
+        type: "inject_started",
+        session_id: accepted.session_id || input.sessionId,
+        streaming: true,
+      });
+      await pollAcceptedControlEvents(buildControlURL(url, query), {
+        request_id: accepted.request_id,
+        type: "inject_started",
+        session_id: accepted.session_id || input.sessionId,
+        device_id: accepted.device_id || input.deviceId,
+        streaming: false,
+      } as InjectEvent, input.onEvent, input.signal, {
+        ...pollOptions,
+        pollIntervalMs: Math.max(CONTROL_EVENT_POLL_RELAXED_MS, pollOptions.pollIntervalMs || 0),
+      });
+      return;
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
   }
   return streamControl(
     url,
@@ -970,7 +1092,26 @@ export async function markSessionOpened(input: {
   sessionId: string;
   deviceId: string;
   openedAt?: string;
+  realtime?: SessionSubscription | null;
 }): Promise<{ device_id: string; session_id: string; last_opened_at: string }> {
+  const realtime = preferredRealtime(input.realtime);
+  if (realtime?.sendCommand) {
+    try {
+      const accepted = await realtime.sendCommand({
+        command: "session_opened_hint",
+        daemonDeviceId: input.deviceId,
+        sessionId: input.sessionId,
+        payload: { session_id: input.sessionId, opened_at: input.openedAt },
+      });
+      return {
+        device_id: accepted.device_id || input.deviceId,
+        session_id: accepted.session_id || input.sessionId,
+        last_opened_at: String((accepted as { last_opened_at?: string }).last_opened_at || input.openedAt || new Date().toISOString()),
+      };
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   return fetchJSON<{ device_id: string; session_id: string; last_opened_at: string }>(`/api/sessions/${encodeURIComponent(input.sessionId)}/opened`, {
     method: "POST",
@@ -1092,8 +1233,41 @@ export async function streamSessionSync(input: {
   limit?: number;
   beforeSeq?: number;
   signal?: AbortSignal;
+  realtime?: SessionSubscription | null;
   onEvent: (event: SyncSessionEvent) => void;
 }) {
+  const realtime = preferredRealtime(input.realtime);
+  if (realtime?.sendCommand) {
+    try {
+      const accepted = await realtime.sendCommand<SyncSessionEvent>({
+        command: "sync_session",
+        daemonDeviceId: input.deviceId,
+        sessionId: input.sessionId,
+        payload: { session_id: input.sessionId, limit: input.limit ?? DEFAULT_INITIAL_TURN_LIMIT, before_seq: input.beforeSeq ?? 0 },
+        onEvent: input.onEvent,
+        signal: input.signal,
+      });
+      const event = {
+        request_id: accepted.request_id,
+        session_id: accepted.session_id || input.sessionId,
+        device_id: accepted.device_id || input.deviceId,
+        stage: "queued",
+        status: "running",
+        streaming: true,
+      } as SyncSessionEvent;
+      input.onEvent(event);
+      await pollAcceptedControlEvents(
+        buildControlURL(`/api/sessions/${encodeURIComponent(input.sessionId)}/sync`, { device_id: input.deviceId }),
+        { ...event, streaming: false },
+        input.onEvent,
+        input.signal,
+        { afterSeq: input.beforeSeq ?? 0, pollIntervalMs: CONTROL_EVENT_POLL_RELAXED_MS },
+      );
+      return;
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   return streamControl(
     `/api/sessions/${encodeURIComponent(input.sessionId)}/sync`,
     { device_id: input.deviceId },
@@ -1112,8 +1286,43 @@ export async function streamNewTask(input: {
   permissionMode?: string;
   effort?: string;
   signal?: AbortSignal;
+  realtime?: SessionSubscription | null;
   onEvent: (event: InjectEvent) => void;
 }) {
+  const realtime = preferredRealtime(input.realtime);
+  if (realtime?.sendCommand) {
+    try {
+      const accepted = await realtime.sendCommand<InjectEvent>({
+        command: "start_task",
+        daemonDeviceId: input.daemonDeviceId,
+        payload: buildNewTaskRequestBody(input),
+        onEvent: input.onEvent,
+        signal: input.signal,
+      });
+      input.onEvent({
+        request_id: accepted.request_id,
+        type: "inject_started",
+        session_id: accepted.session_id || "",
+        streaming: true,
+      });
+      await pollAcceptedControlEvents(
+        buildControlURL("/api/tasks", undefined),
+        {
+          request_id: accepted.request_id,
+          type: "inject_started",
+          session_id: accepted.session_id || "",
+          device_id: accepted.device_id || input.daemonDeviceId,
+          streaming: false,
+        } as InjectEvent,
+        input.onEvent,
+        input.signal,
+        { afterSeq: 0, pollIntervalMs: CONTROL_EVENT_POLL_RELAXED_MS },
+      );
+      return;
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   return streamControl(
     "/api/tasks",
     undefined,
@@ -1189,7 +1398,25 @@ export async function createTerminalSession(input: {
   sessionId?: string | undefined;
   agent?: string;
   cwd: string;
+  realtime?: SessionSubscription | null;
 }) {
+  const realtime = preferredRealtime(input.realtime);
+  if (realtime?.sendCommand) {
+    try {
+      const accepted = await realtime.sendCommand<TerminalEvent>({
+        command: "terminal_create",
+        daemonDeviceId: input.daemonDeviceId,
+        payload: {
+          session_id: input.sessionId,
+          agent: input.agent ?? "claude-code",
+          cwd: input.cwd,
+        },
+      });
+      if (accepted.terminal_session) return { terminal_session: accepted.terminal_session };
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   return fetchJSON<{ terminal_session: TerminalSession }>("/api/terminal-sessions", {
     method: "POST",
@@ -1218,7 +1445,21 @@ export async function listTerminalSessions() {
   });
 }
 
-export async function sendTerminalInput(terminalSessionId: string, text: string) {
+export async function sendTerminalInput(terminalSessionId: string, text: string, realtime?: SessionSubscription | null, daemonDeviceId?: string) {
+  const preferred = preferredRealtime(realtime);
+  if (preferred?.sendCommand && daemonDeviceId) {
+    try {
+      await preferred.sendCommand({
+        command: "terminal_input",
+        daemonDeviceId,
+        terminalSessionId,
+        payload: { terminal_session_id: terminalSessionId, text },
+      });
+      return { status: "queued" };
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   return fetchJSON<{ status: string }>(`/api/terminal-sessions/${encodeURIComponent(terminalSessionId)}/input`, {
     method: "POST",
@@ -1231,7 +1472,21 @@ export async function sendTerminalInput(terminalSessionId: string, text: string)
   });
 }
 
-export async function stopTerminalSession(terminalSessionId: string) {
+export async function stopTerminalSession(terminalSessionId: string, realtime?: SessionSubscription | null, daemonDeviceId?: string) {
+  const preferred = preferredRealtime(realtime);
+  if (preferred?.sendCommand && daemonDeviceId) {
+    try {
+      await preferred.sendCommand({
+        command: "terminal_stop",
+        daemonDeviceId,
+        terminalSessionId,
+        payload: { terminal_session_id: terminalSessionId },
+      });
+      return { status: "queued" };
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   return fetchJSON<{ status: string }>(`/api/terminal-sessions/${encodeURIComponent(terminalSessionId)}/stop`, {
     method: "POST",
@@ -1242,7 +1497,21 @@ export async function stopTerminalSession(terminalSessionId: string) {
   });
 }
 
-export async function openTerminalSession(terminalSessionId: string) {
+export async function openTerminalSession(terminalSessionId: string, realtime?: SessionSubscription | null, daemonDeviceId?: string) {
+  const preferred = preferredRealtime(realtime);
+  if (preferred?.sendCommand && daemonDeviceId) {
+    try {
+      await preferred.sendCommand({
+        command: "terminal_open",
+        daemonDeviceId,
+        terminalSessionId,
+        payload: { terminal_session_id: terminalSessionId },
+      });
+      return { status: "queued" };
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   return fetchJSON<{ status: string }>(`/api/terminal-sessions/${encodeURIComponent(terminalSessionId)}/open-terminal`, {
     method: "POST",
@@ -1255,9 +1524,41 @@ export async function openTerminalSession(terminalSessionId: string) {
 
 export async function streamTerminalSession(input: {
   terminalSessionId: string;
+  daemonDeviceId?: string;
+  realtime?: SessionSubscription | null;
   signal?: AbortSignal;
   onEvent: (event: TerminalEvent) => void;
 }) {
+  const realtime = preferredRealtime(input.realtime);
+  if (realtime?.subscribeTerminal && input.daemonDeviceId) {
+    try {
+      await realtime.subscribeTerminal(input.terminalSessionId, input.onEvent, { notifyServer: false });
+      await realtime.sendCommand?.({
+        command: "terminal_subscribe",
+        daemonDeviceId: input.daemonDeviceId,
+        terminalSessionId: input.terminalSessionId,
+        payload: { terminal_session_id: input.terminalSessionId },
+        signal: input.signal,
+      });
+      await new Promise<void>((resolve) => {
+        const onAbort = () => {
+          realtime?.unsubscribeTerminal?.(input.terminalSessionId).catch(() => undefined);
+          resolve();
+        };
+        if (input.signal?.aborted) {
+          resolve();
+          return;
+        }
+        input.signal?.addEventListener("abort", onAbort, { once: true });
+        // The caller owns this stream lifetime through AbortController. Keep the
+        // promise pending so UI code mirrors the existing SSE behavior.
+      });
+      return;
+    } catch (error) {
+      await realtime?.unsubscribeTerminal?.(input.terminalSessionId).catch(() => undefined);
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   const token = auth.device_access_token;
   const init: RequestInit = {
@@ -1517,15 +1818,15 @@ export async function submitFeedback(input: {
   return data as FeedbackSubmission;
 }
 
-// Keepalive for the realtime socket. The server's Durable Object answers the
-// literal "POCKLY_PING" with "POCKLY_PONG" at the edge via the hibernation
-// auto-response pair — without waking (or billing) the DO — so this doubles as
-// a free dead-link detector: a missing PONG within the liveness window means
-// the link is gone and the socket reconnects.
+// Keepalive for the realtime socket. Some hosted realtime backends can answer
+// this literal ping/pong pair without waking the application handler, so this
+// doubles as a low-cost dead-link detector: a missing PONG within the liveness
+// window means the link is gone and the socket reconnects.
 export const REALTIME_KEEPALIVE_PING = "POCKLY_PING";
 export const REALTIME_KEEPALIVE_PONG = "POCKLY_PONG";
 export const REALTIME_KEEPALIVE_INTERVAL_MS = 30_000;
 export const REALTIME_LIVENESS_TIMEOUT_MS = 75_000;
+export const REALTIME_COMMAND_ACK_TIMEOUT_MS = 8_000;
 
 export type HostStatusUpdate = {
   device_id: string;
@@ -1536,9 +1837,9 @@ export type HostStatusUpdate = {
 };
 
 export function subscribeToSession(input: {
-  sessionId: string;
-  deviceId: string;
-  afterSeq: number;
+  sessionId?: string;
+  deviceId?: string;
+  afterSeq?: number;
   onTurn: (turn: SessionTurn) => void;
   onStatus: (status: WSState, detail?: string) => void;
   // Presence pushes for the user's daemons. While the subscription is live
@@ -1550,6 +1851,23 @@ export function subscribeToSession(input: {
   let reconnectTimer: number | null = null;
   let reconnectAttempt = 0;
   let keepaliveTimer: number | null = null;
+  const pendingCommands = new Map<string, {
+    command: string;
+    resolve: (accepted: RealtimeCommandAccepted) => void;
+    reject: (error: Error) => void;
+    onEvent?: (event: unknown) => void;
+    waitsForFinalEvent: boolean;
+    timer: number;
+  }>();
+  const sessionSubscriptions = new Map<string, { sessionId: string; deviceId: string; afterSeq: number }>();
+  const terminalSubscriptions = new Map<string, (event: TerminalEvent) => void>();
+  if (input.sessionId && input.deviceId) {
+    sessionSubscriptions.set(realtimeSessionKey(input.sessionId, input.deviceId), {
+      sessionId: input.sessionId,
+      deviceId: input.deviceId,
+      afterSeq: input.afterSeq ?? 0,
+    });
+  }
 
   const clearReconnect = () => {
     if (reconnectTimer != null) {
@@ -1563,6 +1881,21 @@ export function subscribeToSession(input: {
       window.clearInterval(keepaliveTimer);
       keepaliveTimer = null;
     }
+  };
+
+  const sendJSON = (payload: unknown) => {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(payload));
+    return true;
+  };
+
+  const sendSessionSubscription = (subscription: { sessionId: string; deviceId: string; afterSeq: number }) => {
+    return sendJSON({
+      type: "SUBSCRIBE_SESSION",
+      session_id: subscription.sessionId,
+      device_id: subscription.deviceId,
+      after_seq: subscription.afterSeq,
+    });
   };
 
   const scheduleReconnect = () => {
@@ -1593,12 +1926,10 @@ export function subscribeToSession(input: {
         lastLiveAt = Date.now();
         trackEvent("session_ws_opened");
         input.onStatus("connecting");
-        ws.send(JSON.stringify({
-          type: "SUBSCRIBE",
-          session_id: input.sessionId,
-          device_id: input.deviceId,
-          after_seq: input.afterSeq,
-        }));
+        for (const subscription of sessionSubscriptions.values()) sendSessionSubscription(subscription);
+        for (const terminalSessionId of terminalSubscriptions.keys()) {
+          ws.send(JSON.stringify({ type: "SUBSCRIBE_TERMINAL", terminal_session_id: terminalSessionId }));
+        }
         clearKeepalive();
         keepaliveTimer = window.setInterval(() => {
           if (closed || socket !== ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1618,7 +1949,7 @@ export function subscribeToSession(input: {
         // Edge-answered keepalive (and any other non-JSON frame) only counts
         // as liveness; it carries no payload.
         if (raw === REALTIME_KEEPALIVE_PONG || !raw.startsWith("{")) return;
-        let payload: { type?: string; turn?: SessionTurn; message?: string } & Partial<HostStatusUpdate>;
+        let payload: { type?: string; turn?: SessionTurn; message?: string; request_id?: string; command?: string; status?: string; event?: unknown; code?: string; error?: string; terminal_session_id?: string } & Partial<HostStatusUpdate>;
         try {
           payload = JSON.parse(raw);
         } catch {
@@ -1644,6 +1975,42 @@ export function subscribeToSession(input: {
               });
             }
             break;
+          case "COMMAND_ACK": {
+            const requestID = String(payload.request_id || "");
+            const pending = pendingCommands.get(requestID);
+            if (pending) {
+              window.clearTimeout(pending.timer);
+              pending.resolve(payload as RealtimeCommandAccepted);
+              if (!pending.waitsForFinalEvent) pendingCommands.delete(requestID);
+            }
+            break;
+          }
+          case "COMMAND_EVENT": {
+            const requestID = String(payload.request_id || "");
+            const pending = pendingCommands.get(requestID);
+            pending?.onEvent?.(payload.event);
+            if (isRealtimeCommandFinalEvent(payload.event)) {
+              window.clearTimeout(pending?.timer);
+              pendingCommands.delete(requestID);
+            }
+            break;
+          }
+          case "COMMAND_ERROR": {
+            const requestID = String(payload.request_id || "");
+            const pending = pendingCommands.get(requestID);
+            if (pending) {
+              window.clearTimeout(pending.timer);
+              pendingCommands.delete(requestID);
+              pending.reject(new InjectControlError(payload.error || payload.code || "realtime command failed"));
+            }
+            break;
+          }
+          case "TERMINAL_EVENT": {
+            if (payload.terminal_session_id && isRecord(payload.event)) {
+              terminalSubscriptions.get(payload.terminal_session_id)?.(payload.event as TerminalEvent);
+            }
+            break;
+          }
           case "ERROR":
             input.onStatus("error", payload.message ?? "subscription error");
             break;
@@ -1656,6 +2023,11 @@ export function subscribeToSession(input: {
           socket = null;
         }
         clearKeepalive();
+        for (const [requestID, pending] of pendingCommands) {
+          window.clearTimeout(pending.timer);
+          pendingCommands.delete(requestID);
+          pending.reject(new Error("realtime socket disconnected before command acknowledgement"));
+        }
         trackEvent("session_ws_closed");
         if (!closed) scheduleReconnect();
       });
@@ -1672,16 +2044,115 @@ export function subscribeToSession(input: {
   void connect();
 
   return {
+    sendCommand<TEvent = unknown>(commandInput: RealtimeCommandInput<TEvent>) {
+      if (closed || !socket || socket.readyState !== WebSocket.OPEN) {
+        return Promise.reject(new RealtimeNotOpenError());
+      }
+      const requestID = commandInput.requestId || randomRealtimeID("bcmd");
+      const message = {
+        type: "COMMAND",
+        request_id: requestID,
+        command: commandInput.command,
+        daemon_device_id: commandInput.daemonDeviceId,
+        ...(commandInput.sessionId ? { session_id: commandInput.sessionId } : {}),
+        ...(commandInput.terminalSessionId ? { terminal_session_id: commandInput.terminalSessionId } : {}),
+        payload: commandInput.payload || {},
+      };
+      return new Promise<RealtimeCommandAccepted>((resolve, reject) => {
+        let abortListenerAttached = false;
+        const cleanupAbort = () => {
+          const pending = pendingCommands.get(requestID);
+          if (!pending) return;
+          window.clearTimeout(pending.timer);
+          pendingCommands.delete(requestID);
+          commandInput.signal?.removeEventListener("abort", cleanupAbort);
+          reject(new DOMException("Aborted", "AbortError"));
+        };
+        const timer = window.setTimeout(() => {
+          pendingCommands.delete(requestID);
+          if (abortListenerAttached) commandInput.signal?.removeEventListener("abort", cleanupAbort);
+          reject(new RealtimeAckTimeoutError("realtime command acknowledgement timed out"));
+        }, Math.max(1, commandInput.ackTimeoutMs ?? REALTIME_COMMAND_ACK_TIMEOUT_MS));
+        const pendingEntry: {
+          command: string;
+          resolve: (accepted: RealtimeCommandAccepted) => void;
+          reject: (error: Error) => void;
+          onEvent?: (event: unknown) => void;
+          waitsForFinalEvent: boolean;
+          timer: number;
+        } = {
+          command: commandInput.command,
+          resolve: (accepted) => {
+            commandInput.signal?.removeEventListener("abort", cleanupAbort);
+            resolve(accepted);
+          },
+          reject: (error) => {
+            commandInput.signal?.removeEventListener("abort", cleanupAbort);
+            reject(error);
+          },
+          waitsForFinalEvent: typeof commandInput.onEvent === "function",
+          timer,
+        };
+        if (commandInput.onEvent) pendingEntry.onEvent = commandInput.onEvent as (event: unknown) => void;
+        pendingCommands.set(requestID, pendingEntry);
+        if (commandInput.signal) {
+          abortListenerAttached = true;
+          commandInput.signal.addEventListener("abort", cleanupAbort, { once: true });
+        }
+        try {
+          socket?.send(JSON.stringify(message));
+        } catch (error) {
+          window.clearTimeout(timer);
+          pendingCommands.delete(requestID);
+          commandInput.signal?.removeEventListener("abort", cleanupAbort);
+          reject(error instanceof Error ? error : new Error("failed to send realtime command"));
+        }
+      });
+    },
+    subscribeSession(sessionId: string, deviceId: string, afterSeq = 0) {
+      const subscription = { sessionId, deviceId, afterSeq };
+      sessionSubscriptions.set(realtimeSessionKey(sessionId, deviceId), subscription);
+      sendSessionSubscription(subscription);
+    },
+    unsubscribeSession(sessionId: string, deviceId: string) {
+      sessionSubscriptions.delete(realtimeSessionKey(sessionId, deviceId));
+      sendJSON({ type: "UNSUBSCRIBE_SESSION", session_id: sessionId, device_id: deviceId });
+    },
+    async subscribeTerminal(terminalSessionId: string, onEvent: (event: TerminalEvent) => void, options: { notifyServer?: boolean } = {}) {
+      terminalSubscriptions.set(terminalSessionId, onEvent);
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        terminalSubscriptions.delete(terminalSessionId);
+        throw new RealtimeNotOpenError();
+      }
+      if (options.notifyServer !== false && !sendJSON({ type: "SUBSCRIBE_TERMINAL", terminal_session_id: terminalSessionId })) {
+        terminalSubscriptions.delete(terminalSessionId);
+        throw new RealtimeNotOpenError();
+      }
+    },
+    async unsubscribeTerminal(terminalSessionId: string) {
+      terminalSubscriptions.delete(terminalSessionId);
+      sendJSON({ type: "UNSUBSCRIBE_TERMINAL", terminal_session_id: terminalSessionId });
+    },
     close() {
       closed = true;
       clearReconnect();
       clearKeepalive();
+      for (const [requestID, pending] of pendingCommands) {
+        window.clearTimeout(pending.timer);
+        pendingCommands.delete(requestID);
+        pending.reject(new Error("realtime socket closed"));
+      }
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-          type: "UNSUBSCRIBE",
-          session_id: input.sessionId,
-          device_id: input.deviceId,
-        }));
+        for (const subscription of sessionSubscriptions.values()) {
+          socket.send(JSON.stringify({
+            type: "UNSUBSCRIBE_SESSION",
+            session_id: subscription.sessionId,
+            device_id: subscription.deviceId,
+          }));
+        }
+        for (const terminalSessionId of terminalSubscriptions.keys()) {
+          socket.send(JSON.stringify({ type: "UNSUBSCRIBE_TERMINAL", terminal_session_id: terminalSessionId }));
+        }
       }
       socket?.close();
     },
@@ -1714,7 +2185,21 @@ export async function decidePermissionRequest(
   requestId: string,
   daemonDeviceId: string,
   decision: "allow" | "deny",
+  realtime?: SessionSubscription | null,
 ) {
+  const preferred = preferredRealtime(realtime);
+  if (preferred?.sendCommand) {
+    try {
+      await preferred.sendCommand({
+        command: "permission_decide",
+        daemonDeviceId,
+        payload: { permission_request_id: requestId, decision },
+      });
+      return { request_id: requestId, status: "accepted" };
+    } catch (error) {
+      if (!(error instanceof RealtimeNotOpenError)) throw error;
+    }
+  }
   const auth = await authenticateBrowserDevice();
   return fetchJSON<{ request_id: string; status: string; error?: string }>(
     `/api/permission-requests/${encodeURIComponent(requestId)}/decide`,
@@ -1762,6 +2247,31 @@ export class AuthExpiredError extends Error {
   constructor(message = "session expired") {
     super(message);
     this.name = "AuthExpiredError";
+  }
+}
+
+export class ApiError extends Error {
+  status: number;
+  data: unknown;
+  constructor(message: string, status: number, data: unknown = null) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.data = data;
+  }
+}
+
+export class RealtimeNotOpenError extends Error {
+  constructor(message = "realtime socket is not open") {
+    super(message);
+    this.name = "RealtimeNotOpenError";
+  }
+}
+
+export class RealtimeAckTimeoutError extends Error {
+  constructor(message = "realtime command acknowledgement timed out") {
+    super(message);
+    this.name = "RealtimeAckTimeoutError";
   }
 }
 
@@ -1901,9 +2411,10 @@ async function pollAcceptedControlEvents<TEvent extends InjectEvent | SyncSessio
     }
     const response = await fetchWithBrowserDevice<SessionEventCursorResponse<TEvent>>(pollURL.pathname + pollURL.search);
     cursor = response.next_cursor || cursor;
-    // Turn content arrives from session_turns (written once server-side) and
-    // is surfaced to callers as the same stream_event shape the SSE path
-    // produced, so the reader's append/merge logic is untouched.
+    // Turn content arrives from the server's active-turn feed: stable turns
+    // from session_turns plus transient stream deltas from the control cache.
+    // Both are surfaced as stream_event so the append/merge logic is shared
+    // with the SSE path.
     for (const turn of response.turns || []) {
       seqCursor = Math.max(seqCursor, Number(turn.seq) || 0);
       onEvent({ request_id: requestID, type: "stream_event", turn } as unknown as TEvent);
@@ -1924,6 +2435,10 @@ async function pollAcceptedControlEvents<TEvent extends InjectEvent | SyncSessio
           const next = controlEventsURL(finalURL, { ...(accepted as object), ...created } as TEvent, requestID);
           if (next?.pathname.startsWith("/api/sessions/")) pollURL = next;
         }
+        for (const turn of (event.payload as { turns?: SessionTurn[] }).turns || []) {
+          seqCursor = Math.max(seqCursor, Number(turn.seq) || 0);
+          onEvent({ request_id: requestID, type: "stream_event", turn } as unknown as TEvent);
+        }
         if (isTerminalControlEvent(event.payload)) return;
       }
     }
@@ -1943,6 +2458,14 @@ function controlEventsURL<TEvent extends InjectEvent | SyncSessionEvent>(finalUR
   return new URL(`/api/injects/${encodeURIComponent(requestID)}/events`, window.location.origin);
 }
 
+function isRealtimeCommandFinalEvent(event: unknown) {
+  if (!isRecord(event)) return false;
+  const type = String(event.type || event.stage || "");
+  const status = String(event.status || "");
+  return ["inject_completed", "inject_failed", "inject_cancelled", "completed", "failed"].includes(type) ||
+    ["completed", "failed", "cancelled"].includes(status);
+}
+
 function isTerminalControlEvent(event: InjectEvent | SyncSessionEvent) {
   const inject = event as InjectEvent;
   if (inject.type === "inject_completed" || inject.type === "inject_failed" || inject.type === "inject_cancelled") return true;
@@ -1956,9 +2479,15 @@ function sleep(ms: number, signal?: AbortSignal) {
       reject(new DOMException("Aborted", "AbortError"));
       return;
     }
-    const timer = window.setTimeout(resolve, ms);
+    const setTimer = typeof window !== "undefined" && typeof window.setTimeout === "function"
+      ? window.setTimeout.bind(window)
+      : globalThis.setTimeout.bind(globalThis);
+    const clearTimer = typeof window !== "undefined" && typeof window.clearTimeout === "function"
+      ? window.clearTimeout.bind(window)
+      : globalThis.clearTimeout.bind(globalThis);
+    const timer = setTimer(resolve, ms);
     signal?.addEventListener("abort", () => {
-      window.clearTimeout(timer);
+      clearTimer(timer);
       reject(new DOMException("Aborted", "AbortError"));
     }, { once: true });
   });

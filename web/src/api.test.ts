@@ -13,9 +13,18 @@ import {
   DEFAULT_INITIAL_TURN_LIMIT,
   TERMINAL_EVENT_POLL_INTERVAL_MS,
   buildNewTaskRequestBody,
+  getSessionCatalogItem,
+  getSessionTurns,
+  listSessionsDelta,
   markSessionOpened,
   reportWebTelemetry,
+  subscribeToSession,
+  createTerminalSession,
+  decidePermissionRequest,
+  sendTerminalInput,
+  stopTerminalSession,
   streamSessionSync,
+  streamTerminalSession,
 } from "./api";
 
 test("new task request body carries codex effort and permission settings", () => {
@@ -68,6 +77,225 @@ test("polling fallback event budget matches long-running agent turns", () => {
   assert.equal(CONTROL_EVENT_POLL_INTERVAL_MS, 2000);
   assert.equal(CONTROL_EVENT_POLL_MAX_MS, 35 * 60 * 1000);
   assert.equal(TERMINAL_EVENT_POLL_INTERVAL_MS, 2000);
+});
+
+test("session catalog delta API carries cursor and page limit", async () => {
+  const globals = globalThis as unknown as {
+    window: { location?: { origin?: string } } | undefined;
+    localStorage: Storage | undefined;
+    crypto: Crypto | undefined;
+    fetch: typeof fetch | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalFetch = globals.fetch;
+  const originalLocalStorage = globals.localStorage;
+  const originalCrypto = globals.crypto;
+  let requestedURL = "";
+  globals.window = { ...(originalWindow ?? {}), location: { origin: "https://pockly.test" } };
+  globals.localStorage = memoryStorage({
+    "pockly.browser_device": JSON.stringify({
+      deviceId: "bd_test",
+      devicePublicKey: "public",
+      devicePrivateKeyPkcs8: "private",
+      deviceAccessToken: "dt_test",
+      deviceRefreshToken: "drt_test",
+    }),
+  });
+  const testCrypto = {
+    ...(originalCrypto ?? {}),
+    subtle: {
+      ...(originalCrypto?.subtle ?? {}),
+      importKey: async () => ({} as CryptoKey),
+      sign: async () => new ArrayBuffer(0),
+    } as SubtleCrypto,
+  } as Crypto;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: testCrypto,
+  });
+  globals.fetch = (async (input) => {
+    const url = String(input);
+    if (url.includes("/api/device-challenge/verify")) {
+      return Response.json({ verified: true, device_access_token: "dt_test" });
+    }
+    if (url.includes("/api/device-challenge")) {
+      return Response.json({
+        challenge_id: "ch_test",
+        device_id: "bd_test",
+        audience: "browser-ws",
+        nonce: "nonce",
+      });
+    }
+    requestedURL = url;
+    return Response.json({
+      upserts: [],
+      deletes: [{ device_id: "dd_test", session_id: "sess_deleted" }],
+      next_cursor: "sc_next",
+      has_more: false,
+    });
+  }) as typeof fetch;
+  try {
+    const body = await listSessionsDelta({ since: "sc_prev", limit: 25, pageCursor: "pg_prev" });
+    const url = new URL(requestedURL);
+    assert.equal(url.pathname, "/api/sessions/delta");
+    assert.equal(url.searchParams.get("since"), "sc_prev");
+    assert.equal(url.searchParams.get("limit"), "25");
+    assert.equal(url.searchParams.get("page_cursor"), "pg_prev");
+    assert.deepEqual(body.deletes, [{ device_id: "dd_test", session_id: "sess_deleted" }]);
+    assert.equal(body.next_cursor, "sc_next");
+  } finally {
+    globals.window = originalWindow;
+    globals.fetch = originalFetch;
+    globals.localStorage = originalLocalStorage;
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      value: originalCrypto,
+    });
+  }
+});
+
+test("session catalog item API fetches one session without full catalog", async () => {
+  const globals = globalThis as unknown as {
+    window: { location?: { origin?: string } } | undefined;
+    localStorage: Storage | undefined;
+    crypto: Crypto | undefined;
+    fetch: typeof fetch | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalFetch = globals.fetch;
+  const originalLocalStorage = globals.localStorage;
+  const originalCrypto = globals.crypto;
+  let requestedURL = "";
+  globals.window = { ...(originalWindow ?? {}), location: { origin: "https://pockly.test" } };
+  globals.localStorage = memoryStorage({
+    "pockly.browser_device": JSON.stringify({
+      deviceId: "bd_test",
+      devicePublicKey: "public",
+      devicePrivateKeyPkcs8: "private",
+      deviceAccessToken: "dt_test",
+      deviceRefreshToken: "drt_test",
+    }),
+  });
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: {
+      ...(originalCrypto ?? {}),
+      subtle: {
+        ...(originalCrypto?.subtle ?? {}),
+        importKey: async () => ({} as CryptoKey),
+        sign: async () => new ArrayBuffer(0),
+      } as SubtleCrypto,
+    } as Crypto,
+  });
+  globals.fetch = (async (input) => {
+    const url = String(input);
+    if (url.includes("/api/device-challenge/verify")) {
+      return Response.json({ verified: true, device_access_token: "dt_test" });
+    }
+    if (url.includes("/api/device-challenge")) {
+      return Response.json({
+        challenge_id: "ch_test",
+        device_id: "bd_test",
+        audience: "browser-ws",
+        nonce: "nonce",
+      });
+    }
+    requestedURL = url;
+    return Response.json({
+      session: {
+        session_id: "sess_old",
+        device_id: "dd_test",
+        agent: "claude-code",
+        cwd: "/work",
+        snippet: "old",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T01:00:00Z",
+      },
+    });
+  }) as typeof fetch;
+  try {
+    const body = await getSessionCatalogItem("sess_old", "dd_test");
+    const url = new URL(requestedURL);
+    assert.equal(url.pathname, "/api/sessions/sess_old");
+    assert.equal(url.searchParams.get("device_id"), "dd_test");
+    assert.equal(body.session.session_id, "sess_old");
+  } finally {
+    globals.window = originalWindow;
+    globals.fetch = originalFetch;
+    globals.localStorage = originalLocalStorage;
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      value: originalCrypto,
+    });
+  }
+});
+
+test("session turns API carries after_seq for incremental hot-window reads", async () => {
+  const globals = globalThis as unknown as {
+    window: { location?: { origin?: string } } | undefined;
+    localStorage: Storage | undefined;
+    crypto: Crypto | undefined;
+    fetch: typeof fetch | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalFetch = globals.fetch;
+  const originalLocalStorage = globals.localStorage;
+  const originalCrypto = globals.crypto;
+  let requestedURL = "";
+  globals.window = { ...(originalWindow ?? {}), location: { origin: "https://pockly.test" } };
+  globals.localStorage = memoryStorage({
+    "pockly.browser_device": JSON.stringify({
+      deviceId: "bd_test",
+      devicePublicKey: "public",
+      devicePrivateKeyPkcs8: "private",
+      deviceAccessToken: "dt_test",
+      deviceRefreshToken: "drt_test",
+    }),
+  });
+  const testCrypto = {
+    ...(originalCrypto ?? {}),
+    subtle: {
+      ...(originalCrypto?.subtle ?? {}),
+      importKey: async () => ({} as CryptoKey),
+      sign: async () => new ArrayBuffer(0),
+    } as SubtleCrypto,
+  } as Crypto;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: testCrypto,
+  });
+  globals.fetch = (async (input) => {
+    const url = String(input);
+    if (url.includes("/api/device-challenge/verify")) {
+      return Response.json({ verified: true, device_access_token: "dt_test" });
+    }
+    if (url.includes("/api/device-challenge")) {
+      return Response.json({
+        challenge_id: "ch_test",
+        device_id: "bd_test",
+        audience: "browser-ws",
+        nonce: "nonce",
+      });
+    }
+    requestedURL = url;
+    return Response.json({ session_id: "sess_hot", turns: [], after_seq: 120 });
+  }) as typeof fetch;
+  try {
+    await getSessionTurns("sess_hot", "dd_test", { limit: 100, afterSeq: 120 });
+    const url = new URL(requestedURL);
+    assert.equal(url.pathname, "/api/sessions/sess_hot/turns");
+    assert.equal(url.searchParams.get("device_id"), "dd_test");
+    assert.equal(url.searchParams.get("limit"), "100");
+    assert.equal(url.searchParams.get("after_seq"), "120");
+  } finally {
+    globals.window = originalWindow;
+    globals.fetch = originalFetch;
+    globals.localStorage = originalLocalStorage;
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      value: originalCrypto,
+    });
+  }
 });
 
 test("lazy session sync defaults to latest 20 turns", async () => {
@@ -216,6 +444,318 @@ test("markSessionOpened writes a recently-opened lazy sync hint", async () => {
   });
 });
 
+test("polling fallback surfaces transient sync turns from request events", async () => {
+  const globals = globalThis as unknown as {
+    window: { location?: { origin?: string } } | undefined;
+    localStorage: Storage | undefined;
+    crypto: Crypto | undefined;
+    fetch: typeof fetch | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalFetch = globals.fetch;
+  const originalLocalStorage = globals.localStorage;
+  const originalCrypto = globals.crypto;
+  const events: unknown[] = [];
+  globals.window = { ...(originalWindow ?? {}), location: { origin: "https://pockly.test" } };
+  globals.localStorage = memoryStorage({
+    "pockly.browser_device": JSON.stringify({
+      deviceId: "bd_test",
+      devicePublicKey: "public",
+      devicePrivateKeyPkcs8: "private",
+      deviceAccessToken: "dt_test",
+      deviceRefreshToken: "drt_test",
+    }),
+  });
+  const testCrypto = {
+    ...(originalCrypto ?? {}),
+    subtle: {
+      ...(originalCrypto?.subtle ?? {}),
+      importKey: async () => ({} as CryptoKey),
+      sign: async () => new ArrayBuffer(0),
+    } as SubtleCrypto,
+  } as Crypto;
+  Object.defineProperty(globalThis, "crypto", {
+    configurable: true,
+    value: testCrypto,
+  });
+  globals.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url.includes("/api/device-challenge/verify")) {
+      return Response.json({ verified: true, device_access_token: "dt_test" });
+    }
+    if (url.includes("/api/device-challenge")) {
+      return Response.json({
+        challenge_id: "ch_test",
+        device_id: "bd_test",
+        audience: "browser-ws",
+        nonce: "nonce",
+      });
+    }
+    if (url.includes("/api/sessions/sess_lazy/events")) {
+      return Response.json({
+        events: [{
+          cursor: "ev_1",
+          payload: {
+            request_id: "sync_1",
+            session_id: "sess_lazy",
+            stage: "completed",
+            status: "completed",
+            turns: [{
+              session_id: "sess_lazy",
+              device_id: "dd_test",
+              seq: 41,
+              agent: "claude-code",
+              kind: "assistant_text",
+              timestamp: "2026-06-06T00:00:00Z",
+              payload: { text: "older window" },
+            }],
+          },
+        }],
+        next_cursor: "ev_1",
+      });
+    }
+    if (url.includes("/api/sessions/sess_lazy/sync")) {
+      assert.deepEqual(JSON.parse(String(init?.body ?? "{}")), { limit: 50, before_seq: 42 });
+      return Response.json({
+        request_id: "sync_1",
+        session_id: "sess_lazy",
+        device_id: "dd_test",
+        stage: "queued",
+        status: "running",
+        streaming: false,
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  }) as typeof fetch;
+  try {
+    await streamSessionSync({
+      sessionId: "sess_lazy",
+      deviceId: "dd_test",
+      limit: 50,
+      beforeSeq: 42,
+      onEvent: (event) => events.push(event),
+    });
+  } finally {
+    globals.window = originalWindow;
+    globals.fetch = originalFetch;
+    globals.localStorage = originalLocalStorage;
+    Object.defineProperty(globalThis, "crypto", {
+      configurable: true,
+      value: originalCrypto,
+    });
+  }
+
+  assert.ok(events.some((event) =>
+    typeof event === "object" &&
+    event !== null &&
+    (event as { turn?: { seq?: number; payload?: { text?: string } } }).turn?.seq === 41 &&
+    (event as { turn?: { payload?: { text?: string } } }).turn?.payload?.text === "older window"
+  ));
+});
+
+test("realtime ACK-only commands resolve and do not leak into later messages", async () => {
+  const globals = globalThis as unknown as {
+    window: Record<string, unknown> | undefined;
+    WebSocket: typeof WebSocket | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalWebSocket = globals.WebSocket;
+  const sockets: FakeWebSocket[] = [];
+  globals.window = {
+    ...(globalThis as typeof globalThis),
+    location: { origin: "https://pockly.test" },
+  };
+  globals.WebSocket = fakeWebSocketClass(sockets) as unknown as typeof WebSocket;
+  try {
+    const subscription = subscribeToSession({
+      onTurn: () => {},
+      onStatus: () => {},
+    });
+    await tick();
+    const socket = sockets[0];
+    assert.ok(socket);
+    const accepted = subscription.sendCommand?.({
+      command: "session_opened_hint",
+      daemonDeviceId: "dd_test",
+      sessionId: "sess_test",
+      payload: { session_id: "sess_test" },
+    });
+    const command = socket.sentJSON().find((msg) => msg.type === "COMMAND");
+    assert.equal(command?.command, "session_opened_hint");
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: command.request_id,
+      command: "session_opened_hint",
+      status: "accepted",
+      session_id: "sess_test",
+      device_id: "dd_test",
+    }));
+    assert.equal((await accepted)?.status, "accepted");
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ERROR",
+      request_id: command.request_id,
+      command: "session_opened_hint",
+      code: "late_error",
+      error: "should be ignored after ack",
+    }));
+    subscription.close();
+  } finally {
+    globals.window = originalWindow;
+    globals.WebSocket = originalWebSocket;
+  }
+});
+
+test("terminal realtime subscription sends a single command subscription", async () => {
+  const globals = globalThis as unknown as {
+    window: Record<string, unknown> | undefined;
+    WebSocket: typeof WebSocket | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalWebSocket = globals.WebSocket;
+  const sockets: FakeWebSocket[] = [];
+  const abort = new AbortController();
+  globals.window = {
+    ...(globalThis as typeof globalThis),
+    location: { origin: "https://pockly.test" },
+  };
+  globals.WebSocket = fakeWebSocketClass(sockets) as unknown as typeof WebSocket;
+  try {
+    const subscription = subscribeToSession({
+      onTurn: () => {},
+      onStatus: () => {},
+    });
+    await tick();
+    const socket = sockets[0];
+    assert.ok(socket);
+    const stream = streamTerminalSession({
+      terminalSessionId: "ts_test",
+      daemonDeviceId: "dd_test",
+      realtime: subscription,
+      signal: abort.signal,
+      onEvent: () => {},
+    });
+    await tick();
+    const command = socket.sentJSON().find((msg) => msg.type === "COMMAND" && msg.command === "terminal_subscribe");
+    assert.ok(command);
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: command.request_id,
+      command: "terminal_subscribe",
+      status: "accepted",
+      terminal_session_id: "ts_test",
+    }));
+    await tick();
+    assert.equal(socket.sentJSON().filter((msg) => msg.type === "SUBSCRIBE_TERMINAL").length, 0);
+    assert.equal(socket.sentJSON().filter((msg) => msg.type === "COMMAND" && msg.command === "terminal_subscribe").length, 1);
+    abort.abort();
+    await stream;
+    subscription.close();
+  } finally {
+    globals.window = originalWindow;
+    globals.WebSocket = originalWebSocket;
+  }
+});
+
+test("permission and terminal controls prefer realtime commands", async () => {
+  const globals = globalThis as unknown as {
+    window: Record<string, unknown> | undefined;
+    WebSocket: typeof WebSocket | undefined;
+    fetch: typeof fetch | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalWebSocket = globals.WebSocket;
+  const originalFetch = globals.fetch;
+  const sockets: FakeWebSocket[] = [];
+  let fetchCalled = false;
+  globals.window = {
+    ...(globalThis as typeof globalThis),
+    location: { origin: "https://pockly.test" },
+  };
+  globals.WebSocket = fakeWebSocketClass(sockets) as unknown as typeof WebSocket;
+  globals.fetch = (() => {
+    fetchCalled = true;
+    throw new Error("fetch should not be called when realtime is open");
+  }) as typeof fetch;
+  try {
+    const subscription = subscribeToSession({
+      onTurn: () => {},
+      onStatus: () => {},
+    });
+    await tick();
+    const socket = sockets[0];
+    assert.ok(socket);
+
+    const permission = decidePermissionRequest("perm_test", "dd_test", "allow", subscription);
+    const permissionCommand = latestCommand(socket, "permission_decide");
+    assert.equal(permissionCommand?.payload.permission_request_id, "perm_test");
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: permissionCommand.request_id,
+      command: "permission_decide",
+      status: "accepted",
+      device_id: "dd_test",
+    }));
+    assert.deepEqual(await permission, { request_id: "perm_test", status: "accepted" });
+
+    const created = createTerminalSession({
+      daemonDeviceId: "dd_test",
+      sessionId: "sess_test",
+      agent: "claude-code",
+      cwd: "/tmp/project",
+      realtime: subscription,
+    });
+    const createCommand = latestCommand(socket, "terminal_create");
+    assert.equal(createCommand?.payload.cwd, "/tmp/project");
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: createCommand.request_id,
+      command: "terminal_create",
+      status: "accepted",
+      terminal_session_id: "ts_test",
+      terminal_session: {
+        terminal_session_id: "ts_test",
+        daemon_device_id: "dd_test",
+        agent: "claude-code",
+        cwd: "/tmp/project",
+        session_status: "starting",
+        turn_status: "idle",
+      },
+    }));
+    assert.equal((await created).terminal_session.terminal_session_id, "ts_test");
+
+    const input = sendTerminalInput("ts_test", "hello", subscription, "dd_test");
+    const inputCommand = latestCommand(socket, "terminal_input");
+    assert.equal(inputCommand?.payload.text, "hello");
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: inputCommand.request_id,
+      command: "terminal_input",
+      status: "accepted",
+      terminal_session_id: "ts_test",
+    }));
+    assert.deepEqual(await input, { status: "queued" });
+
+    const stop = stopTerminalSession("ts_test", subscription, "dd_test");
+    const stopCommand = latestCommand(socket, "terminal_stop");
+    assert.equal(stopCommand?.payload.terminal_session_id, "ts_test");
+    socket.emitMessage(JSON.stringify({
+      type: "COMMAND_ACK",
+      request_id: stopCommand.request_id,
+      command: "terminal_stop",
+      status: "accepted",
+      terminal_session_id: "ts_test",
+    }));
+    assert.deepEqual(await stop, { status: "queued" });
+
+    assert.equal(fetchCalled, false);
+    subscription.close();
+  } finally {
+    globals.window = originalWindow;
+    globals.WebSocket = originalWebSocket;
+    globals.fetch = originalFetch;
+  }
+});
+
 function memoryStorage(seed: Record<string, string> = {}): Storage {
   const data = new Map(Object.entries(seed));
   return {
@@ -238,4 +778,68 @@ function memoryStorage(seed: Record<string, string> = {}): Storage {
       data.set(key, String(value));
     },
   };
+}
+
+type FakeListener = (event?: unknown) => void;
+
+class FakeWebSocket {
+  static OPEN = 1;
+  static CLOSING = 2;
+  static CLOSED = 3;
+  readyState = FakeWebSocket.OPEN;
+  sent: string[] = [];
+  private listeners = new Map<string, FakeListener[]>();
+
+  constructor(public url: string) {
+    queueMicrotask(() => this.emit("open"));
+  }
+
+  addEventListener(type: string, listener: FakeListener) {
+    const next = this.listeners.get(type) ?? [];
+    next.push(listener);
+    this.listeners.set(type, next);
+  }
+
+  send(data: string) {
+    this.sent.push(String(data));
+  }
+
+  close() {
+    this.readyState = FakeWebSocket.CLOSED;
+    this.emit("close");
+  }
+
+  emitMessage(data: string) {
+    this.emit("message", { data });
+  }
+
+  sentJSON() {
+    return this.sent
+      .filter((raw) => raw.startsWith("{"))
+      .map((raw) => JSON.parse(raw));
+  }
+
+  private emit(type: string, event?: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+function fakeWebSocketClass(sockets: FakeWebSocket[]) {
+  return class extends FakeWebSocket {
+    static override OPEN = FakeWebSocket.OPEN;
+    static override CLOSING = FakeWebSocket.CLOSING;
+    static override CLOSED = FakeWebSocket.CLOSED;
+    constructor(url: string) {
+      super(url);
+      sockets.push(this);
+    }
+  };
+}
+
+function tick() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function latestCommand(socket: FakeWebSocket, command: string) {
+  return socket.sentJSON().filter((msg) => msg.type === "COMMAND" && msg.command === command).at(-1);
 }

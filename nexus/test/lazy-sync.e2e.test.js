@@ -16,7 +16,7 @@ const daemonDeviceID = "dd_lazy_e2e";
 const computerID = "dc_lazy_e2e";
 
 test("lazy session sync E2E keeps old catalog visible and backfills on demand", async () => {
-  const env = testEnv();
+  const env = testEnv({ extra: { POCKLY_HOT_TURN_TTL_DAYS: "365" } });
   const cookie = await loginCookie(env);
   const browserKeys = await generateSigningKeyPair();
   const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
@@ -173,11 +173,12 @@ test("lazy session sync E2E keeps old catalog visible and backfills on demand", 
   assert.equal(offlineTurnsBody.has_older_turns, true);
 });
 
-function testEnv() {
+function testEnv(options = {}) {
   return {
     POCKLY_NEXUS_STORE: new InMemoryNexusStore(),
     POCKLY_CONTROL_HUB: new InMemoryControlHub(),
     POCKLY_NEXUS_DEV_LOGIN_ENABLED: "1",
+    ...(options.extra || {}),
   };
 }
 

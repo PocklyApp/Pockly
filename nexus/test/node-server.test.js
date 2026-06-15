@@ -57,6 +57,7 @@ describe("Node self-hosted Nexus server", () => {
         runtime: "self_hosted",
         realtime: true,
         browser_realtime: true,
+        browser_realtime_control: false,
         control_streaming: true,
         terminal: true,
         terminal_streaming: true,

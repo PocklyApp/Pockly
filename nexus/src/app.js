@@ -44,12 +44,63 @@ const defaultSessionTurnWindowLimit = 100;
 const maxSessionTurnWindowLimit = 500;
 const defaultHostsOnlineCacheMs = 1000;
 const defaultTurnPayloadBatchRawBytes = 1024 * 1024;
+const defaultEdgeRetentionProfile = "standard";
+const defaultHotTurnMaxPayloadBytes = 32 * 1024;
+const defaultGlobalHotTurnPruneIntervalMs = 10 * 60 * 1000;
+const maxScopedHotTurnPruneSessions = 25;
+const edgeRetentionProfiles = Object.freeze({
+  standard: Object.freeze({
+    hotTurnsPerSession: 100,
+    hotTurnsPerUser: 5_000,
+    hotTurnTTLDays: 30,
+  }),
+  extended: Object.freeze({
+    hotTurnsPerSession: 300,
+    hotTurnsPerUser: 50_000,
+    hotTurnTTLDays: 90,
+  }),
+  max: Object.freeze({
+    hotTurnsPerSession: 300,
+    hotTurnsPerUser: 100_000,
+    hotTurnTTLDays: 90,
+  }),
+});
 const hostsOnlineCache = new Map();
 const turnPayloadBlobPointerVersion = 1;
 const primaryPayloadStorageGBMonthUSD = 0.75;
 const archivePayloadStorageGBMonthUSD = 0.015;
+const globalHotTurnPruneLastRun = new Map();
 
 export async function handleRequest(request, env = {}, ctx = {}) {
+  const startedAt = Date.now();
+  const telemetryProvider = resolveTelemetryProvider(ctx);
+  const costTracker = telemetryProvider ? createEndpointCostTracker() : null;
+  const providers = resolveRequestProviders(ctx, costTracker);
+  const requestContext = providers
+    ? { ...ctx, ...(costTracker ? { costTracker } : {}), providers }
+    : (costTracker ? { ...ctx, costTracker } : ctx);
+  const response = await routeRequest(request, env, requestContext);
+  const telemetry = recordEndpointCostTelemetry(telemetryProvider, request, response, {
+    durationMs: Date.now() - startedAt,
+    costTracker,
+  });
+  if (typeof ctx?.waitUntil === "function") ctx.waitUntil(telemetry);
+  else void telemetry;
+  return response;
+}
+
+function resolveTelemetryProvider(ctx = {}) {
+  if (ctx?.providers?.telemetryProvider) return ctx.providers.telemetryProvider;
+  if (typeof ctx?.providersFactory !== "function") return null;
+  return ctx.providersFactory({ telemetryOnly: true })?.telemetryProvider || null;
+}
+
+function resolveRequestProviders(ctx = {}, costTracker = null) {
+  if (typeof ctx?.providersFactory !== "function") return ctx.providers;
+  return ctx.providersFactory({ costTracker });
+}
+
+async function routeRequest(request, env = {}, ctx = {}) {
   const url = new URL(request.url);
   const path = normalizePath(url.pathname);
   const requestRuntime = createRequestRuntime(env, ctx);
@@ -95,6 +146,7 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (path === "/api/voice/transcriptions") return await transcribeVoice(request, store, env);
     if (path === "/api/feedback") return await submitFeedback(request, store);
     if (path === "/api/sessions") return await listSessions(request, store, env, requestRuntime.providers.telemetryProvider);
+    if (path === "/api/sessions/delta") return await listSessionsDelta(request, store, env, url);
     if (path === "/api/prefs") return await listPrefs(request, store);
     if (path === "/api/projects/prefs") return await setProjectPrefs(request, store);
     if (path === "/api/tasks") return await startTask(request, store, env);
@@ -132,7 +184,10 @@ export async function handleRequest(request, env = {}, ctx = {}) {
     if (sessionTurns) return await listSessionTurns(request, store, env, requestRuntime.providers, decodeURIComponent(sessionTurns[1]), url);
 
     const sessionEvents = path.match(/^\/api\/sessions\/([^/]+)\/events$/);
-    if (sessionEvents) return await listSessionEvents(request, store, env, requestRuntime.providers, decodeURIComponent(sessionEvents[1]), url);
+    if (sessionEvents) return await listSessionEvents(request, store, requestRuntime.env, requestRuntime.providers, decodeURIComponent(sessionEvents[1]), url);
+
+    const sessionCatalogItem = path.match(/^\/api\/sessions\/([^/]+)$/);
+    if (sessionCatalogItem) return await getSessionCatalogItem(request, store, decodeURIComponent(sessionCatalogItem[1]), url);
 
     const sessionPrefs = path.match(/^\/api\/sessions\/([^/]+)\/prefs$/);
     if (sessionPrefs) return await setSessionPrefs(request, store, decodeURIComponent(sessionPrefs[1]));
@@ -945,7 +1000,6 @@ async function registerBrowser(request, store) {
 async function announceBrowser(request, store) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   const { device } = await requireDeviceAuth(request, store, "browser");
-  const body = await readJSON(request);
   const now = new Date().toISOString();
   await store.touchDevice(device.device_id, now);
   return jsonResponse({ announced: true, daemons_notified: 0 });
@@ -1055,7 +1109,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     uploadedTurnStatsBySession.set(sessionID, stats);
   }
   const turnRecords = turns.map((turn) => syncTurnRecord(user, device, turn, now));
-  await upsertChangedTurns(store, turnRecords, env, providers);
+  const prunedTurnSessions = await upsertChangedTurns(store, turnRecords, env, providers);
   timings.mark("upsert_turns");
   let existingSessions = null;
   const getExistingSessions = async () => {
@@ -1063,6 +1117,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     return existingSessions;
   };
   let deletedSessionCount = 0;
+  let deletedSessions = [];
   if (body.full_reconcile) {
     const keepSessionIDs = sessions.map((session) => String(session.session_id));
     const currentExistingSessions = await getExistingSessions();
@@ -1075,12 +1130,22 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       currentExistingSessions,
     );
     if (typeof store.deleteMissingDeviceSessionsFromExisting === "function") {
+      deletedSessions = missingDeviceSessions(currentExistingSessions, keepSessionIDs);
       deletedSessionCount = Number(await store.deleteMissingDeviceSessionsFromExisting(user.user_id, device.device_id, keepSessionIDs, currentExistingSessions) ?? 0) || 0;
     } else {
+      deletedSessions = missingDeviceSessions(currentExistingSessions, keepSessionIDs);
       deletedSessionCount = Number(await store.deleteMissingDeviceSessions(user.user_id, device.device_id, keepSessionIDs) ?? 0) || 0;
     }
     if (deletedSessionCount > 0) {
       await deleteHistoryBlobsBestEffort(providers, deletedHistoryBlobKeys);
+      await appendSessionCatalogChanges(store, deletedSessions.map((session) => ({
+        type: "delete",
+        user_id: user.user_id,
+        device_id: device.device_id,
+        session_id: session.session_id,
+        session: null,
+        at: now,
+      })));
     }
   }
   timings.mark("reconcile");
@@ -1090,12 +1155,14 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   timings.mark("load_existing_sessions");
   let sessionFastPathCount = 0;
   const changedSessionRecords = [];
+  const currentSessionRecords = [];
   for (const session of sessions) {
     const sessionID = String(session.session_id);
     const uploadedTurnStats = uploadedTurnStatsBySession.get(sessionID);
     const existing = existingBySessionID.get(sessionID) ?? null;
     if (unchangedCatalogSession(device, session, existing, uploadedTurnStats)) {
       sessionFastPathCount += 1;
+      if (existing) currentSessionRecords.push(existing);
       continue;
     }
     const record = await syncSessionRecord(
@@ -1107,6 +1174,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       uploadedTurnStats,
       existing,
     );
+    currentSessionRecords.push(record);
     if (!sessionMatchesExisting(record, existing)) changedSessionRecords.push(record);
   }
   timings.mark("build_session_records");
@@ -1114,19 +1182,121 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   timings.mark("filter_unchanged_sessions");
   if (changedSessionCount > 0) {
     await store.upsertSessions(changedSessionRecords);
+    await appendSessionCatalogChanges(store, changedSessionRecords.map((session) => ({
+      type: "upsert",
+      user_id: user.user_id,
+      device_id: session.device_id,
+      session_id: session.session_id,
+      session,
+      at: now,
+    })));
   }
+  const repairedPrunedSessions = await repairPrunedTurnSessions(
+    store,
+    user,
+    device,
+    prunedTurnSessions,
+    new Set(changedSessionRecords.map((session) => String(session.session_id))),
+    now,
+  );
   timings.mark("upsert_sessions");
+  const currentSessionsForWindows = repairedPrunedSessions.length
+    ? mergeSessionRecordsByID(currentSessionRecords, repairedPrunedSessions)
+    : currentSessionRecords;
+  const knownWindowSessions = turns.length === 0
+    ? await loadKnownWindowSessions(store, user.user_id, device.device_id, body.known_window_session_ids)
+    : filterKnownWindowSessions(currentSessionsForWindows, body.known_window_session_ids);
+  const knownWindows = turns.length === 0
+    ? await knownSessionWindows(store, user.user_id, device.device_id, knownWindowSessions)
+    : [];
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
     session_upsert_count: changedSessionCount,
+    session_repair_count: repairedPrunedSessions.length,
     session_delete_count: deletedSessionCount,
     session_fast_path_count: sessionFastPathCount,
     turn_count: turns.length,
     daemon_device: device.device_id,
     daemon_version: body.hello?.version ?? "",
     timings_ms: timings.finish(),
+    ...(knownWindows.length ? { known_windows: knownWindows } : {}),
   });
+}
+
+function mergeSessionRecordsByID(base = [], updates = []) {
+  const byID = new Map(base.map((session) => [String(session.session_id), session]));
+  for (const session of updates) byID.set(String(session.session_id), session);
+  return [...byID.values()];
+}
+
+function missingDeviceSessions(existingSessions, keepSessionIDs) {
+  const keep = new Set(keepSessionIDs.map((id) => String(id)));
+  return existingSessions.filter((session) => !keep.has(String(session.session_id)));
+}
+
+function filterKnownWindowSessions(sessions = [], requestedSessionIDs) {
+  if (!Array.isArray(requestedSessionIDs)) return [];
+  const wanted = new Set(requestedSessionIDs.map((id) => String(id || "").trim()).filter(Boolean));
+  if (!wanted.size) return [];
+  return sessions.filter((session) => wanted.has(String(session?.session_id || "")));
+}
+
+async function loadKnownWindowSessions(store, userID, deviceID, requestedSessionIDs) {
+  if (!Array.isArray(requestedSessionIDs) || requestedSessionIDs.length === 0) return [];
+  const out = [];
+  const seen = new Set();
+  for (const rawID of requestedSessionIDs) {
+    const sessionID = String(rawID || "").trim();
+    if (!sessionID || seen.has(sessionID)) continue;
+    seen.add(sessionID);
+    const session = await store.getSession(userID, deviceID, sessionID);
+    if (session) out.push(session);
+  }
+  return out;
+}
+
+async function appendSessionCatalogChanges(store, changes) {
+  const rows = changes.map((change) => ({
+    user_id: change.user_id,
+    device_id: change.device_id,
+    session_id: change.session_id,
+    change_type: change.type,
+    session_row: change.session ? publicCatalogChangeSessionRow(change.session) : null,
+    created_at: change.at,
+  }));
+  if (typeof store.appendSessionCatalogChanges === "function") {
+    await store.appendSessionCatalogChanges(rows);
+    return;
+  }
+  if (typeof store.appendSessionCatalogChange !== "function") return;
+  for (const row of rows) await store.appendSessionCatalogChange(row);
+}
+
+function publicCatalogChangeSessionRow(session) {
+  return {
+    user_id: session.user_id,
+    computer_id: session.computer_id ?? null,
+    device_id: session.device_id,
+    session_id: session.session_id,
+    agent: session.agent,
+    runner_alias: session.runner_alias ?? null,
+    cwd: session.cwd ?? "",
+    snippet: session.snippet ?? "",
+    first_message: session.first_message ?? "",
+    title: session.title ?? null,
+    last_seq: Number(session.last_seq ?? 0),
+    last_timestamp: session.last_timestamp ?? null,
+    channel_last_seen_at: session.channel_last_seen_at ?? null,
+    sync_state: session.sync_state ?? "catalog_only",
+    turn_count: Number(session.turn_count ?? 0),
+    last_sync_error: session.last_sync_error ?? "",
+    synced_turn_count: Number(session.synced_turn_count ?? 0),
+    synced_min_seq: Number(session.synced_min_seq ?? 0),
+    synced_max_seq: Number(session.synced_max_seq ?? 0),
+    has_older_turns: Boolean(session.has_older_turns),
+    updated_at: session.updated_at,
+  };
 }
 
 function syncTimings() {
@@ -1289,9 +1459,11 @@ async function daemonSyncHints(request, store) {
       continue;
     }
     const sessionWithStats = await sessionWithTurnStats(store, user.user_id, device.device_id, String(hint.session_id));
+    const windowHash = await sessionWindowHash(store, user.user_id, device.device_id, String(hint.session_id), sessionWithStats);
     hints.push({
       ...hint,
       ...sessionSyncHintPayload(sessionWithStats, String(hint.session_id)),
+      ...(windowHash ? { window_hash: windowHash } : {}),
       reason: hint.reason,
       preferred_min: hint.preferred_min,
     });
@@ -1320,23 +1492,153 @@ async function listSessionOpenHintsForDevice(store, userID, deviceID) {
 async function listSessions(request, store, env, telemetryProvider = null) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store);
-  const control = createControlHubForUser(env, user.user_id);
   const sessions = await store.listSessionsForUser(user.user_id);
   const devices = new Map((await store.listDevicesForUser(user.user_id)).map((device) => [device.device_id, device]));
   const daemonDeviceIDs = uniqueDaemonDeviceIDs(sessions, devices);
-  const onlineByDeviceID = daemonDeviceIDs.length > 0 ? await control.onlineDevices(daemonDeviceIDs) : {};
   const rows = [];
   for (const session of sessions) {
-    rows.push(publicSession(session, devices.get(session.device_id), Boolean(onlineByDeviceID[session.device_id])));
+    rows.push(publicSession(session, devices.get(session.device_id), false));
   }
   void recordPresenceTelemetry(telemetryProvider, request, {
     command: "sessions",
-    presence_source: daemonDeviceIDs.length > 0 ? "batch_do" : "none",
+    presence_source: daemonDeviceIDs.length > 0 ? "device_last_seen" : "none",
     sessions_count: sessions.length,
     unique_daemon_count: daemonDeviceIDs.length,
-    presence_batch_size: daemonDeviceIDs.length,
+    presence_batch_size: 0,
   });
   return jsonResponse({ sessions: rows });
+}
+
+async function listSessionsDelta(request, store, env, url) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user } = await requireDeviceAuth(request, store);
+  const limit = sessionCatalogDeltaLimit(url.searchParams);
+  const since = String(url.searchParams.get("since") ?? "");
+  if (!since) {
+    const pageCursor = url.searchParams.get("page_cursor");
+    return await sessionCatalogInitialPageResponse(
+      store,
+      user.user_id,
+      limit,
+      pageCursor,
+      pageCursor ? {} : { reset: true },
+    );
+  }
+  if (typeof store.listSessionCatalogChanges !== "function") {
+    return errorResponse("session catalog delta unavailable", ErrorCode.NotSupported, { status: 501 });
+  }
+  if (await sessionCatalogCursorExpired(store, user.user_id, since)) {
+    return await sessionCatalogInitialPageResponse(store, user.user_id, limit, "", { reset: true });
+  }
+  const changes = await store.listSessionCatalogChanges(user.user_id, { since, limit: limit + 1 });
+  const page = changes.slice(0, limit);
+  const hasMore = changes.length > limit;
+  const upsertRows = [];
+  const deletes = [];
+  for (const change of page) {
+    const type = String(change.change_type || "");
+    if (type === "delete") {
+      deletes.push({
+        device_id: change.device_id,
+        session_id: change.session_id,
+      });
+      continue;
+    }
+    const row = parsePayload(change.session_row);
+    if (row && typeof row === "object") upsertRows.push(row);
+  }
+  return jsonResponse({
+    // Catalog deltas are a data-plane API. Realtime daemon presence is served
+    // by /api/hosts/online and projected client-side, so large catalog paging
+    // does not wake the realtime coordinator once per page.
+    upserts: upsertRows.map(publicCatalogSession),
+    deletes,
+    next_cursor: page[page.length - 1]?.change_id || since,
+    has_more: hasMore,
+  });
+}
+
+async function getSessionCatalogItem(request, store, sessionID, url) {
+  if (request.method !== "GET") return methodNotAllowed("GET");
+  const { user } = await requireDeviceAuth(request, store);
+  const deviceID = url.searchParams.get("device_id") ?? "";
+  if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
+  const session = await store.getSession(user.user_id, deviceID, sessionID);
+  if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
+  return jsonResponse({ session: publicCatalogSession(session) });
+}
+
+async function sessionCatalogInitialPageResponse(store, userID, limit, rawPageCursor, extra = {}) {
+  const pageCursor = parseSessionCatalogPageCursor(rawPageCursor);
+  const cursor = typeof store.currentSessionCatalogCursor === "function"
+    ? await store.currentSessionCatalogCursor(userID)
+    : "";
+  const sessions = typeof store.listSessionCatalogPage === "function"
+    ? await store.listSessionCatalogPage(userID, { limit: limit + 1, after: pageCursor })
+    : pageSessionCatalogRows(await store.listSessionsForUser(userID), { limit: limit + 1, after: pageCursor });
+  const page = sessions.slice(0, limit);
+  const hasMore = sessions.length > limit;
+  return jsonResponse({
+    upserts: page.map(publicCatalogSession),
+    deletes: [],
+    next_cursor: cursor,
+    next_page_cursor: hasMore ? encodeSessionCatalogPageCursor(page[page.length - 1]) : "",
+    has_more: hasMore,
+    ...extra,
+  });
+}
+
+async function sessionCatalogCursorExpired(store, userID, since) {
+  if (!since || since === "sc_0000000000000_000000_000000") return false;
+  if (typeof store.sessionCatalogCursorBounds !== "function") return false;
+  const bounds = await store.sessionCatalogCursorBounds(userID);
+  return Boolean(bounds.oldest && since < bounds.oldest);
+}
+
+function sessionCatalogDeltaLimit(params) {
+  const parsed = Number(params.get("limit") ?? 50);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 50;
+  return Math.min(200, Math.max(1, Math.floor(parsed)));
+}
+
+function pageSessionCatalogRows(sessions, options = {}) {
+  const after = options.after ?? null;
+  return sessions
+    .filter((session) => !after || sessionCatalogRowAfterCursor(session, after))
+    .slice(0, options.limit ?? sessions.length);
+}
+
+function encodeSessionCatalogPageCursor(session) {
+  if (!session) return "";
+  return base64Url(new TextEncoder().encode(JSON.stringify({
+    updated_at: String(session.updated_at || ""),
+    device_id: String(session.device_id || ""),
+    session_id: String(session.session_id || ""),
+  })));
+}
+
+function parseSessionCatalogPageCursor(value) {
+  const raw = String(value || "");
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(fromBase64Url(raw)));
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      updated_at: String(parsed.updated_at || ""),
+      device_id: String(parsed.device_id || ""),
+      session_id: String(parsed.session_id || ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sessionCatalogRowAfterCursor(session, cursor) {
+  const updatedAt = String(session.updated_at || "");
+  if (updatedAt !== cursor.updated_at) return updatedAt < cursor.updated_at;
+  const deviceID = String(session.device_id || "");
+  if (deviceID !== cursor.device_id) return deviceID > cursor.device_id;
+  return String(session.session_id || "") > cursor.session_id;
 }
 
 // ---- UI preferences (pin / archive / rename) ----------------------------
@@ -1408,6 +1710,14 @@ async function markSessionOpened(request, store, env, sessionID) {
   const deviceID = String(body?.device_id ?? "");
   if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
   const openedAt = body?.opened_at ? String(body.opened_at) : new Date().toISOString();
+  const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID);
+  if (isLargeSessionForAutomaticBackfill(session)) {
+    return jsonResponse({
+      device_id: deviceID,
+      session_id: sessionID,
+      last_opened_at: openedAt,
+    });
+  }
   const hint = await store.upsertSessionOpenHint({
     user_id: user.user_id,
     device_id: deviceID,
@@ -1415,10 +1725,7 @@ async function markSessionOpened(request, store, env, sessionID) {
     last_opened_at: openedAt,
     updated_at: new Date().toISOString(),
   });
-  const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID);
-  if (!isLargeSessionForAutomaticBackfill(session)) {
-    await pushSyncHintToDaemon(env, user.user_id, deviceID, sessionID, session);
-  }
+  await pushSyncHintToDaemon(env, store, user.user_id, deviceID, sessionID, session);
   return jsonResponse({
     device_id: hint.device_id,
     session_id: hint.session_id,
@@ -1437,13 +1744,15 @@ function isLargeSessionForAutomaticBackfill(session) {
 // so pushing replaces the daemon-side hint polling loop as the default
 // transport. Best-effort: an offline daemon falls back to the persisted open
 // hint (consumed by the optional poll) and the regular sync flow.
-async function pushSyncHintToDaemon(env, userID, daemonDeviceID, sessionID, session) {
+async function pushSyncHintToDaemon(env, store, userID, daemonDeviceID, sessionID, session) {
   try {
     const control = createControlHubForUser(env, userID);
+    const windowHash = await sessionWindowHash(store, userID, daemonDeviceID, sessionID, session);
     await control.dispatch(daemonDeviceID, {
       type: "SYNC_HINT",
       sync_hint: {
         ...sessionSyncHintPayload(session, sessionID),
+        ...(windowHash ? { window_hash: windowHash } : {}),
         reason: "recently_opened",
         preferred_min: prioritySyncHintTurnLimit,
       },
@@ -1488,6 +1797,10 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
   if (!deviceID) return errorResponse("device_id is required", ErrorCode.BadRequest, { status: 400 });
   const limit = sessionTurnsWindowLimit(url.searchParams);
   const beforeSeq = Number(url.searchParams.get("before_seq") ?? 0) || 0;
+  const afterSeq = Number(url.searchParams.get("after_seq") ?? 0) || 0;
+  if (afterSeq > 0) {
+    return await listSessionTurnsAfterSeq(store, providers, user.user_id, deviceID, sessionID, afterSeq, limit);
+  }
   const session = await sessionWithTurnStats(store, user.user_id, deviceID, sessionID, { repairMetadata: true });
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
   const turns = await store.listTurns(user.user_id, deviceID, sessionID, {
@@ -1502,8 +1815,8 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
     latest_contiguous_min_seq: Number(session.latest_contiguous_min_seq ?? session.synced_min_seq ?? 0) || 0,
   };
   const syncedTurnCount = stats.count;
-  const syncedMinSeq = mergeSyncedMinSeq(session.synced_min_seq, stats.min_seq);
-  const syncedMaxSeq = Math.max(Number(session.synced_max_seq ?? 0) || 0, stats.max_seq);
+  const syncedMinSeq = Number(stats.min_seq ?? 0) || 0;
+  const syncedMaxSeq = Number(stats.max_seq ?? 0) || 0;
   const totalTurnCount = Number(session.turn_count ?? parsedTurns.length);
   const oldestLoadedSeq = Number(parsedTurns[0]?.seq ?? 0) || 0;
   const latestContiguousMinSeq = Number(stats.latest_contiguous_min_seq ?? 0) || syncedMinSeq;
@@ -1519,9 +1832,11 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
   return jsonResponse({
     session_id: sessionID,
     turns: parsedTurns,
+    source: "remote_hot_window",
     oldest_seq: parsedTurns[0]?.seq,
     latest_seq: parsedTurns[parsedTurns.length - 1]?.seq,
     window_limit: limit,
+    ...(afterSeq > 0 ? { after_seq: afterSeq } : {}),
     next_loaded_before_seq: oldestLoadedSeq > syncedMinSeq ? oldestLoadedSeq : 0,
     synced_turn_count: syncedTurnCount,
     synced_min_seq: syncedMinSeq,
@@ -1529,8 +1844,34 @@ async function listSessionTurns(request, store, env, providers, sessionID, url) 
     latest_contiguous_min_seq: latestContiguousMinSeq,
     next_before_seq: nextBeforeSeq,
     total_turn_count: totalTurnCount,
-    has_older_turns: Boolean(session.has_older_turns || (totalTurnCount > 0 && syncedMinSeq > 1)),
+    has_older_turns: Boolean(session.has_older_turns || totalTurnCount > syncedTurnCount || (totalTurnCount > 0 && syncedMinSeq > 1)),
     needs_sync: parsedTurns.length === 0 && (session.turn_count ?? 0) > 0,
+  });
+}
+
+async function listSessionTurnsAfterSeq(store, providers, userID, deviceID, sessionID, afterSeq, limit) {
+  const session = await store.getSession(userID, deviceID, sessionID);
+  if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
+  const turns = await store.listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, limit);
+  const parsedTurns = await publicTurns(turns, providers);
+  const syncedTurnCount = Number(session.synced_turn_count ?? 0) || 0;
+  const syncedMinSeq = Number(session.synced_min_seq ?? 0) || 0;
+  const syncedMaxSeq = Number(session.synced_max_seq ?? 0) || 0;
+  const totalTurnCount = Number(session.turn_count ?? session.last_seq ?? syncedTurnCount) || 0;
+  return jsonResponse({
+    session_id: sessionID,
+    turns: parsedTurns,
+    source: "remote_hot_window",
+    oldest_seq: parsedTurns[0]?.seq,
+    latest_seq: parsedTurns[parsedTurns.length - 1]?.seq,
+    window_limit: limit,
+    after_seq: afterSeq,
+    synced_turn_count: syncedTurnCount,
+    synced_min_seq: syncedMinSeq,
+    synced_max_seq: syncedMaxSeq,
+    latest_contiguous_min_seq: Number(session.latest_contiguous_min_seq ?? syncedMinSeq) || 0,
+    total_turn_count: totalTurnCount,
+    has_older_turns: Boolean(session.has_older_turns || (totalTurnCount > 0 && syncedMinSeq > 1)),
   });
 }
 
@@ -1550,41 +1891,167 @@ async function listSessionEvents(request, store, env, providers, sessionID, url)
   const deviceID = requiredString(url.searchParams.get("device_id") ?? "", "device_id");
   const session = await store.getSession(user.user_id, deviceID, sessionID);
   if (!session) return errorResponse("session not found", ErrorCode.NotFound, { status: 404 });
+  const control = createControlHubForUser(env, user.user_id);
   return jsonResponse(await sessionEventsResponse(store, providers, user.user_id, deviceID, sessionID, {
     after: url.searchParams.get("after") ?? "",
     after_seq: url.searchParams.get("after_seq") ?? "",
     request_id: url.searchParams.get("request_id") ?? "",
     limit: url.searchParams.get("limit") ?? "",
-  }));
+  }, control));
 }
 
 async function listInjectEvents(request, store, env, providers, requestID, url) {
   if (request.method !== "GET") return methodNotAllowed("GET");
   const { user } = await requireDeviceAuth(request, store, "browser", "browser-ws");
+  const control = createControlHubForUser(env, user.user_id);
   return jsonResponse(await sessionEventsResponse(store, providers, user.user_id, "", "", {
     after: url.searchParams.get("after") ?? "",
     request_id: requestID,
     limit: url.searchParams.get("limit") ?? "",
-  }));
+  }, control));
 }
 
-async function sessionEventsResponse(store, providers, userID, deviceID, sessionID, options = {}) {
+async function sessionEventsResponse(store, providers, userID, deviceID, sessionID, options = {}, control = null) {
   const events = await store.listSessionEvents(userID, deviceID, sessionID, options);
-  const publicEvents = events.map(publicSessionEvent);
+  const transientEvents = await listTransientSessionEventsBestEffort(control, userID, deviceID, sessionID, options);
+  const publicEvents = mergeTransientSessionEvents(
+    events.map(publicSessionEvent),
+    transientEvents,
+  );
   const response = {
     events: publicEvents,
-    next_cursor: publicEvents[publicEvents.length - 1]?.cursor || String(options.after || ""),
+    next_cursor: persistedEventCursor(publicEvents) || String(options.after || ""),
   };
-  // Session-scoped polls also carry fresh turn content from session_turns.
-  // Live turns land there once (written by the event sink) instead of being
-  // duplicated into a session_events row per turn.
+  // Session-scoped polls carry stable turns from session_turns plus active
+  // stream deltas from the short-lived control cache. Stream deltas are not
+  // durable remote history; the final completed block is persisted separately.
   if (deviceID && sessionID && options.after_seq !== undefined && options.after_seq !== "") {
     const afterSeq = Number(options.after_seq) || 0;
     const turns = await store.listSessionTurnsAfter(userID, deviceID, sessionID, afterSeq, options.limit);
-    response.turns = await publicTurns(turns, providers);
-    response.next_seq = turns.length > 0 ? Number(turns[turns.length - 1].seq) : afterSeq;
+    const mergedTurns = mergeSessionTurnsWithTransientTurns(turns, transientEvents, afterSeq, options.limit);
+    response.turns = await publicTurns(mergedTurns, providers);
+    response.next_seq = mergedTurns.length > 0 ? Number(mergedTurns[mergedTurns.length - 1].seq) : afterSeq;
   }
   return response;
+}
+
+async function listTransientSessionEventsBestEffort(control, userID, deviceID, sessionID, options) {
+  if (typeof control?.listTransientSessionEvents !== "function") return [];
+  try {
+    return await control.listTransientSessionEvents(userID, deviceID, sessionID, options);
+  } catch {
+    // Transient events carry request-scoped old-history windows and active
+    // stream deltas for the current page. Persisted lifecycle events and final
+    // durable turns remain the source of truth; a cache miss must not turn
+    // polling into a hard 500.
+    return [];
+  }
+}
+
+function mergeTransientSessionEvents(persistedEvents, transientEvents) {
+  if (!Array.isArray(transientEvents) || transientEvents.length === 0) return persistedEvents;
+  const eventPayloads = transientEvents.filter((event) => !isTransientSingleTurnEvent(event));
+  const byRequestID = new Map();
+  for (const event of eventPayloads) {
+    const requestID = String(event.request_id || event.payload?.request_id || "");
+    if (requestID) byRequestID.set(requestID, event);
+  }
+  if (!byRequestID.size) return persistedEvents;
+  const merged = persistedEvents.map((event) => {
+    const transient = byRequestID.get(String(event.request_id || ""));
+    if (!transient) return event;
+    byRequestID.delete(String(event.request_id || ""));
+    return {
+      ...event,
+      payload: transient.payload,
+    };
+  });
+  for (const transient of byRequestID.values()) {
+    merged.push(publicTransientSessionEvent(transient));
+  }
+  return merged;
+}
+
+function publicTransientSessionEvent(event) {
+  return {
+    // Do not expose the transient tev_* cursor to clients. Persistent event
+    // cursors use ev_*; mixing prefixes can make later persistent events
+    // unreachable when clients pass the transient cursor back as "after".
+    cursor: "",
+    event_id: "",
+    request_id: event.request_id || event.payload?.request_id || "",
+    device_id: event.device_id || event.payload?.device_id || "",
+    session_id: event.session_id || event.payload?.session_id || "",
+    type: event.type || event.payload?.type || event.payload?.stage || "",
+    created_at: event.created_at || event.payload?.timestamp || "",
+    payload: event.payload,
+  };
+}
+
+function isTransientSingleTurnEvent(event) {
+  return Boolean(event?.payload?.turn && typeof event.payload.turn === "object");
+}
+
+function mergeSessionTurnsWithTransientTurns(persistedTurns = [], transientEvents = [], afterSeq = 0, limit = "") {
+  const max = eventTurnLimit(limit);
+  const bySeq = new Map();
+  for (const turn of persistedTurns || []) {
+    const seq = Number(turn?.seq);
+    if (!Number.isFinite(seq) || seq <= afterSeq) continue;
+    bySeq.set(seq, turn);
+  }
+  for (const turn of transientSessionTurns(transientEvents)) {
+    const seq = Number(turn?.seq);
+    if (!Number.isFinite(seq) || seq <= afterSeq) continue;
+    // Stable persisted rows win over transient deltas for the same seq.
+    if (!bySeq.has(seq)) bySeq.set(seq, transientTurnRecord(turn));
+  }
+  return [...bySeq.values()]
+    .sort((left, right) => Number(left.seq) - Number(right.seq))
+    .slice(0, max);
+}
+
+function eventTurnLimit(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return defaultSessionTurnWindowLimit;
+  return Math.min(maxSessionTurnWindowLimit, Math.max(1, Math.floor(parsed)));
+}
+
+function transientSessionTurns(transientEvents = []) {
+  const turns = [];
+  for (const event of transientEvents || []) {
+    const payload = event?.payload;
+    if (!payload || typeof payload !== "object") continue;
+    if (Array.isArray(payload.turns)) {
+      turns.push(...payload.turns.filter((turn) => turn && typeof turn === "object"));
+    }
+    if (payload.turn && typeof payload.turn === "object") {
+      turns.push(payload.turn);
+    }
+  }
+  return turns;
+}
+
+function transientTurnRecord(turn) {
+  return {
+    device_id: String(turn.device_id || ""),
+    session_id: String(turn.session_id || ""),
+    seq: Number(turn.seq),
+    agent: String(turn.agent || ""),
+    kind: String(turn.kind || ""),
+    timestamp: String(turn.timestamp || ""),
+    payload: turn.payload === undefined || turn.payload === null
+      ? null
+      : (typeof turn.payload === "string" ? turn.payload : JSON.stringify(turn.payload)),
+  };
+}
+
+function persistedEventCursor(events) {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const cursor = String(events[index]?.cursor || "");
+    if (cursor) return cursor;
+  }
+  return "";
 }
 
 async function listOnlineHosts(request, store, env, telemetryProvider = null) {
@@ -1603,20 +2070,22 @@ async function listOnlineHosts(request, store, env, telemetryProvider = null) {
     });
     return jsonResponse({ hosts: cached.hosts });
   }
-  const control = createControlHubForUser(env, user.user_id);
   const release = await daemonReleaseSnapshot(env);
   const devices = await store.listDevicesForUser(user.user_id);
-  const sessions = await store.listSessionsForUser(user.user_id);
-  const activeSessionsByDevice = new Map();
-  for (const session of sessions) {
-    activeSessionsByDevice.set(session.device_id, (activeSessionsByDevice.get(session.device_id) ?? 0) + 1);
-  }
   const daemonDevices = devices.filter((entry) => entry.device_type === "daemon" && entry.status !== "revoked");
-  const onlineByDeviceID = daemonDevices.length > 0 ? await control.onlineDevices(daemonDevices.map((device) => device.device_id)) : {};
+  const daemonDeviceIDs = daemonDevices.map((device) => device.device_id);
+  const control = daemonDeviceIDs.length > 0 ? createControlHubForUser(env, user.user_id) : null;
+  const presenceMap = control
+    ? await control.onlineDevices(daemonDeviceIDs).catch(() => ({}))
+    : {};
+  const activeSessionsByDevice = daemonDeviceIDs.length > 0
+    ? await sessionCountsByDevice(store, user.user_id, daemonDeviceIDs)
+    : new Map();
   const hosts = [];
   for (const device of daemonDevices) {
+    const controlOnline = Boolean(presenceMap?.[device.device_id]);
     hosts.push(withDaemonReleaseInfo(
-      publicHost(device, activeSessionsByDevice.get(device.device_id) ?? 0, Boolean(onlineByDeviceID[device.device_id])),
+      publicHost(device, activeSessionsByDevice.get(device.device_id) ?? 0, controlOnline),
       release,
     ));
   }
@@ -1624,18 +2093,51 @@ async function listOnlineHosts(request, store, env, telemetryProvider = null) {
     hostsOnlineCache.set(cacheKey, {
       fetchedAt: now,
       hosts,
-      sessionsCount: sessions.length,
+      sessionsCount: sumSessionCounts(activeSessionsByDevice),
       uniqueDaemonCount: daemonDevices.length,
     });
     pruneHostsOnlineCache(now, cacheTTL);
   }
   void recordPresenceTelemetry(telemetryProvider, request, {
-    presence_source: daemonDevices.length > 0 ? "batch_do" : "none",
-    sessions_count: sessions.length,
+    presence_source: daemonDevices.length > 0 ? "batch_control" : "none",
+    sessions_count: sumSessionCounts(activeSessionsByDevice),
     unique_daemon_count: daemonDevices.length,
-    presence_batch_size: daemonDevices.length,
+    presence_batch_size: daemonDeviceIDs.length,
   });
   return jsonResponse({ hosts });
+}
+
+async function sessionCountsByDevice(store, userID, deviceIDs) {
+  if (typeof store.countSessionsByDeviceForUser === "function") {
+    return normalizeSessionCountMap(await store.countSessionsByDeviceForUser(userID, deviceIDs));
+  }
+  const allowed = new Set(deviceIDs.map((id) => String(id)));
+  const counts = new Map();
+  for (const session of await store.listSessionsForUser(userID)) {
+    const deviceID = String(session.device_id || "");
+    if (!allowed.has(deviceID)) continue;
+    counts.set(deviceID, (counts.get(deviceID) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function normalizeSessionCountMap(value) {
+  if (value instanceof Map) {
+    return new Map([...value.entries()].map(([key, count]) => [String(key), Number(count) || 0]));
+  }
+  if (Array.isArray(value)) {
+    return new Map(value.map((row) => [String(row.device_id || ""), Number(row.count ?? row.session_count ?? 0) || 0]).filter(([deviceID]) => deviceID));
+  }
+  if (value && typeof value === "object") {
+    return new Map(Object.entries(value).map(([key, count]) => [String(key), Number(count) || 0]));
+  }
+  return new Map();
+}
+
+function sumSessionCounts(counts) {
+  let total = 0;
+  for (const count of counts.values()) total += Number(count) || 0;
+  return total;
 }
 
 async function historyUsage(request, store, url) {
@@ -1773,12 +2275,24 @@ export async function authorizeNexusWebSocket(request, env = {}) {
 
 function createRequestRuntime(env = {}, ctx = {}) {
   const provided = ctx.providers || {};
+  const costTracker = ctx.costTracker || null;
+  const store = instrumentCostProvider(
+    provided.store || env.POCKLY_NEXUS_STORE || env.POCKLY_RELAY_STORE || createStore(env),
+    costTracker,
+    "store",
+  );
+  const controlHub = instrumentCostProvider(
+    provided.controlHub || env.POCKLY_CONTROL_HUB || null,
+    costTracker,
+    "control",
+  );
+  const controlHubFactory = instrumentCostProvider(env.POCKLY_CONTROL_HUB_FACTORY || null, costTracker, "control_factory");
   const providers = createNexusProviderBundle({
     ...provided,
-    store: provided.store || env.POCKLY_NEXUS_STORE || env.POCKLY_RELAY_STORE || createStore(env),
-    controlHub: provided.controlHub || env.POCKLY_CONTROL_HUB || null,
-    blobStore: provided.blobStore || env.RELEASES || null,
-    historyBlobStore: provided.historyBlobStore || env.HISTORY_BLOBS || env.POCKLY_HISTORY_BLOBS || null,
+    store,
+    controlHub,
+    blobStore: instrumentCostProvider(provided.blobStore || env.RELEASES || null, costTracker, "object"),
+    historyBlobStore: instrumentCostProvider(provided.historyBlobStore || env.HISTORY_BLOBS || env.POCKLY_HISTORY_BLOBS || null, costTracker, "object"),
     emailProvider: provided.emailProvider || env.POCKLY_EMAIL_PROVIDER || null,
     sttProvider: provided.sttProvider || env.POCKLY_STT_PROVIDER || null,
     pushProvider: provided.pushProvider || env.POCKLY_PUSH_PROVIDER || null,
@@ -1787,6 +2301,8 @@ function createRequestRuntime(env = {}, ctx = {}) {
   const runtimeEnv = {
     ...env,
     ...(providers.controlHub ? { POCKLY_CONTROL_HUB: providers.controlHub } : {}),
+    ...(!providers.controlHub && controlHubFactory ? { POCKLY_CONTROL_HUB_FACTORY: controlHubFactory } : {}),
+    POCKLY_BROWSER_COMMAND_HANDLER: createBrowserRealtimeCommandHandler(requireNexusProvider(providers, "store"), env),
     POCKLY_CONTROL_EVENT_SINK: createSessionEventSink(requireNexusProvider(providers, "store"), {
       persistTerminalEvents: terminalEventCacheEnabled(env),
       env,
@@ -1804,18 +2320,220 @@ function createRequestRuntime(env = {}, ctx = {}) {
   };
 }
 
+export function createBrowserRealtimeCommandHandler(store, env = {}) {
+  return async ({ userID, browserDeviceID, message }) => {
+    const command = String(message?.command || "");
+    const requestID = requiredString(String(message?.request_id || ""), "request_id");
+    const payload = message?.payload && typeof message.payload === "object" ? message.payload : {};
+    const daemonDeviceID = requiredString(String(message?.daemon_device_id || payload.daemon_device_id || ""), "daemon_device_id");
+    const daemon = await requireUserDaemon(store, userID, daemonDeviceID);
+    await requireBrowserDaemonBinding(store, userID, daemon.device_id, browserDeviceID);
+    if (!daemon.remote_access_enabled) throw new Error("remote access is disabled");
+
+    switch (command) {
+      case "inject_session":
+        return await buildRealtimeInjectCommand(store, userID, browserDeviceID, daemon, requestID, message, payload);
+      case "start_task":
+        return buildRealtimeStartTaskCommand(browserDeviceID, daemon, requestID, payload);
+      case "sync_session":
+        return await buildRealtimeSyncCommand(store, userID, browserDeviceID, daemon, requestID, message, payload);
+      case "permission_decide":
+        return buildRealtimePermissionCommand(daemon, requestID, payload);
+      case "session_opened_hint":
+        return await buildRealtimeSessionOpenedHintCommand(store, userID, daemon, requestID, payload);
+      case "terminal_create":
+        return buildRealtimeTerminalCreate(userID, browserDeviceID, daemon, requestID, payload);
+      case "terminal_input":
+        return { mode: "terminal_action", action: "input", terminalSessionID: requiredString(String(message.terminal_session_id || payload.terminal_session_id || ""), "terminal_session_id"), text: String(payload.text || "") };
+      case "terminal_open":
+        return { mode: "terminal_action", action: "open", terminalSessionID: requiredString(String(message.terminal_session_id || payload.terminal_session_id || ""), "terminal_session_id") };
+      case "terminal_stop":
+        return { mode: "terminal_action", action: "stop", terminalSessionID: requiredString(String(message.terminal_session_id || payload.terminal_session_id || ""), "terminal_session_id") };
+      case "terminal_subscribe":
+        return { mode: "terminal_action", action: "subscribe", terminalSessionID: requiredString(String(message.terminal_session_id || payload.terminal_session_id || ""), "terminal_session_id") };
+      case "terminal_unsubscribe":
+        return { mode: "terminal_action", action: "unsubscribe", terminalSessionID: requiredString(String(message.terminal_session_id || payload.terminal_session_id || ""), "terminal_session_id") };
+      default:
+        throw new Error("unsupported browser command");
+    }
+  };
+}
+
+async function buildRealtimeInjectCommand(store, userID, browserDeviceID, daemon, requestID, message, payload) {
+  const sessionID = requiredString(String(message.session_id || payload.session_id || ""), "session_id");
+  const { session } = await requireUserDaemonSession(store, userID, daemon.device_id, sessionID);
+  const text = String(payload.text || "");
+  if (!text.trim()) throw new Error("text is required");
+  const options = injectStreamOptions(sessionID);
+  return {
+    mode: "stream",
+    daemonDeviceID: daemon.device_id,
+    daemonRequestID: requestID,
+    sessionID,
+    timeoutMs: options.timeoutMs,
+    closeWhen: options.closeWhen,
+    timeoutEvent: options.timeoutEvent,
+    errorEvent: options.errorEvent,
+    initialEvent: { request_id: requestID, type: "inject_started", session_id: sessionID },
+    ack: { status: "accepted", type: "inject_started", session_id: sessionID, device_id: daemon.device_id, streaming: true },
+    envelope: {
+      type: "INJECT_REQUEST",
+      request: {
+        request_id: requestID,
+        daemon_device_id: daemon.device_id,
+        browser_device_id: browserDeviceID,
+        mode: "resume_session",
+        session_id: sessionID,
+        agent: session.agent || "claude-code",
+        cwd: session.cwd || "",
+        text,
+        model: payload.model || "",
+        files: [],
+      },
+    },
+  };
+}
+
+function buildRealtimeStartTaskCommand(browserDeviceID, daemon, requestID, payload) {
+  const text = String(payload.text || "");
+  if (!text.trim()) throw new Error("text is required");
+  const sessionID = String(payload.session_id || "");
+  const options = injectStreamOptions(sessionID);
+  return {
+    mode: "stream",
+    daemonDeviceID: daemon.device_id,
+    daemonRequestID: requestID,
+    sessionID,
+    timeoutMs: options.timeoutMs,
+    closeWhen: options.closeWhen,
+    timeoutEvent: options.timeoutEvent,
+    errorEvent: options.errorEvent,
+    initialEvent: { request_id: requestID, type: "inject_started", session_id: sessionID },
+    ack: { status: "accepted", type: "inject_started", session_id: sessionID, device_id: daemon.device_id, streaming: true },
+    envelope: {
+      type: "INJECT_REQUEST",
+      request: {
+        request_id: requestID,
+        daemon_device_id: daemon.device_id,
+        browser_device_id: browserDeviceID,
+        mode: "start_task",
+        session_id: sessionID,
+        agent: payload.agent || "claude-code",
+        cwd: payload.cwd || "",
+        text,
+        model: payload.model || "",
+        permission_mode: payload.permission_mode || "",
+        effort: payload.effort || "",
+      },
+    },
+  };
+}
+
+async function buildRealtimeSyncCommand(store, userID, browserDeviceID, daemon, requestID, message, payload) {
+  const sessionID = requiredString(String(message.session_id || payload.session_id || ""), "session_id");
+  await requireUserDaemonSession(store, userID, daemon.device_id, sessionID);
+  const options = syncStreamOptions(sessionID, daemon.device_id);
+  return {
+    mode: "stream",
+    daemonDeviceID: daemon.device_id,
+    daemonRequestID: requestID,
+    sessionID,
+    timeoutMs: options.timeoutMs,
+    closeWhen: options.closeWhen,
+    timeoutEvent: options.timeoutEvent,
+    errorEvent: options.errorEvent,
+    initialEvent: { ...options.initialEvent, request_id: requestID },
+    ack: { request_id: requestID, session_id: sessionID, device_id: daemon.device_id, stage: "queued", status: "running", streaming: true },
+    envelope: {
+      type: "SYNC_SESSION_REQUEST",
+      sync_request: {
+        request_id: requestID,
+        daemon_device_id: daemon.device_id,
+        session_id: sessionID,
+        browser_device_id: browserDeviceID,
+        mode: "window",
+        limit: Number(payload.limit ?? 20),
+        before_seq: Number(payload.before_seq ?? 0),
+      },
+    },
+  };
+}
+
+function buildRealtimePermissionCommand(daemon, requestID, payload) {
+  const decision = String(payload.decision || "");
+  if (decision !== "allow" && decision !== "deny") throw new Error("decision must be allow or deny");
+  const permissionRequestID = requiredString(String(payload.permission_request_id || requestID || ""), "permission_request_id");
+  return {
+    mode: "request_response",
+    daemonDeviceID: daemon.device_id,
+    daemonRequestID: permissionRequestID,
+    responseType: "PERMISSION_DECIDE_EVENT",
+    timeoutMs: 5_000,
+    ack: { status: "accepted", device_id: daemon.device_id },
+    envelope: {
+      type: "PERMISSION_DECIDE",
+      permission_decide: { request_id: permissionRequestID, decision },
+    },
+  };
+}
+
+async function buildRealtimeSessionOpenedHintCommand(store, userID, daemon, requestID, payload) {
+  const sessionID = requiredString(String(payload.session_id || ""), "session_id");
+  const session = await sessionWithTurnStats(store, userID, daemon.device_id, sessionID);
+  const openedAt = payload.opened_at ? String(payload.opened_at) : new Date().toISOString();
+  if (!isLargeSessionForAutomaticBackfill(session)) {
+    await store.upsertSessionOpenHint({
+      user_id: userID,
+      device_id: daemon.device_id,
+      session_id: sessionID,
+      last_opened_at: openedAt,
+      updated_at: new Date().toISOString(),
+    });
+  }
+  const windowHash = await sessionWindowHash(store, userID, daemon.device_id, sessionID, session);
+  return {
+    mode: "dispatch",
+    daemonDeviceID: daemon.device_id,
+    sessionID,
+    ack: { status: "accepted", device_id: daemon.device_id, session_id: sessionID, last_opened_at: openedAt },
+    envelope: {
+      type: "SYNC_HINT",
+      sync_hint: {
+        ...sessionSyncHintPayload(session, sessionID),
+        ...(windowHash ? { window_hash: windowHash } : {}),
+        reason: "recently_opened",
+        preferred_min: prioritySyncHintTurnLimit,
+        request_id: requestID,
+      },
+    },
+  };
+}
+
+function buildRealtimeTerminalCreate(userID, browserDeviceID, daemon, requestID, payload) {
+  return {
+    mode: "terminal_create",
+    terminalSession: {
+      request_id: requestID,
+      terminal_session_id: randomID("ts"),
+      user_id: userID,
+      daemon_device_id: daemon.device_id,
+      browser_device_id: browserDeviceID,
+      session_id: payload.session_id || "",
+      agent: payload.agent || "claude-code",
+      cwd: payload.cwd || "",
+    },
+  };
+}
+
 export function createSessionEventSink(store, options = {}) {
   const persistTerminalEvents = options.persistTerminalEvents !== false;
   const env = options.env || {};
   const providers = options.providers || {};
   return {
     async onControlEvent(payload, meta = {}) {
-      // Turn content goes straight into session_turns — the same row the
-      // daemon's window sync would write later (a byte-identical re-upsert is
-      // a zero-write no-op under the conditional upsert). Persisting the turn
-      // once instead of duplicating it inside a session_events row halves the
-      // D1 row-writes of an active turn; pollers read it back via the
-      // turns/next_seq fields of the events response.
+      // Active stream deltas stay in the control hub's short-lived cache. Only
+      // stable final turns are written into session_turns so active polling can
+      // stay live without turning every token/chunk into a durable write.
       const turnRow = sessionTurnRecord(payload, meta);
       if (turnRow) {
         try {
@@ -1850,13 +2568,14 @@ export function createSessionEventSink(store, options = {}) {
   };
 }
 
-// sessionTurnRecord maps a turn-carrying control event onto a session_turns
-// row (the durable shape syncTurnRecord also produces). Returns null when the
-// routing keys are unresolvable — the caller then falls back to persisting the
-// full event row so no content is dropped.
+// sessionTurnRecord maps a stable final turn onto a session_turns row (the
+// durable shape syncTurnRecord also produces). Mid-turn stream deltas return
+// null and are served from the transient control cache instead.
 function sessionTurnRecord(payload, meta = {}) {
+  if (Array.isArray(payload?.turns)) return null;
   const turn = payload?.turn && typeof payload.turn === "object" ? payload.turn : null;
   if (!turn) return null;
+  if (!isStableTurnEvent(payload, meta)) return null;
   const userID = String(meta.userID || "");
   const deviceID = String(turn.device_id || payload.device_id || meta.daemonDeviceID || "");
   const sessionID = String(turn.session_id || payload.session_id || "");
@@ -1878,6 +2597,15 @@ function sessionTurnRecord(payload, meta = {}) {
   };
 }
 
+function isStableTurnEvent(payload, meta = {}) {
+  const type = String(payload?.type || payload?.stage || meta.kind || "");
+  const status = String(payload?.status || "");
+  return type === "inject_completed" ||
+    type === "completed" ||
+    type === "turn_completed" ||
+    status === "completed";
+}
+
 function sessionEventRecord(payload, meta = {}, options = {}) {
   if (!shouldPersistSessionEvent(payload, meta, options)) return null;
   const requestID = String(payload?.request_id || "");
@@ -1895,9 +2623,26 @@ function sessionEventRecord(payload, meta = {}, options = {}) {
     session_id: sessionID,
     request_id: requestID,
     event_type: String(payload.type || payload.stage || meta.kind || "control_event"),
-    payload: JSON.stringify(payload),
+    payload: JSON.stringify(sessionEventPayloadForStorage(payload)),
     created_at: String(payload.timestamp || turn?.timestamp || now),
   };
+}
+
+function sessionEventPayloadForStorage(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (Array.isArray(payload.turns)) {
+    // SYNC_SESSION_EVENT turns are transient older-history windows. They are
+    // delivered to the waiting page through the live control/event cache, but
+    // must not become durable session_events payloads. Hot-window history stays
+    // bounded in session_turns; full old history remains daemon-local.
+    const { turns, ...rest } = payload;
+    return {
+      ...rest,
+      turns_omitted: true,
+      turns_omitted_count: turns.length,
+    };
+  }
+  return payload;
 }
 
 function shouldPersistSessionEvent(payload, meta = {}, options = {}) {
@@ -1909,10 +2654,9 @@ function shouldPersistSessionEvent(payload, meta = {}, options = {}) {
   if (type === "inject_completed" || type === "inject_failed" || type === "inject_cancelled") return true;
   if (type === "completed" || type === "failed") return true;
   if (payload?.status === "completed" || payload?.status === "failed") return true;
-  // Pure turn events (stream_event) are content, not lifecycle. When the turn
-  // was already written into session_turns, skip the duplicate event row;
-  // keep the old behavior as a fallback when the turn keys were unresolvable.
-  if (payload?.turn && typeof payload.turn === "object" && !options.turnPersisted) return true;
+  // Pure turn events (stream_event) are active content, not lifecycle. They
+  // stay in the short-lived control cache and must not become durable rows.
+  if (payload?.turn && typeof payload.turn === "object") return false;
   return false;
 }
 
@@ -2041,6 +2785,14 @@ async function sessionDelete(request, store, env, providers, sessionID, url) {
     }
     const historyBlobKeys = await collectSessionHistoryBlobKeys(store, providers, user.user_id, daemon.device_id, sessionID);
     await store.deleteSessionData(user.user_id, daemon.device_id, sessionID);
+    await appendSessionCatalogChanges(store, [{
+      type: "delete",
+      user_id: user.user_id,
+      device_id: daemon.device_id,
+      session_id: sessionID,
+      session: null,
+      at: new Date().toISOString(),
+    }]);
     await deleteHistoryBlobsBestEffort(providers, historyBlobKeys);
     return jsonResponse({ status: "ok", deleted: result.deleted || [] });
   } catch (error) {
@@ -2500,6 +3252,138 @@ async function invokeTelemetryProvider(provider, text, request) {
   }
 }
 
+function createEndpointCostTracker() {
+  return {
+    store_reads: 0,
+    store_writes: 0,
+    sql_rows_read: 0,
+    sql_rows_written: 0,
+    object_reads: 0,
+    object_writes: 0,
+    control_requests: 0,
+  };
+}
+
+function instrumentCostProvider(provider, tracker, kind) {
+  if (!provider || !tracker || (typeof provider !== "object" && typeof provider !== "function")) return provider;
+  return new Proxy(provider, {
+    get(target, prop, receiver) {
+      const value = Reflect.get(target, prop, receiver);
+      if (typeof value !== "function") return value;
+      return (...args) => {
+        const method = String(prop);
+        recordProviderCost(tracker, kind, method);
+        const result = value.apply(target, args);
+        if (kind === "control_factory" && (method === "forUser" || method === "get")) {
+          return instrumentCostProvider(result, tracker, "control");
+        }
+        return result;
+      };
+    },
+  });
+}
+
+function recordProviderCost(tracker, kind, method) {
+  if (kind === "store") {
+    if (isStoreWriteMethod(method)) tracker.store_writes += 1;
+    else tracker.store_reads += 1;
+    return;
+  }
+  if (kind === "object") {
+    if (isObjectWriteMethod(method)) tracker.object_writes += 1;
+    else if (isObjectReadMethod(method)) tracker.object_reads += 1;
+    return;
+  }
+  if (kind === "control") {
+    tracker.control_requests += 1;
+  }
+}
+
+function isStoreWriteMethod(method) {
+  return /^(upsert|create|delete|append|touch|consume|revoke|set|update|save|mark|prune)/.test(method);
+}
+
+function isObjectWriteMethod(method) {
+  return /^(put|delete|write|upload|remove)/.test(method);
+}
+
+function isObjectReadMethod(method) {
+  return /^(get|head|list|text|read|download)/.test(method);
+}
+
+async function recordEndpointCostTelemetry(provider, request, response, fields = {}) {
+  if (!provider) return;
+  const endpoint = endpointCostName(new URL(request.url).pathname);
+  if (!endpoint) return;
+  const costTracker = fields.costTracker || {};
+  const event = {
+    name: "nexus_endpoint_cost",
+    endpoint,
+    method: request.method,
+    status: Number(response.status || 0),
+    duration_ms: Math.max(0, Math.round(Number(fields.durationMs || 0))),
+    worker_requests: 1,
+    worker_wall_duration_ms: Math.max(0, Math.round(Number(fields.durationMs || 0))),
+    worker_cpu_time_ms_estimate: Math.max(0, Math.round(Number(fields.durationMs || 0))),
+    worker_cpu_time_source: "wall_clock_proxy",
+    request_bytes: headerBytes(request.headers, "content-length"),
+    response_bytes: headerBytes(response.headers, "content-length"),
+    store_reads: Number(costTracker.store_reads || 0),
+    store_writes: Number(costTracker.store_writes || 0),
+    sql_rows_read: Number(costTracker.sql_rows_read || 0),
+    sql_rows_written: Number(costTracker.sql_rows_written || 0),
+    object_reads: Number(costTracker.object_reads || 0),
+    object_writes: Number(costTracker.object_writes || 0),
+    control_requests: Number(costTracker.control_requests || 0),
+    do_requests: Number(costTracker.control_requests || 0),
+    timestamp: new Date().toISOString(),
+  };
+  const payload = JSON.stringify({ events: [event] });
+  try {
+    await invokeTelemetryProvider(provider, payload, request);
+  } catch {
+    // Endpoint cost telemetry is advisory and must never affect API behavior.
+  }
+}
+
+function endpointCostName(pathname) {
+  const path = normalizePath(pathname);
+  if (path === "/api/telemetry/web" || path === "/api/telemetry/daemon") return "";
+  if (path === "/healthz") return "healthz";
+  const exact = {
+    "/api/runtime": "runtime",
+    "/api/auth/session": "auth_session",
+    "/api/daemon/control": "daemon_control",
+    "/api/daemon/sync": "daemon_sync",
+    "/api/daemon/sync-hints": "daemon_sync_hints",
+    "/api/hosts/online": "hosts_online",
+    "/api/sessions": "sessions",
+    "/api/sessions/delta": "sessions_delta",
+    "/api/terminal-sessions": "terminal_sessions",
+  };
+  if (exact[path]) return exact[path];
+  if (/^\/api\/sessions\/[^/]+\/turns$/.test(path)) return "session_turns";
+  if (/^\/api\/sessions\/[^/]+\/events$/.test(path)) return "session_events";
+  if (/^\/api\/sessions\/[^/]+\/opened$/.test(path)) return "session_opened";
+  if (/^\/api\/sessions\/[^/]+$/.test(path)) return "session_catalog_item";
+  const sessionAction = path.match(/^\/api\/sessions\/[^/]+\/(inject|sync|agent-settings|diff|delete|reveal)$/);
+  if (sessionAction) return `session_${sessionAction[1].replace(/-/g, "_")}`;
+  if (/^\/api\/injects\/[^/]+\/events$/.test(path)) return "inject_events";
+  const terminalAction = path.match(/^\/api\/terminal-sessions\/[^/]+\/(input|stop|open-terminal|stream|subscribe|unsubscribe|events)$/);
+  if (terminalAction) return `terminal_${terminalAction[1].replace(/-/g, "_")}`;
+  if (/^\/api\/permission-requests\/[^/]+\/decide$/.test(path)) return "permission_decide";
+  const hostAction = path.match(/^\/api\/hosts\/[^/]+\/(connect|disconnect|update)$/);
+  if (hostAction) return `host_${hostAction[1]}`;
+  if (path.startsWith("/api/")) return "api_other";
+  return "other";
+}
+
+function headerBytes(headers, name) {
+  const value = Number(headers.get(name) || 0);
+  if (!Number.isFinite(value) || value < 0) return 0;
+  return Math.floor(value);
+}
+
 async function invokeSTTProvider(provider, input) {
   if (typeof provider === "function") return await provider(input);
   if (provider && typeof provider.transcribe === "function") return await provider.transcribe(input);
@@ -2820,12 +3704,12 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
   const uploadedTurnCount = Number(uploadedTurnStats?.count ?? 0) || 0;
   const uploadedSyncedMinSeq = Number(stats?.min_seq ?? uploadedTurnStats?.min_seq ?? minSeq) || 0;
   const uploadedSyncedMaxSeq = Number(stats?.max_seq ?? uploadedTurnStats?.max_seq ?? maxSeq) || 0;
-  const syncedMinSeq = uploadedTurnCount > 0
-    ? mergeSyncedMinSeq(existing?.synced_min_seq, uploadedSyncedMinSeq)
-    : mergeSyncedMinSeq(existing?.synced_min_seq, stats?.min_seq ?? 0);
-  const syncedMaxSeq = uploadedTurnCount > 0
-    ? Math.max(Number(existing?.synced_max_seq ?? 0), uploadedSyncedMaxSeq)
-    : Math.max(Number(existing?.synced_max_seq ?? 0), stats?.max_seq ?? 0);
+  const syncedMinSeq = stats
+    ? uploadedSyncedMinSeq
+    : Number(existing?.synced_min_seq ?? 0) || 0;
+  const syncedMaxSeq = stats
+    ? uploadedSyncedMaxSeq
+    : Number(existing?.synced_max_seq ?? 0) || 0;
   return {
     user_id: user.user_id,
     computer_id: device.computer_id ?? null,
@@ -2862,8 +3746,9 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
 async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnStats) {
   const uploadedTurnCount = Number(uploadedTurnStats?.count ?? 0) || 0;
   if (uploadedTurnCount > 0) {
-    const merged = mergeUploadedTurnStats(existing, session, uploadedTurnStats);
-    if (!merged.requires_full_stats) return merged;
+    // Turns are written before session metadata and may be pruned by the
+    // hot-window retention policy. Use the store's seq-only stats query so catalog
+    // metadata reflects the rows actually retained in Nexus, not just uploaded.
     return await sessionTurnStats(store, userID, deviceID, sessionID);
   }
   return null;
@@ -2945,8 +3830,8 @@ async function sessionWithTurnStats(store, userID, deviceID, sessionID, options 
   const session = await store.getSession(userID, deviceID, sessionID);
   if (!session) return null;
   const stats = await sessionTurnStats(store, userID, deviceID, sessionID);
-  const syncedMinSeq = mergeSyncedMinSeq(session.synced_min_seq, stats.min_seq);
-  const syncedMaxSeq = Math.max(Number(session.synced_max_seq ?? 0) || 0, stats.max_seq);
+  const syncedMinSeq = Number(stats.min_seq ?? 0) || 0;
+  const syncedMaxSeq = Number(stats.max_seq ?? 0) || 0;
   const next = {
     ...session,
     synced_turn_count: stats.count,
@@ -2974,6 +3859,55 @@ async function sessionWithTurnStats(store, userID, deviceID, sessionID, options 
     });
   }
   return next;
+}
+
+async function repairPrunedTurnSessions(store, user, device, prunedSessions = [], alreadyUpdatedSessionIDs = new Set(), now = new Date().toISOString()) {
+  const out = [];
+  const seen = new Set();
+  for (const pruned of prunedSessions) {
+    if (String(pruned.user_id || "") !== user.user_id) continue;
+    if (String(pruned.device_id || "") !== device.device_id) continue;
+    const sessionID = String(pruned.session_id || "");
+    if (!sessionID || alreadyUpdatedSessionIDs.has(sessionID) || seen.has(sessionID)) continue;
+    seen.add(sessionID);
+    const existing = await store.getSession(user.user_id, device.device_id, sessionID);
+    if (!existing) continue;
+    const stats = await sessionTurnStats(store, user.user_id, device.device_id, sessionID);
+    const hasRetainedTurns = Number(stats.count ?? 0) > 0;
+    const repaired = {
+      ...existing,
+      sync_state: hasRetainedTurns
+        ? mergedSyncState(existing, existing, 0, {
+            persistedTurnCount: stats.count,
+            syncedMinSeq: stats.min_seq,
+            syncedMaxSeq: stats.max_seq,
+          })
+        : "catalog_only",
+      synced_turn_count: stats.count,
+      synced_min_seq: Number(stats.min_seq ?? 0) || 0,
+      synced_max_seq: Number(stats.max_seq ?? 0) || 0,
+      has_older_turns: hasRetainedTurns
+        ? mergedHasOlderTurns(existing, existing, 0, {
+            persistedTurnCount: stats.count,
+            syncedMinSeq: stats.min_seq,
+            syncedMaxSeq: stats.max_seq,
+          })
+        : false,
+      updated_at: existing.updated_at || now,
+    };
+    if (!sessionMatchesExisting(repaired, existing)) out.push(repaired);
+  }
+  if (!out.length) return [];
+  await store.upsertSessions(out);
+  await appendSessionCatalogChanges(store, out.map((session) => ({
+    type: "upsert",
+    user_id: user.user_id,
+    device_id: session.device_id,
+    session_id: session.session_id,
+    session,
+    at: now,
+  })));
+  return out;
 }
 
 function sessionNeedsStatsRepair(session, next) {
@@ -3007,6 +3941,105 @@ function sessionSyncHintPayload(session, fallbackSessionID = "") {
     total_turn_count: totalTurnCount,
     has_older_turns: Boolean(session?.has_older_turns),
   };
+}
+
+async function sessionWindowHash(store, userID, deviceID, sessionID, session) {
+  if (typeof store.listTurnPayloadsForWindow !== "function") return "";
+  const minSeq = Number(session?.synced_min_seq ?? 0) || 0;
+  const maxSeq = Number(session?.synced_max_seq ?? 0) || 0;
+  const count = Number(session?.synced_turn_count ?? 0) || 0;
+  if (minSeq <= 0 || maxSeq < minSeq || count < maxSeq - minSeq + 1) return "";
+  const turns = await store.listTurnPayloadsForWindow(userID, deviceID, sessionID, minSeq, maxSeq);
+  if (turns.length !== maxSeq - minSeq + 1) return "";
+  return await turnWindowHash(turns);
+}
+
+async function knownSessionWindows(store, userID, deviceID, sessions = []) {
+  if (typeof store.listTurnPayloadPointers !== "function") return [];
+  const candidates = sessions
+    .map((session) => knownWindowCandidate(session))
+    .filter(Boolean);
+  if (!candidates.length) return [];
+  const bySessionID = new Map(candidates.map((candidate) => [candidate.session_id, candidate]));
+  const turnsBySessionID = new Map();
+  for (const turn of await store.listTurnPayloadPointers(userID, deviceID, candidates.map((candidate) => candidate.session_id))) {
+    const candidate = bySessionID.get(String(turn.session_id || ""));
+    if (!candidate) continue;
+    const seq = Number(turn.seq ?? 0) || 0;
+    if (seq <= 0 || seq > candidate.synced_max_seq) continue;
+    const turns = turnsBySessionID.get(candidate.session_id) || [];
+    turns.push(turn);
+    turnsBySessionID.set(candidate.session_id, turns);
+  }
+  const out = [];
+  for (const candidate of candidates) {
+    const turns = latestContiguousTurnTail(turnsBySessionID.get(candidate.session_id) || [], candidate.synced_max_seq);
+    if (!turns.length) continue;
+    out.push({
+      session_id: candidate.session_id,
+      synced_min_seq: Number(turns[0].seq ?? 0) || 0,
+      synced_max_seq: Number(turns[turns.length - 1].seq ?? 0) || 0,
+      synced_turn_count: turns.length,
+      window_hash: await turnWindowHash(turns),
+    });
+  }
+  return out;
+}
+
+function latestContiguousTurnTail(turns = [], maxSeq = 0) {
+  const sorted = turns
+    .sort((left, right) => Number(left.seq) - Number(right.seq));
+  let expected = Number(maxSeq ?? 0) || Number(sorted[sorted.length - 1]?.seq ?? 0) || 0;
+  const tail = [];
+  for (let index = sorted.length - 1; index >= 0; index -= 1) {
+    const turn = sorted[index];
+    const seq = Number(turn.seq ?? 0) || 0;
+    if (seq !== expected) {
+      if (tail.length > 0) break;
+      if (seq > expected) continue;
+      break;
+    }
+    tail.push(turn);
+    expected -= 1;
+  }
+  return tail.reverse();
+}
+
+function knownWindowCandidate(session) {
+  const sessionID = String(session?.session_id || "");
+  const minSeq = Number(session?.synced_min_seq ?? 0) || 0;
+  const maxSeq = Number(session?.synced_max_seq ?? 0) || 0;
+  const count = Number(session?.synced_turn_count ?? 0) || 0;
+  if (!sessionID || maxSeq <= 0 || count <= 0) return null;
+  return {
+    session_id: sessionID,
+    synced_min_seq: minSeq,
+    synced_max_seq: maxSeq,
+    synced_turn_count: count,
+  };
+}
+
+async function turnWindowHash(turns) {
+  const parts = [];
+  for (const turn of turns) {
+    parts.push(
+      String(turn.session_id ?? ""),
+      String(turn.agent ?? ""),
+      String(Number(turn.seq ?? 0) || 0),
+      String(turn.kind ?? ""),
+      String(turn.timestamp ?? ""),
+      await turnPayloadDigest(turn.payload),
+    );
+  }
+  return `sha256:${await sha256Base64URL(`${parts.join("\0")}\0`)}`;
+}
+
+async function turnPayloadDigest(payload) {
+  const raw = payload == null ? "" : String(payload);
+  const parsed = parsePayload(raw);
+  if (isLocalOnlyPayloadPlaceholder(parsed) && parsed.sha256) return String(parsed.sha256);
+  if (isTurnPayloadPointerObject(parsed) && parsed.sha256) return String(parsed.sha256);
+  return await sha256Base64URL(raw);
 }
 
 function nextBackfillBeforeSeq(session) {
@@ -3221,6 +4254,13 @@ function publicSession(session, device, controlOnline = false) {
   };
 }
 
+function publicCatalogSession(session) {
+  // Catalog deltas intentionally do not carry realtime presence. The browser
+  // projects /api/hosts/online onto cached catalog rows, keeping catalog paging
+  // independent of realtime-coordinator wakeups and stale last_seen_at heuristics.
+  return publicSession(session, null, false);
+}
+
 async function publicTurns(turns, providers = {}) {
   const blobCache = new Map();
   return await Promise.all(turns.map((turn) => publicTurn(turn, providers, blobCache)));
@@ -3302,18 +4342,96 @@ function roundCost(value) {
 }
 
 async function externalizeTurnPayloads(turns, env = {}, providers = {}) {
+  if (!historyBlobStorageEnabled(env)) {
+    return await applyHotTurnPayloadPolicy(turns, env);
+  }
   const threshold = turnPayloadBlobThreshold(env);
   const blobStore = providers.historyBlobStore;
-  if (!blobStore || threshold <= 0 || !turns.length) return turns;
+  if (!blobStore || threshold <= 0 || !turns.length) return await applyHotTurnPayloadPolicy(turns, env);
   return await externalizeTurnPayloadBatch(turns, blobStore, threshold, turnPayloadBatchRawBytes(env));
 }
 
 async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
   const deduped = dedupeTurnRecords(turns);
-  if (!deduped.length) return;
-  const changed = await filterChangedTurnRecords(store, deduped);
-  if (!changed.length) return;
-  await store.upsertTurns(await externalizeTurnPayloads(changed, env, providers));
+  if (!deduped.length) return [];
+  const hotCandidates = selectHotTurnCandidates(deduped, env);
+  if (!hotCandidates.length) return [];
+  const useHistoryBlobStorage = historyBlobStorageEnabled(env) && providers.historyBlobStore;
+  const candidates = useHistoryBlobStorage ? hotCandidates : await applyHotTurnPayloadPolicy(hotCandidates, env);
+  const changed = await filterChangedTurnRecords(store, candidates);
+  if (!changed.length) return [];
+  await store.upsertTurns(useHistoryBlobStorage ? await externalizeTurnPayloads(changed, env, providers) : changed);
+  if (typeof store.pruneHotTurnCache === "function") {
+    const perUser = hotTurnsPerUser(env);
+    const userIDs = [...new Set(changed.map((turn) => String(turn.user_id)).filter(Boolean))];
+    const changedSessionKeys = [...new Set(changed.map((turn) => turnSessionKey(turn)).filter(Boolean))];
+    const sessionKeys = changedSessionKeys.length <= maxScopedHotTurnPruneSessions ? changedSessionKeys : [];
+    const runGlobalPrune = shouldRunGlobalHotTurnPrune(userIDs, changed.length, perUser, env);
+    return await store.pruneHotTurnCache({
+      perSession: hotTurnsPerSession(env),
+      perUser: runGlobalPrune ? perUser : 0,
+      inactiveBefore: runGlobalPrune ? hotTurnInactiveBefore(env) : "",
+      userIDs,
+      sessionKeys,
+    });
+  }
+  return [];
+}
+
+function shouldRunGlobalHotTurnPrune(userIDs, changedCount, perUser, env = {}, nowMs = Date.now()) {
+  if (env.POCKLY_FORCE_GLOBAL_HOT_TURN_PRUNE === "1") return true;
+  if (changedCount >= perUser) return true;
+  const intervalMs = globalHotTurnPruneIntervalMs(env);
+  if (intervalMs <= 0) return true;
+  for (const userID of userIDs) {
+    const last = globalHotTurnPruneLastRun.get(userID) ?? 0;
+    if (nowMs - last >= intervalMs) {
+      globalHotTurnPruneLastRun.set(userID, nowMs);
+      return true;
+    }
+  }
+  return false;
+}
+
+function selectHotTurnCandidates(turns, env = {}) {
+  const perSession = hotTurnsPerSession(env);
+  const perUser = hotTurnsPerUser(env);
+  const sessionScoped = newestTurnRecordsByGroup(
+    turns,
+    (turn) => `${turn.user_id}\x00${turn.device_id}\x00${turn.session_id}`,
+    perSession,
+    compareTurnSeqNewestFirst,
+  );
+  return newestTurnRecordsByGroup(sessionScoped, (turn) => String(turn.user_id || ""), perUser);
+}
+
+function newestTurnRecordsByGroup(turns, keyFn, limit, compareFn = compareTurnRecordsNewestFirst) {
+  if (!Number.isFinite(limit) || limit <= 0 || turns.length <= limit) return turns;
+  const groups = new Map();
+  for (const turn of turns) {
+    const key = keyFn(turn);
+    const group = groups.get(key) || [];
+    group.push(turn);
+    groups.set(key, group);
+  }
+  const keep = new Set();
+  for (const group of groups.values()) {
+    const selected = group.length > limit
+      ? [...group].sort(compareFn).slice(0, limit)
+      : group;
+    for (const turn of selected) keep.add(turnRecordKey(turn));
+  }
+  return turns.filter((turn) => keep.has(turnRecordKey(turn)));
+}
+
+function compareTurnSeqNewestFirst(left, right) {
+  return (Number(right.seq) || 0) - (Number(left.seq) || 0);
+}
+
+function compareTurnRecordsNewestFirst(left, right) {
+  const timeDiff = (Date.parse(right.timestamp || "") || 0) - (Date.parse(left.timestamp || "") || 0);
+  if (timeDiff !== 0) return timeDiff;
+  return (Number(right.seq) || 0) - (Number(left.seq) || 0);
 }
 
 async function filterChangedTurnRecords(store, turns) {
@@ -3331,6 +4449,9 @@ async function filterChangedTurnRecords(store, turns) {
 async function turnPayloadsEquivalent(existingPayload, nextPayload) {
   if (existingPayload === nextPayload) return true;
   const existingPointer = parsePayload(existingPayload);
+  if (isLocalOnlyPayloadPlaceholder(existingPointer)) {
+    return existingPointer.sha256 && existingPointer.sha256 === await sha256Base64URL(String(nextPayload ?? ""));
+  }
   if (isTurnPayloadPointerObject(existingPointer)) {
     return existingPointer.sha256 && existingPointer.sha256 === await sha256Base64URL(String(nextPayload ?? ""));
   }
@@ -3347,6 +4468,14 @@ function dedupeTurnRecords(turns = []) {
 
 function turnRecordKey(turn) {
   return `${turn.user_id}\x00${turn.device_id}\x00${turn.session_id}\x00${turn.seq}`;
+}
+
+function turnSessionKey(turn) {
+  const userID = String(turn.user_id || "");
+  const deviceID = String(turn.device_id || "");
+  const sessionID = String(turn.session_id || "");
+  if (!userID || !deviceID || !sessionID) return "";
+  return `${userID}\x00${deviceID}\x00${sessionID}`;
 }
 
 async function externalizeTurnPayloadBatch(turns, blobStore, threshold, maxBatchRawBytes) {
@@ -3576,6 +4705,91 @@ function turnPayloadBlobThreshold(env = {}) {
   return Math.floor(value);
 }
 
+function historyBlobStorageEnabled(env = {}) {
+  const value = env.POCKLY_HISTORY_BLOBS_ENABLED ?? "";
+  return value === true || value === "1" || value === "true";
+}
+
+async function applyHotTurnPayloadPolicy(turns, env = {}) {
+  const maxPayloadBytes = hotTurnMaxPayloadBytes(env);
+  if (maxPayloadBytes <= 0) return turns;
+  return await Promise.all(turns.map(async (turn) => {
+    const payload = turn?.payload == null ? "" : String(turn.payload);
+    const bytes = utf8ByteLength(payload);
+    if (bytes <= maxPayloadBytes || isLocalOnlyPayloadPlaceholder(parsePayload(payload))) return turn;
+    return {
+      ...turn,
+      payload: JSON.stringify({
+        pockly_payload_ref: "local_only",
+        reason: "payload_too_large",
+        bytes,
+        sha256: await sha256Base64URL(payload),
+        preview: payloadPreview(payload),
+        text: localOnlyPayloadText(bytes, payload),
+      }),
+    };
+  }));
+}
+
+function hotTurnsPerSession(env = {}) {
+  const profile = edgeRetentionProfile(env);
+  return boundedPositiveInteger(env.POCKLY_HOT_TURNS_PER_SESSION, profile.hotTurnsPerSession);
+}
+
+function hotTurnsPerUser(env = {}) {
+  const profile = edgeRetentionProfile(env);
+  return boundedPositiveInteger(env.POCKLY_HOT_TURNS_PER_USER, profile.hotTurnsPerUser);
+}
+
+function hotTurnMaxPayloadBytes(env = {}) {
+  return boundedPositiveInteger(env.POCKLY_HOT_TURN_MAX_PAYLOAD_BYTES, defaultHotTurnMaxPayloadBytes);
+}
+
+function hotTurnInactiveBefore(env = {}) {
+  const profile = edgeRetentionProfile(env);
+  const days = boundedPositiveInteger(env.POCKLY_HOT_TURN_TTL_DAYS, profile.hotTurnTTLDays);
+  if (days <= 0) return "";
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function globalHotTurnPruneIntervalMs(env = {}) {
+  const parsed = Number(env.POCKLY_GLOBAL_HOT_TURN_PRUNE_INTERVAL_MS ?? defaultGlobalHotTurnPruneIntervalMs);
+  if (!Number.isFinite(parsed) || parsed < 0) return defaultGlobalHotTurnPruneIntervalMs;
+  return Math.floor(parsed);
+}
+
+function edgeRetentionProfile(env = {}) {
+  const profile = String(env.POCKLY_EDGE_RETENTION_PROFILE || defaultEdgeRetentionProfile).trim().toLowerCase();
+  return edgeRetentionProfiles[profile] || edgeRetentionProfiles[defaultEdgeRetentionProfile];
+}
+
+function boundedPositiveInteger(value, fallback) {
+  const parsed = Number(value ?? fallback);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.max(1, Math.floor(parsed));
+}
+
+function isLocalOnlyPayloadPlaceholder(value) {
+  return Boolean(value && typeof value === "object" && value.pockly_payload_ref === "local_only");
+}
+
+function payloadPreview(payload) {
+  const parsed = parsePayload(payload);
+  const text = typeof parsed?.text === "string" ? parsed.text : payload;
+  const normalized = String(text).replace(/\s+/g, " ").trim();
+  return normalized.length > 240 ? `${normalized.slice(0, 240)}...` : normalized;
+}
+
+function localOnlyPayloadText(bytes, payload) {
+  const preview = payloadPreview(payload);
+  const size = bytes >= 1024 * 1024 ? `${Math.round(bytes / 1024 / 1024)} MB` : `${Math.round(bytes / 1024)} KB`;
+  return [
+    `[Large message omitted from the remote hot window: ${size}.]`,
+    "Open the local daemon and load this history window again to fetch the full content from your computer.",
+    preview ? `Preview: ${preview}` : "",
+  ].filter(Boolean).join("\n\n");
+}
+
 function turnPayloadBatchRawBytes(env = {}) {
   const value = Number(env.POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES ?? defaultTurnPayloadBatchRawBytes);
   if (!Number.isFinite(value) || value <= 0) return defaultTurnPayloadBatchRawBytes;
@@ -3686,8 +4900,8 @@ async function deleteHistoryBlobsBestEffort(providers = {}, keys = []) {
       await blobStore.delete(key);
     } catch {
       // History blob GC is best-effort: stale objects are cheaper than making a
-      // successful session deletion or reconcile fail because R2 is transiently
-      // unavailable.
+      // successful session deletion or reconcile fail because object storage is
+      // transiently unavailable.
     }
   }));
 }

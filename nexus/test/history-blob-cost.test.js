@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 
 describe("history blob cost estimator", () => {
-  it("shows batch objects reducing R2 Class A operations for large histories", async () => {
+  it("shows batch objects reducing object-storage write operations for large histories", async () => {
     const dir = await mkdtemp(join(tmpdir(), "pockly-history-cost-"));
     const file = join(dir, "rollout-test.jsonl");
     const largeLine = JSON.stringify({ type: "turn", text: "large payload ".repeat(128) });
