@@ -1096,13 +1096,26 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   timings.mark("touch_device");
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
   const turns = Array.isArray(body.turns) ? body.turns : [];
-  let existingSessions = null;
-  const getExistingSessions = async () => {
-    existingSessions ??= await listDeviceSessionSyncSnapshots(store, user.user_id, device.device_id);
-    return existingSessions;
+  const sessionIDs = sessions.map((session) => String(session?.session_id || "").trim()).filter(Boolean);
+  let existingSessionsForBody = null;
+  let existingSessionsForDevice = null;
+  const getExistingSessionsForDevice = async () => {
+    existingSessionsForDevice ??= await listDeviceSessionSyncSnapshots(store, user.user_id, device.device_id);
+    return existingSessionsForDevice;
+  };
+  const getExistingSessionsForBody = async () => {
+    if (existingSessionsForBody) return existingSessionsForBody;
+    if (body.full_reconcile) {
+      existingSessionsForBody = await getExistingSessionsForDevice();
+    } else if (typeof store.listDeviceSessionSyncSnapshotsByIDs === "function") {
+      existingSessionsForBody = await store.listDeviceSessionSyncSnapshotsByIDs(user.user_id, device.device_id, sessionIDs);
+    } else {
+      existingSessionsForBody = await listDeviceSessionSyncSnapshots(store, user.user_id, device.device_id);
+    }
+    return existingSessionsForBody;
   };
   const existingBySessionID = sessions.length > 0
-    ? new Map((await getExistingSessions()).map((session) => [String(session.session_id), session]))
+    ? new Map((await getExistingSessionsForBody()).map((session) => [String(session.session_id), session]))
     : new Map();
   const openedBackfillSessionIDs = await openedBackfillSessionIDsForDaemonSync(
     store,
@@ -1133,7 +1146,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   let deletedSessions = [];
   if (body.full_reconcile) {
     const keepSessionIDs = sessions.map((session) => String(session.session_id));
-    const currentExistingSessions = await getExistingSessions();
+    const currentExistingSessions = await getExistingSessionsForDevice();
     const deletedHistoryBlobKeys = await collectMissingSessionHistoryBlobKeys(
       store,
       providers,
@@ -1318,12 +1331,22 @@ function filterKnownWindowSessions(sessions = [], requestedSessionIDs) {
 
 async function loadKnownWindowSessions(store, userID, deviceID, requestedSessionIDs) {
   if (!Array.isArray(requestedSessionIDs) || requestedSessionIDs.length === 0) return [];
-  const out = [];
   const seen = new Set();
+  const ids = [];
   for (const rawID of requestedSessionIDs) {
     const sessionID = String(rawID || "").trim();
     if (!sessionID || seen.has(sessionID)) continue;
     seen.add(sessionID);
+    ids.push(sessionID);
+  }
+  if (!ids.length) return [];
+  if (typeof store.listDeviceSessionSyncSnapshotsByIDs === "function") {
+    const rows = await store.listDeviceSessionSyncSnapshotsByIDs(userID, deviceID, ids);
+    const byID = new Map(rows.map((session) => [String(session.session_id), session]));
+    return ids.map((sessionID) => byID.get(sessionID)).filter(Boolean);
+  }
+  const out = [];
+  for (const sessionID of ids) {
     const session = await store.getSession(userID, deviceID, sessionID);
     if (session) out.push(session);
   }
@@ -2034,26 +2057,35 @@ async function listTransientSessionEventsBestEffort(control, userID, deviceID, s
 
 function mergeTransientSessionEvents(persistedEvents, transientEvents) {
   if (!Array.isArray(transientEvents) || transientEvents.length === 0) return persistedEvents;
-  const eventPayloads = transientEvents.filter((event) => !isTransientSingleTurnEvent(event));
+  const eventPayloads = transientEvents;
   const byRequestID = new Map();
   for (const event of eventPayloads) {
-    const requestID = String(event.request_id || event.payload?.request_id || "");
-    if (requestID) byRequestID.set(requestID, event);
+    const key = sessionEventMergeKey(event);
+    if (key) byRequestID.set(key, event);
   }
   if (!byRequestID.size) return persistedEvents;
   const merged = persistedEvents.map((event) => {
-    const transient = byRequestID.get(String(event.request_id || ""));
+    const key = sessionEventMergeKey(event);
+    const transient = byRequestID.get(key);
     if (!transient) return event;
-    byRequestID.delete(String(event.request_id || ""));
+    byRequestID.delete(key);
     return {
       ...event,
       payload: transient.payload,
     };
   });
   for (const transient of byRequestID.values()) {
+    if (isTransientSingleTurnEvent(transient)) continue;
     merged.push(publicTransientSessionEvent(transient));
   }
   return merged;
+}
+
+function sessionEventMergeKey(event) {
+  const requestID = String(event?.request_id || event?.payload?.request_id || "");
+  if (!requestID) return "";
+  const type = String(event?.type || event?.payload?.type || event?.payload?.stage || event?.payload?.status || "");
+  return `${requestID}\x00${type}`;
 }
 
 function publicTransientSessionEvent(event) {
@@ -2619,13 +2651,15 @@ export function createSessionEventSink(store, options = {}) {
   const persistTerminalEvents = options.persistTerminalEvents !== false;
   const env = options.env || {};
   const providers = options.providers || {};
+  const persistActiveFinalTurns = activeFinalTurnPersistenceEnabled(env);
   return {
     async onControlEvent(payload, meta = {}) {
       // Active stream deltas stay in the control hub's short-lived cache. Only
-      // stable final turns are written into session_turns so active polling can
-      // stay live without turning every token/chunk into a durable write.
+      // stable final turns are written into session_turns in runtimes where
+      // immediate durability is cheap. Managed runtimes let the daemon's
+      // bounded hot-window sync batch those writes instead.
       const turnRow = sessionTurnRecord(payload, meta);
-      if (turnRow) {
+      if (turnRow && persistActiveFinalTurns) {
         try {
           await upsertChangedTurns(store, [turnRow], env, providers);
         } catch {
@@ -2633,7 +2667,7 @@ export function createSessionEventSink(store, options = {}) {
           // jsonl, so a failed live write only delays content, never loses it.
         }
       }
-      const event = sessionEventRecord(payload, meta, { turnPersisted: Boolean(turnRow) });
+      const event = sessionEventRecord(payload, meta, { turnPersisted: Boolean(turnRow && persistActiveFinalTurns) });
       if (!event) return;
       try {
         await store.appendSessionEvent(event);
@@ -2656,6 +2690,14 @@ export function createSessionEventSink(store, options = {}) {
       }
     },
   };
+}
+
+function activeFinalTurnPersistenceEnabled(env = {}) {
+  const configured = env.POCKLY_PERSIST_ACTIVE_FINAL_TURNS ?? env.PERSIST_ACTIVE_FINAL_TURNS;
+  if (configured !== undefined && configured !== null && String(configured) !== "") {
+    return enabledFlag(configured);
+  }
+  return !managedRuntime(env);
 }
 
 // sessionTurnRecord maps a stable final turn onto a session_turns row (the
@@ -2713,12 +2755,12 @@ function sessionEventRecord(payload, meta = {}, options = {}) {
     session_id: sessionID,
     request_id: requestID,
     event_type: String(payload.type || payload.stage || meta.kind || "control_event"),
-    payload: JSON.stringify(sessionEventPayloadForStorage(payload)),
+    payload: JSON.stringify(sessionEventPayloadForStorage(payload, options)),
     created_at: String(payload.timestamp || turn?.timestamp || now),
   };
 }
 
-function sessionEventPayloadForStorage(payload) {
+function sessionEventPayloadForStorage(payload, options = {}) {
   if (!payload || typeof payload !== "object") return payload;
   if (Array.isArray(payload.turns)) {
     // SYNC_SESSION_EVENT turns are transient older-history windows. They are
@@ -2730,6 +2772,13 @@ function sessionEventPayloadForStorage(payload) {
       ...rest,
       turns_omitted: true,
       turns_omitted_count: turns.length,
+    };
+  }
+  if (options.turnPersisted === false && payload.turn && typeof payload.turn === "object") {
+    const { turn, ...rest } = payload;
+    return {
+      ...rest,
+      turn_omitted: true,
     };
   }
   return payload;
@@ -4550,6 +4599,23 @@ function compareTurnRecordsNewestFirst(left, right) {
 }
 
 async function filterChangedTurnRecords(store, turns) {
+  if (typeof store.listExistingTurnKeys === "function") {
+    const existingKeys = await store.listExistingTurnKeys(turns);
+    if (!existingKeys?.size) return turns;
+    const newTurns = [];
+    const existingTurns = [];
+    for (const turn of turns) {
+      if (existingKeys.has(turnRecordKey(turn))) existingTurns.push(turn);
+      else newTurns.push(turn);
+    }
+    if (!existingTurns.length || typeof store.listExistingTurnPayloads !== "function") return newTurns;
+    const changedExisting = await filterChangedExistingTurnRecords(store, existingTurns);
+    return [...newTurns, ...changedExisting];
+  }
+  return await filterChangedExistingTurnRecords(store, turns);
+}
+
+async function filterChangedExistingTurnRecords(store, turns) {
   if (typeof store.listExistingTurnPayloads !== "function") return turns;
   const existingPayloads = await store.listExistingTurnPayloads(turns);
   if (!existingPayloads?.size) return turns;

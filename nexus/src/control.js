@@ -1143,9 +1143,8 @@ function isTransientTurnEvent(payload) {
   if (!payload || typeof payload !== "object" || !payload.turn || typeof payload.turn !== "object") return false;
   const type = String(payload.type || payload.stage || "");
   const status = String(payload.status || "");
-  if (type === "inject_completed" || type === "completed" || type === "turn_completed") return false;
   if (type === "inject_failed" || type === "inject_cancelled" || type === "failed") return false;
-  if (status === "completed" || status === "failed" || status === "cancelled") return false;
+  if (status === "failed" || status === "cancelled") return false;
   return true;
 }
 

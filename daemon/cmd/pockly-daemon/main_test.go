@@ -545,8 +545,14 @@ func TestTrimKnownUploadedTurnsKeepsOnlyNewTail(t *testing.T) {
 	if trimmed.Turns[0].Seq != 98 || trimmed.Turns[2].Seq != 100 {
 		t.Fatalf("trimmed seq range = %d..%d, want 98..100", trimmed.Turns[0].Seq, trimmed.Turns[2].Seq)
 	}
-	if len(trimmed.Sessions) != 1 || trimmed.Sessions[0].MinSeq != 81 || trimmed.Sessions[0].MaxSeq != 100 {
-		t.Fatalf("session metadata was changed: %+v", trimmed.Sessions)
+	if len(trimmed.Sessions) != 1 || trimmed.Sessions[0].MinSeq != 98 || trimmed.Sessions[0].MaxSeq != 100 {
+		t.Fatalf("trimmed session range = %+v, want 98..100", trimmed.Sessions)
+	}
+	if trimmed.Sessions[0].WindowHash == "" || trimmed.Sessions[0].WindowHash == "sha256:local" {
+		t.Fatalf("trimmed session window hash = %q, want recomputed hash", trimmed.Sessions[0].WindowHash)
+	}
+	if !trimmed.Sessions[0].HasOlder {
+		t.Fatalf("trimmed incremental tail must keep has_older=true")
 	}
 }
 

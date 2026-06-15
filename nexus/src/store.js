@@ -376,6 +376,14 @@ export class InMemoryNexusStore {
       .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   }
 
+  async listDeviceSessionSyncSnapshotsByIDs(userID, deviceID, sessionIDs = []) {
+    const ids = new Set(sessionIDs.map((id) => String(id || "").trim()).filter(Boolean));
+    if (!ids.size) return [];
+    return [...this.sessions.values()]
+      .filter((session) => session.user_id === userID && session.device_id === deviceID && ids.has(String(session.session_id)))
+      .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
+  }
+
   async listDeviceSessionHintSnapshots(userID, deviceID) {
     return await this.listDeviceSessionSyncSnapshots(userID, deviceID);
   }
@@ -537,6 +545,15 @@ export class InMemoryNexusStore {
       const key = turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq);
       const existing = this.turns.get(key);
       if (existing?.payload !== undefined) out.set(key, existing.payload);
+    }
+    return out;
+  }
+
+  async listExistingTurnKeys(turns = []) {
+    const out = new Set();
+    for (const turn of turns) {
+      const key = turnKey(turn.user_id, turn.device_id, turn.session_id, turn.seq);
+      if (this.turns.has(key)) out.add(key);
     }
     return out;
   }
@@ -1485,6 +1502,29 @@ export class SQLNexusStore {
     return (result.results ?? []).map(normalizeSessionRow);
   }
 
+  async listDeviceSessionSyncSnapshotsByIDs(userID, deviceID, sessionIDs = []) {
+    const ids = [...new Set(sessionIDs.map((id) => String(id || "").trim()).filter(Boolean))];
+    if (!ids.length) return [];
+    const out = [];
+    const CHUNK = 50;
+    for (let i = 0; i < ids.length; i += CHUNK) {
+      const chunk = ids.slice(i, i + CHUNK);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = await this.db.prepare(`
+        SELECT
+          user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
+          snippet, first_message, title, last_seq, last_timestamp,
+          channel_last_seen_at, sync_state, turn_count, last_sync_error,
+          synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+          updated_at
+        FROM sessions
+        WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
+      `).bind(userID, deviceID, ...chunk).all();
+      out.push(...((result.results ?? []).map(normalizeSessionRow)));
+    }
+    return out;
+  }
+
   async listDeviceSessionHintSnapshots(userID, deviceID) {
     const result = await this.db.prepare(`
       SELECT
@@ -1849,6 +1889,41 @@ export class SQLNexusStore {
         `).bind(entry.user_id, entry.device_id, entry.session_id, ...chunk).all();
         for (const row of result.results ?? []) {
           out.set(turnKey(row.user_id, row.device_id, row.session_id, row.seq), row.payload);
+        }
+      }
+    }
+    return out;
+  }
+
+  async listExistingTurnKeys(turns = []) {
+    const deduped = dedupeTurnRows(turns);
+    if (!deduped.length) return new Set();
+    const bySession = new Map();
+    for (const turn of deduped) {
+      const key = sessionKey(turn.user_id, turn.device_id, turn.session_id);
+      const entry = bySession.get(key) || {
+        user_id: turn.user_id,
+        device_id: turn.device_id,
+        session_id: turn.session_id,
+        seqs: [],
+      };
+      entry.seqs.push(Number(turn.seq) || 0);
+      bySession.set(key, entry);
+    }
+    const out = new Set();
+    for (const entry of bySession.values()) {
+      const seqs = [...new Set(entry.seqs.filter((seq) => seq > 0))];
+      for (let i = 0; i < seqs.length; i += this.turnUpsertBatchSize) {
+        const chunk = seqs.slice(i, i + this.turnUpsertBatchSize);
+        if (!chunk.length) continue;
+        const placeholders = chunk.map(() => "?").join(", ");
+        const result = await this.db.prepare(`
+          SELECT user_id, device_id, session_id, seq
+          FROM session_turns
+          WHERE user_id = ? AND device_id = ? AND session_id = ? AND seq IN (${placeholders})
+        `).bind(entry.user_id, entry.device_id, entry.session_id, ...chunk).all();
+        for (const row of result.results ?? []) {
+          out.add(turnKey(row.user_id, row.device_id, row.session_id, row.seq));
         }
       }
     }

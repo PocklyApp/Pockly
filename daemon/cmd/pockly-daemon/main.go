@@ -12,6 +12,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -2875,7 +2877,7 @@ func trimKnownUploadedTurns(req pair.SyncRequest, known syncHint) pair.SyncReque
 	// Only trim when the server-known durable tail overlaps this local hot
 	// window. If the server range is disjoint or older backfill is in progress,
 	// keep the request intact so Nexus can repair or extend the window.
-	if session.MinSeq <= 0 || session.MaxSeq <= 0 || known.SyncedMaxSeq < session.MinSeq || known.SyncedMaxSeq >= session.MaxSeq {
+	if session.MinSeq <= 0 || session.MaxSeq <= 0 || known.SyncedMaxSeq < session.MinSeq {
 		return req
 	}
 	trimmedTurns := make([]pair.SyncTurn, 0, len(req.Turns))
@@ -2884,11 +2886,34 @@ func trimKnownUploadedTurns(req pair.SyncRequest, known syncHint) pair.SyncReque
 			trimmedTurns = append(trimmedTurns, turn)
 		}
 	}
-	if len(trimmedTurns) == len(req.Turns) {
+	if len(trimmedTurns) == len(req.Turns) || len(trimmedTurns) == 0 {
 		return req
 	}
 	req.Turns = trimmedTurns
+	req.Sessions[0].MinSeq = trimmedTurns[0].Seq
+	req.Sessions[0].MaxSeq = trimmedTurns[len(trimmedTurns)-1].Seq
+	req.Sessions[0].HasOlder = true
+	req.Sessions[0].WindowHash = windowHashForTurns(trimmedTurns)
 	return req
+}
+
+func windowHashForTurns(turns []pair.SyncTurn) string {
+	hasher := sha256.New()
+	for _, turn := range turns {
+		writeSyncTurnHashPart(hasher, turn.SessionID)
+		writeSyncTurnHashPart(hasher, turn.Agent)
+		writeSyncTurnHashPart(hasher, strconv.Itoa(turn.Seq))
+		writeSyncTurnHashPart(hasher, turn.Kind)
+		writeSyncTurnHashPart(hasher, turn.Timestamp)
+		payloadHash := sha256.Sum256([]byte(turn.Payload))
+		writeSyncTurnHashPart(hasher, base64.RawURLEncoding.EncodeToString(payloadHash[:]))
+	}
+	return "sha256:" + base64.RawURLEncoding.EncodeToString(hasher.Sum(nil))
+}
+
+func writeSyncTurnHashPart(w interface{ Write([]byte) (int, error) }, value string) {
+	_, _ = w.Write([]byte(value))
+	_, _ = w.Write([]byte{0})
 }
 
 func hintMatchesWindowHash(hint syncHint, req pair.SyncRequest) bool {

@@ -597,6 +597,8 @@ describe("Nexus api", () => {
     const syncBody = await sync.json();
     assert.equal(syncBody.session_count, sessionCount);
     assert.equal(syncBody.turn_count, turnCount);
+    assert.equal(store.counts.listExistingTurnKeys, 1);
+    assert.equal(store.counts.listExistingTurnPayloads, 0);
     assert.equal(store.counts.upsertTurnRows, 100);
     assert.equal(store.counts.upsertSessionRows, sessionCount);
     assert.equal(store.pruneHotTurnCacheOptions.at(-1).sessionKeys.length, 1);
@@ -630,6 +632,8 @@ describe("Nexus api", () => {
       turns,
     }, daemonAuth);
     assert.equal(retry.status, 200);
+    assert.equal(store.counts.listExistingTurnKeys, 1);
+    assert.equal(store.counts.listExistingTurnPayloads, 1);
     assert.equal(store.counts.upsertTurns, 0);
     assert.equal(store.counts.upsertTurnRows, 0);
     assert.equal(store.counts.upsertSessions, 0);
@@ -1576,7 +1580,8 @@ describe("Nexus api", () => {
       synced_max_seq: 3,
       synced_turn_count: 3,
     }]);
-    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.getSession, 0);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshotsByIDs, 1);
     assert.equal(store.counts.listTurnPayloadPointers, 1);
     assert.equal(store.counts.listTurns, 0);
     assert.equal(store.counts.upsertSessions, 0);
@@ -1640,7 +1645,8 @@ describe("Nexus api", () => {
       synced_max_seq: 45628,
       synced_turn_count: 20,
     }]);
-    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.getSession, 0);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshotsByIDs, 1);
     assert.equal(store.counts.listTurnPayloadPointers, 1);
     assert.equal(store.counts.listTurns, 0);
     assert.equal(store.counts.upsertSessions, 0);
@@ -1828,7 +1834,8 @@ describe("Nexus api", () => {
   });
 
   it("does not inflate synced turn count when the daemon retries the same window", async () => {
-    const env = testEnv();
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
     const cookie = await loginCookie(env);
     const browserKeys = await generateSigningKeyPair();
     const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
@@ -1865,7 +1872,11 @@ describe("Nexus api", () => {
     };
 
     assert.equal((await call(env, "POST", "/api/daemon/sync", syncPayload, daemonAuth)).status, 200);
+    store.resetCounts();
     assert.equal((await call(env, "POST", "/api/daemon/sync", syncPayload, daemonAuth)).status, 200);
+    assert.equal(store.counts.listExistingTurnKeys, 1);
+    assert.equal(store.counts.listExistingTurnPayloads, 1);
+    assert.equal(store.counts.upsertTurnRows, 0);
 
     const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
     const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_retry_window");
@@ -2420,6 +2431,7 @@ describe("Nexus api", () => {
     const reconcileBody = await reconcile.json();
     assert.equal(reconcileBody.session_delete_count, 1);
     assert.equal(store.counts.listDeviceSessionSyncSnapshots, 1);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshotsByIDs, 0);
     assert.equal(store.counts.listDeviceSessions, 0);
     assert.equal(store.counts.deleteMissingDeviceSessionsFromExisting, 1);
     assert.equal(store.counts.deleteMissingDeviceSessions, 0);
@@ -2464,12 +2476,30 @@ describe("Nexus api", () => {
       "total",
     ]);
     assert.equal(store.counts.listDeviceSessionSyncSnapshots, 1);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshotsByIDs, 0);
     assert.equal(store.counts.listDeviceSessions, 0);
     assert.equal(store.counts.upsertSessions, 0);
     assert.equal(store.counts.upsertSessionRows, 0);
     assert.equal(store.counts.getSessionTurnStats, 0);
     const preserved = await store.getSession("usr_test", daemon.daemon_device_id, "sess_reconcile_001");
     assert.equal(preserved.first_message, "existing long first message should survive catalog-only sync");
+
+    store.resetCounts();
+    const metadataOnly = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: sessions.slice(1),
+      turns: [],
+    }, daemonAuth);
+    assert.equal(metadataOnly.status, 200);
+    const metadataOnlyBody = await metadataOnly.json();
+    assert.equal(metadataOnlyBody.session_count, 335);
+    assert.equal(metadataOnlyBody.session_upsert_count, 0);
+    assert.equal(metadataOnlyBody.session_delete_count, 0);
+    assert.equal(metadataOnlyBody.session_fast_path_count, 335);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshots, 0);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshotsByIDs, 1);
+    assert.equal(store.counts.deleteMissingDeviceSessionsFromExisting, 0);
+    assert.equal(store.counts.upsertSessions, 0);
   });
 
   it("uses batch control presence for host lists", async () => {
@@ -3350,13 +3380,21 @@ describe("Nexus api", () => {
     assert.equal(drainedBody.events.length, 0);
     assert.deepEqual(drainedBody.turns, []);
     assert.equal(drainedBody.next_seq, 3);
-    // Only the final completed turn is durable without a later daemon window
-    // sync. Stream deltas remain transient active-turn content.
+    // Managed runtime keeps all active-turn content transient for the current
+    // reader. The daemon hot-window sync batches durable session_turns later.
     const turnsAfterInject = await call(env, "GET", `/api/sessions/sess_low/turns?device_id=${daemon.daemon_device_id}`, null, {
       authorization: `Bearer ${browser.device_access_token}`,
     });
     const turnsAfterInjectBody = await turnsAfterInject.json();
-    assert.deepEqual(turnsAfterInjectBody.turns.map((turn) => turn.seq).filter((seq) => seq >= 2), [3]);
+    assert.deepEqual(turnsAfterInjectBody.turns.map((turn) => turn.seq).filter((seq) => seq >= 2), []);
+    const persistedInjectEvents = await env.POCKLY_NEXUS_STORE.listSessionEvents("usr_test", daemon.daemon_device_id, "sess_low", {
+      request_id: injectBody.request_id,
+    });
+    assert.equal(persistedInjectEvents.length, 1);
+    const persistedInjectPayload = JSON.parse(persistedInjectEvents[0].payload);
+    assert.equal(persistedInjectPayload.turn, undefined);
+    assert.equal(persistedInjectPayload.turn_omitted, true);
+    assert.equal(JSON.stringify(persistedInjectPayload).includes("polling fallback done"), false);
 
     const sync = await call(env, "POST", `/api/sessions/sess_low/sync?device_id=${daemon.daemon_device_id}`, {
       limit: 20,
@@ -3540,8 +3578,8 @@ describe("Nexus api", () => {
     assert.equal(events.next_seq, 102);
     assert.equal(store.counts.appendSessionEvents, 1);
     assert.equal(store.counts.appendSessionEventRows, 1);
-    assert.equal(store.counts.upsertTurnRows, 1);
-    assert.equal(store.counts.pruneHotTurnCache, 1);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.pruneHotTurnCache, 0);
     assert.equal(store.pruneHotTurnCacheOptions.every((options) => Number(options.perSession) > 0), true);
     assert.equal(store.pruneHotTurnCacheOptions.every((options) => options.sessionKeys.length === 1), true);
     assert.equal(store.pruneHotTurnCacheOptions.filter((options) => Number(options.perUser) > 0).length <= 1, true);
@@ -3552,8 +3590,66 @@ describe("Nexus api", () => {
     });
     assert.equal(storedTurns.status, 200);
     const storedTurnsBody = await storedTurns.json();
-    assert.equal(storedTurnsBody.turns.length, 1);
-    assert.deepEqual(storedTurnsBody.turns.at(-1).payload, { text: "done" });
+    assert.equal(storedTurnsBody.turns.length, 0);
+  });
+
+  it("keeps self-hosted completed inject turns durable for polling readers", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    env.CONTROL_STREAMING_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [
+        { session_id: "sess_selfhost_final", agent: "claude-code", cwd: "/work/app", last_seq: 1, last_timestamp: "2026-06-06T01:00:01Z", turn_count: 1 },
+      ],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+
+    store.resetCounts();
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async (envelope, reply) => {
+      if (envelope.type !== "INJECT_REQUEST") return;
+      reply({
+        type: "INJECT_EVENT",
+        event: {
+          request_id: envelope.request.request_id,
+          type: "inject_completed",
+          session_id: envelope.request.session_id,
+          turn: {
+            device_id: daemon.daemon_device_id,
+            session_id: envelope.request.session_id,
+            seq: 2,
+            agent: "claude-code",
+            kind: "assistant_text",
+            timestamp: "2026-06-06T01:00:02Z",
+            payload: { text: "self-host durable final" },
+          },
+        },
+      });
+    });
+
+    const inject = await call(env, "POST", `/api/sessions/sess_selfhost_final/inject?device_id=${daemon.daemon_device_id}`, {
+      text: "self-host",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(inject.status, 200);
+    const injectBody = await inject.json();
+    const events = await readEventsEventually(env, `/api/sessions/sess_selfhost_final/events?device_id=${daemon.daemon_device_id}&request_id=${injectBody.request_id}&after_seq=1`, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    }, 1);
+    assert.deepEqual(events.turns.map((turn) => [turn.seq, turn.payload.text]), [
+      [2, "self-host durable final"],
+    ]);
+    const storedTurns = await call(env, "GET", `/api/sessions/sess_selfhost_final/turns?device_id=${daemon.daemon_device_id}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const storedTurnsBody = await storedTurns.json();
+    assert.deepEqual(storedTurnsBody.turns.map((turn) => [turn.seq, turn.payload.text]), [
+      [2, "self-host durable final"],
+    ]);
+    assert.equal(store.counts.upsertTurnRows, 1);
+    assert.equal(store.counts.pruneHotTurnCache, 1);
   });
 
   it("keeps daemon stream_event turns live when inject_completed is only an ack", async () => {
@@ -4932,12 +5028,15 @@ class CountingNexusStore extends InMemoryNexusStore {
     this.counts = {
       listDeviceSessions: 0,
       listDeviceSessionSyncSnapshots: 0,
+      listDeviceSessionSyncSnapshotsByIDs: 0,
       listDeviceSessionHintSnapshots: 0,
       deleteMissingDeviceSessions: 0,
       deleteMissingDeviceSessionsFromExisting: 0,
       getSession: 0,
       getSessionTurnStats: 0,
       listTurns: 0,
+      listExistingTurnKeys: 0,
+      listExistingTurnPayloads: 0,
       listTurnPayloadPointers: 0,
       upsertTurns: 0,
       upsertTurnRows: 0,
@@ -5006,6 +5105,11 @@ class CountingNexusStore extends InMemoryNexusStore {
     return await super.listDeviceSessionSyncSnapshots(...args);
   }
 
+  async listDeviceSessionSyncSnapshotsByIDs(...args) {
+    this.counts.listDeviceSessionSyncSnapshotsByIDs += 1;
+    return await super.listDeviceSessionSyncSnapshotsByIDs(...args);
+  }
+
   async listDeviceSessionHintSnapshots(...args) {
     this.counts.listDeviceSessionHintSnapshots += 1;
     return await super.listDeviceSessionHintSnapshots(...args);
@@ -5034,6 +5138,16 @@ class CountingNexusStore extends InMemoryNexusStore {
   async listTurns(...args) {
     this.counts.listTurns += 1;
     return await super.listTurns(...args);
+  }
+
+  async listExistingTurnKeys(...args) {
+    this.counts.listExistingTurnKeys += 1;
+    return await super.listExistingTurnKeys(...args);
+  }
+
+  async listExistingTurnPayloads(...args) {
+    this.counts.listExistingTurnPayloads += 1;
+    return await super.listExistingTurnPayloads(...args);
   }
 
   async listTurnPayloadPointers(...args) {
