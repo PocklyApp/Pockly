@@ -1753,7 +1753,7 @@ describe("Nexus api", () => {
     assert.equal(store.counts.listTurns, 0);
   });
 
-  it("merges lazy backfill windows instead of replacing the latest synced range", async () => {
+  it("keeps lazy backfill windows out of the durable hot cache", async () => {
     const env = testEnv();
     const cookie = await loginCookie(env);
     const browserKeys = await generateSigningKeyPair();
@@ -1799,10 +1799,10 @@ describe("Nexus api", () => {
       authorization: `Bearer ${browser.device_access_token}`,
     });
     const middleBody = await middle.json();
-    assert.equal(middleBody.turns.length, 40);
-    assert.equal(middleBody.oldest_seq, 21);
+    assert.equal(middleBody.turns.length, 20);
+    assert.equal(middleBody.oldest_seq, 41);
     assert.equal(middleBody.latest_seq, 60);
-    assert.equal(middleBody.synced_turn_count, 40);
+    assert.equal(middleBody.synced_turn_count, 20);
     assert.equal(middleBody.has_older_turns, true);
 
     await syncWindow(1, 20, false);
@@ -1811,20 +1811,20 @@ describe("Nexus api", () => {
       authorization: `Bearer ${browser.device_access_token}`,
     });
     const completeBody = await complete.json();
-    assert.equal(completeBody.turns.length, 60);
-    assert.equal(completeBody.oldest_seq, 1);
+    assert.equal(completeBody.turns.length, 20);
+    assert.equal(completeBody.oldest_seq, 41);
     assert.equal(completeBody.latest_seq, 60);
-    assert.equal(completeBody.synced_turn_count, 60);
-    assert.equal(completeBody.has_older_turns, false);
+    assert.equal(completeBody.synced_turn_count, 20);
+    assert.equal(completeBody.has_older_turns, true);
 
     const listed = await call(env, "GET", "/api/sessions", null, {
       authorization: `Bearer ${browser.device_access_token}`,
     });
     const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_merge");
-    assert.equal(session.sync_state, "fully_synced");
-    assert.equal(session.synced_min_seq, 1);
+    assert.equal(session.sync_state, "partial");
+    assert.equal(session.synced_min_seq, 41);
     assert.equal(session.synced_max_seq, 60);
-    assert.equal(session.has_older_turns, false);
+    assert.equal(session.has_older_turns, true);
   });
 
   it("does not inflate synced turn count when the daemon retries the same window", async () => {
@@ -4417,6 +4417,99 @@ describe("Nexus api", () => {
     const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_noncontiguous");
     assert.equal(session.has_older_turns, true);
     assert.equal(session.sync_state, "partial");
+  });
+
+  it("does not persist older backfill windows into the durable hot-turn cache", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const latestTurns = [];
+    for (let seq = 141; seq <= 240; seq += 1) {
+      latestTurns.push({
+        session_id: "sess_no_write_old_window",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T09:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+        payload: { text: `tail ${seq}` },
+      });
+    }
+    const latest = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_no_write_old_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "tail",
+        last_seq: 240,
+        last_timestamp: "2026-06-06T09:59:00.000Z",
+        sync_state: "partial",
+        turn_count: 240,
+        min_seq: 141,
+        max_seq: 240,
+        has_older: true,
+      }],
+      turns: latestTurns,
+    }, daemonAuth);
+    assert.equal(latest.status, 200);
+    assert.equal((await latest.json()).turn_count, 100);
+
+    store.resetCounts();
+    const oldTurns = [];
+    for (let seq = 41; seq <= 140; seq += 1) {
+      oldTurns.push({
+        session_id: "sess_no_write_old_window",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T08:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+        payload: { text: `old ${seq}` },
+      });
+    }
+    const old = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_no_write_old_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "old window",
+        last_seq: 240,
+        last_timestamp: "2026-06-06T08:59:00.000Z",
+        sync_state: "partial",
+        turn_count: 240,
+        min_seq: 41,
+        max_seq: 140,
+        has_older: true,
+      }],
+      turns: oldTurns,
+    }, daemonAuth);
+    assert.equal(old.status, 200);
+    const oldBody = await old.json();
+    assert.equal(oldBody.turn_count, 100);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.pruneHotTurnCache, 0);
+    assert.equal(store.counts.appendSessionCatalogChangeRows, 0);
+
+    const turns = await call(env, "GET", `/api/sessions/sess_no_write_old_window/turns?device_id=${daemon.daemon_device_id}&full=1&limit=0`, null, auth);
+    const turnsBody = await turns.json();
+    assert.equal(turnsBody.turns.length, 100);
+    assert.equal(turnsBody.oldest_seq, 141);
+    assert.equal(turnsBody.latest_seq, 240);
+    assert.equal(turnsBody.turns.some((turn) => turn.seq === 41), false);
+
+    const listed = await call(env, "GET", "/api/sessions", null, auth);
+    const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_no_write_old_window");
+    assert.equal(session.turn_count, 240);
+    assert.equal(session.synced_turn_count, 100);
+    assert.equal(session.synced_min_seq, 141);
+    assert.equal(session.synced_max_seq, 240);
+    assert.equal(session.has_older_turns, true);
   });
 
   it("computes sync hint window_hash with the daemon-compatible algorithm", async () => {

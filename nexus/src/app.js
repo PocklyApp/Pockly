@@ -1096,8 +1096,26 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   timings.mark("touch_device");
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
   const turns = Array.isArray(body.turns) ? body.turns : [];
+  let existingSessions = null;
+  const getExistingSessions = async () => {
+    existingSessions ??= await listDeviceSessionSyncSnapshots(store, user.user_id, device.device_id);
+    return existingSessions;
+  };
+  const existingBySessionID = sessions.length > 0
+    ? new Map((await getExistingSessions()).map((session) => [String(session.session_id), session]))
+    : new Map();
+  const openedBackfillSessionIDs = await openedBackfillSessionIDsForDaemonSync(
+    store,
+    user.user_id,
+    device.device_id,
+    sessions,
+    existingBySessionID,
+    turns,
+  );
+  const durableSessionIDs = durableDaemonSyncSessionIDs(sessions, existingBySessionID, openedBackfillSessionIDs);
+  const durableTurns = turns.filter((turn) => durableSessionIDs.has(String(turn?.session_id ?? "")));
   const uploadedTurnStatsBySession = new Map();
-  for (const turn of turns) {
+  for (const turn of durableTurns) {
     const sessionID = String(turn.session_id ?? "");
     const seq = Number(turn.seq ?? 0) || 0;
     const stats = uploadedTurnStatsBySession.get(sessionID) || { count: 0, min_seq: 0, max_seq: 0 };
@@ -1108,14 +1126,9 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     }
     uploadedTurnStatsBySession.set(sessionID, stats);
   }
-  const turnRecords = turns.map((turn) => syncTurnRecord(user, device, turn, now));
+  const turnRecords = durableTurns.map((turn) => syncTurnRecord(user, device, turn, now));
   const prunedTurnSessions = await upsertChangedTurns(store, turnRecords, env, providers);
   timings.mark("upsert_turns");
-  let existingSessions = null;
-  const getExistingSessions = async () => {
-    existingSessions ??= await listDeviceSessionSyncSnapshots(store, user.user_id, device.device_id);
-    return existingSessions;
-  };
   let deletedSessionCount = 0;
   let deletedSessions = [];
   if (body.full_reconcile) {
@@ -1149,9 +1162,6 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     }
   }
   timings.mark("reconcile");
-  const existingBySessionID = sessions.length > 0
-    ? new Map((await getExistingSessions()).map((session) => [String(session.session_id), session]))
-    : new Map();
   timings.mark("load_existing_sessions");
   let sessionFastPathCount = 0;
   const changedSessionRecords = [];
@@ -1160,7 +1170,8 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     const sessionID = String(session.session_id);
     const uploadedTurnStats = uploadedTurnStatsBySession.get(sessionID);
     const existing = existingBySessionID.get(sessionID) ?? null;
-    if (unchangedCatalogSession(device, session, existing, uploadedTurnStats)) {
+    const durableSession = durableSessionIDs.has(sessionID);
+    if (unchangedCatalogSession(device, session, existing, uploadedTurnStats, durableSession)) {
       sessionFastPathCount += 1;
       if (existing) currentSessionRecords.push(existing);
       continue;
@@ -1173,6 +1184,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       now,
       uploadedTurnStats,
       existing,
+      durableSession,
     );
     currentSessionRecords.push(record);
     if (!sessionMatchesExisting(record, existing)) changedSessionRecords.push(record);
@@ -1191,6 +1203,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       at: now,
     })));
   }
+  await deleteSessionOpenHintsBestEffort(store, user.user_id, device.device_id, openedBackfillSessionIDs);
   const repairedPrunedSessions = await repairPrunedTurnSessions(
     store,
     user,
@@ -1235,6 +1248,67 @@ function missingDeviceSessions(existingSessions, keepSessionIDs) {
   return existingSessions.filter((session) => !keep.has(String(session.session_id)));
 }
 
+async function openedBackfillSessionIDsForDaemonSync(store, userID, deviceID, sessions = [], existingBySessionID = new Map(), turns = []) {
+  if (!turns.length || !sessions.length) return new Set();
+  const candidates = new Set();
+  for (const session of sessions) {
+    const sessionID = String(session?.session_id ?? "");
+    if (!sessionID) continue;
+    const existing = existingBySessionID.get(sessionID);
+    if (!existing || Number(existing.synced_turn_count ?? 0) > 0) continue;
+    const total = Number(session?.turn_count ?? session?.last_seq ?? 0) || 0;
+    const maxSeq = Number(session?.max_seq ?? 0) || 0;
+    if (total > 0 && maxSeq > 0 && maxSeq >= total) candidates.add(sessionID);
+  }
+  if (!candidates.size) return new Set();
+  const hints = await listSessionOpenHintsForDevice(store, userID, deviceID);
+  if (!hints.length) return new Set();
+  const cutoff = Date.now() - recentlyOpenedSyncHintMs;
+  const recentlyOpened = new Set();
+  for (const hint of hints) {
+    const opened = Date.parse(hint.last_opened_at || "");
+    if (Number.isFinite(opened) && opened >= cutoff) recentlyOpened.add(String(hint.session_id));
+  }
+  if (!recentlyOpened.size) return new Set();
+  const out = new Set([...candidates].filter((sessionID) => recentlyOpened.has(sessionID)));
+  return out;
+}
+
+async function deleteSessionOpenHintsBestEffort(store, userID, deviceID, sessionIDs = new Set()) {
+  if (!sessionIDs?.size || typeof store.deleteSessionOpenHint !== "function") return;
+  await Promise.all([...sessionIDs].map((sessionID) =>
+    store.deleteSessionOpenHint(userID, deviceID, sessionID).catch(() => undefined),
+  ));
+}
+
+function durableDaemonSyncSessionIDs(sessions = [], existingBySessionID = new Map(), openedBackfillSessionIDs = new Set()) {
+  const out = new Set();
+  for (const session of sessions) {
+    const sessionID = String(session?.session_id ?? "");
+    if (!sessionID) continue;
+    if (daemonSyncSessionIsDurable(session, existingBySessionID.get(sessionID) ?? null, openedBackfillSessionIDs.has(sessionID))) out.add(sessionID);
+  }
+  return out;
+}
+
+function daemonSyncSessionIsDurable(session, existing = null, openedBackfill = false) {
+  const total = Number(session?.turn_count ?? session?.last_seq ?? 0) || 0;
+  const maxSeq = Number(session?.max_seq ?? 0) || 0;
+  if (total <= 0 || maxSeq <= 0) return true;
+  // Only the latest contiguous tail belongs in the durable hot cache. Older
+  // backfill windows are delivered through request-scoped control events or
+  // future archive storage; writing them here causes D1 insert-then-prune
+  // amplification on large sessions.
+  if (maxSeq < total) return false;
+  if (!existing) return true;
+  const existingSynced = Number(existing.synced_turn_count ?? 0) || 0;
+  // Existing catalog-only sessions are historical placeholders. Opening one may
+  // ask the daemon for its latest local tail, but that backfill should not enter
+  // the durable hot cache until an active/newer sync advances the session.
+  if (openedBackfill && existingSynced <= 0) return false;
+  return true;
+}
+
 function filterKnownWindowSessions(sessions = [], requestedSessionIDs) {
   if (!Array.isArray(requestedSessionIDs)) return [];
   const wanted = new Set(requestedSessionIDs.map((id) => String(id || "").trim()).filter(Boolean));
@@ -1257,7 +1331,7 @@ async function loadKnownWindowSessions(store, userID, deviceID, requestedSession
 }
 
 async function appendSessionCatalogChanges(store, changes) {
-  const rows = changes.map((change) => ({
+  const rows = coalescedCatalogChanges(changes).map((change) => ({
     user_id: change.user_id,
     device_id: change.device_id,
     session_id: change.session_id,
@@ -1271,6 +1345,15 @@ async function appendSessionCatalogChanges(store, changes) {
   }
   if (typeof store.appendSessionCatalogChange !== "function") return;
   for (const row of rows) await store.appendSessionCatalogChange(row);
+}
+
+function coalescedCatalogChanges(changes = []) {
+  const bySession = new Map();
+  for (const change of changes) {
+    const key = `${change.user_id}\x00${change.device_id}\x00${change.session_id}`;
+    bySession.set(key, change);
+  }
+  return [...bySession.values()];
 }
 
 function publicCatalogChangeSessionRow(session) {
@@ -1341,8 +1424,9 @@ function sessionMatchesExisting(session, existing) {
   return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
 }
 
-function unchangedCatalogSession(device, session, existing, uploadedTurnStats) {
+function unchangedCatalogSession(device, session, existing, uploadedTurnStats, durableSession = true) {
   if (!existing || Number(uploadedTurnStats?.count ?? 0) > 0) return false;
+  if (!durableSession) return true;
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
   const lastTimestamp = session.last_timestamp || "";
   const expected = {
@@ -2481,15 +2565,21 @@ async function buildRealtimeSessionOpenedHintCommand(store, userID, daemon, requ
   const sessionID = requiredString(String(payload.session_id || ""), "session_id");
   const session = await sessionWithTurnStats(store, userID, daemon.device_id, sessionID);
   const openedAt = payload.opened_at ? String(payload.opened_at) : new Date().toISOString();
-  if (!isLargeSessionForAutomaticBackfill(session)) {
-    await store.upsertSessionOpenHint({
-      user_id: userID,
-      device_id: daemon.device_id,
-      session_id: sessionID,
-      last_opened_at: openedAt,
-      updated_at: new Date().toISOString(),
-    });
+  if (isLargeSessionForAutomaticBackfill(session)) {
+    return {
+      mode: "ack",
+      daemonDeviceID: daemon.device_id,
+      sessionID,
+      ack: { status: "accepted", device_id: daemon.device_id, session_id: sessionID, last_opened_at: openedAt },
+    };
   }
+  await store.upsertSessionOpenHint({
+    user_id: userID,
+    device_id: daemon.device_id,
+    session_id: sessionID,
+    last_opened_at: openedAt,
+    updated_at: new Date().toISOString(),
+  });
   const windowHash = await sessionWindowHash(store, userID, daemon.device_id, sessionID, session);
   return {
     mode: "dispatch",
@@ -3708,8 +3798,9 @@ async function assertDaemonAssignable(store, daemonDeviceID, userID, publicKey) 
   }
 }
 
-async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats, existing = null) {
+async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats, existing = null, durableSession = true) {
   const sessionID = requiredString(session.session_id, "session_id");
+  const durableTail = Boolean(durableSession);
   const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnStats);
   const persistedTurnCount = stats
     ? stats.count
@@ -3725,36 +3816,43 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
   const syncedMaxSeq = stats
     ? uploadedSyncedMaxSeq
     : Number(existing?.synced_max_seq ?? 0) || 0;
+  const preserveExisting = !durableTail && existing;
   return {
     user_id: user.user_id,
     computer_id: device.computer_id ?? null,
     device_id: device.device_id,
     session_id: sessionID,
-    agent: session.agent || "claude-code",
-    runner_alias: session.runner_alias || "",
-    cwd: session.cwd || "",
-    snippet: session.snippet || session.first_message || "",
-    first_message: session.first_message ?? existing?.first_message ?? "",
-    title: session.title || "",
-    last_seq: Number(session.last_seq ?? maxSeq),
-    last_timestamp: session.last_timestamp || now,
-    channel_last_seen_at: session.channel_last_seen_at || existing?.channel_last_seen_at || session.last_timestamp || now,
-    sync_state: mergedSyncState(existing, session, uploadedTurnCount, {
-      persistedTurnCount,
-      syncedMinSeq,
-      syncedMaxSeq,
-    }),
-    turn_count: Number(session.turn_count ?? 0),
-    last_sync_error: "",
+    agent: preserveExisting ? existing.agent : (session.agent || "claude-code"),
+    runner_alias: preserveExisting ? (existing.runner_alias || "") : (session.runner_alias || ""),
+    cwd: preserveExisting ? (existing.cwd || "") : (session.cwd || ""),
+    snippet: preserveExisting ? (existing.snippet || "") : (session.snippet || session.first_message || ""),
+    first_message: preserveExisting ? (existing.first_message || "") : (session.first_message ?? existing?.first_message ?? ""),
+    title: preserveExisting ? (existing.title || "") : (session.title || ""),
+    last_seq: durableTail || !existing ? Number(session.last_seq ?? maxSeq) : Number(existing.last_seq ?? 0),
+    last_timestamp: durableTail || !existing ? (session.last_timestamp || now) : (existing.last_timestamp || session.last_timestamp || now),
+    channel_last_seen_at: durableTail
+      ? (session.channel_last_seen_at || existing?.channel_last_seen_at || session.last_timestamp || now)
+      : (existing?.channel_last_seen_at || session.channel_last_seen_at || session.last_timestamp || now),
+    sync_state: durableTail
+      ? mergedSyncState(existing, session, uploadedTurnCount, {
+          persistedTurnCount,
+          syncedMinSeq,
+          syncedMaxSeq,
+        })
+      : (existing?.sync_state || "catalog_only"),
+    turn_count: durableTail || !existing ? Number(session.turn_count ?? 0) : Number(existing.turn_count ?? session.turn_count ?? 0),
+    last_sync_error: preserveExisting ? (existing.last_sync_error || "") : "",
     synced_turn_count: persistedTurnCount,
     synced_min_seq: syncedMinSeq,
     synced_max_seq: syncedMaxSeq,
-    has_older_turns: mergedHasOlderTurns(existing, session, uploadedTurnCount, {
-      persistedTurnCount,
-      syncedMinSeq,
-      syncedMaxSeq,
-    }),
-    updated_at: session.last_timestamp || now,
+    has_older_turns: durableTail
+      ? mergedHasOlderTurns(existing, session, uploadedTurnCount, {
+          persistedTurnCount,
+          syncedMinSeq,
+          syncedMaxSeq,
+        })
+      : Boolean(existing?.has_older_turns),
+    updated_at: durableTail || !existing ? (session.last_timestamp || now) : (existing.updated_at || now),
   };
 }
 
@@ -4245,6 +4343,8 @@ function publicDeviceAuthorization(auth) {
 function publicSession(session, device, controlOnline = false) {
   const online = controlOnline || isOnline(device?.last_seen_at);
   const writable = Boolean(online && device?.remote_access_enabled && device.status === "active");
+  const turnCount = Number(session.turn_count ?? 0);
+  const syncedTurnCount = Number(session.synced_turn_count ?? 0);
   return {
     session_id: session.session_id,
     device_id: session.device_id,
@@ -4260,12 +4360,12 @@ function publicSession(session, device, controlOnline = false) {
     sync_state: session.sync_state || "catalog_only",
     connection_mode: writable ? "sdk_headless" : "read_only",
     writable,
-    turn_count: Number(session.turn_count ?? 0),
+    turn_count: turnCount,
     last_sync_error: session.last_sync_error || "",
-    synced_turn_count: Number(session.synced_turn_count ?? 0),
+    synced_turn_count: syncedTurnCount,
     synced_min_seq: Number(session.synced_min_seq ?? 0),
     synced_max_seq: Number(session.synced_max_seq ?? 0),
-    has_older_turns: Boolean(session.has_older_turns),
+    has_older_turns: Boolean(session.has_older_turns || turnCount > syncedTurnCount),
   };
 }
 

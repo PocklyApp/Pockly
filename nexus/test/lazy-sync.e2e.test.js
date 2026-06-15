@@ -144,13 +144,13 @@ test("lazy session sync E2E keeps old catalog visible and backfills on demand", 
 
   const oldAfterBackfill = await call(env, "GET", `/api/sessions/sess_old/turns?device_id=${daemon.daemon_device_id}`, null, browserAuth);
   const oldAfterBackfillBody = await oldAfterBackfill.json();
-  assert.equal(oldAfterBackfillBody.turns.length, 100);
-  assert.equal(oldAfterBackfillBody.oldest_seq, 141);
-  assert.equal(oldAfterBackfillBody.latest_seq, 240);
-  assert.equal(oldAfterBackfillBody.synced_turn_count, 100);
+  assert.equal(oldAfterBackfillBody.turns.length, 0);
+  assert.equal(oldAfterBackfillBody.oldest_seq, undefined);
+  assert.equal(oldAfterBackfillBody.latest_seq, undefined);
+  assert.equal(oldAfterBackfillBody.synced_turn_count, 0);
   assert.equal(oldAfterBackfillBody.total_turn_count, 240);
   assert.equal(oldAfterBackfillBody.has_older_turns, true);
-  assert.equal(oldAfterBackfillBody.needs_sync, false);
+  assert.equal(oldAfterBackfillBody.needs_sync, true);
 
   await env.POCKLY_NEXUS_STORE.patchDevice("usr_test", daemon.daemon_device_id, {
     last_seen_at: "2026-01-01T00:00:00.000Z",
@@ -161,14 +161,14 @@ test("lazy session sync E2E keeps old catalog visible and backfills on demand", 
   const offlineOld = (await offlineList.json()).sessions.find((session) => session.session_id === "sess_old");
   assert.equal(offlineOld.writable, false);
   assert.equal(offlineOld.connection_mode, "read_only");
-  assert.equal(offlineOld.synced_turn_count, 100);
+  assert.equal(offlineOld.synced_turn_count, 0);
   assert.equal(offlineOld.turn_count, 240);
   assert.equal(offlineOld.has_older_turns, true);
 
   const offlineTurns = await call(env, "GET", `/api/sessions/sess_old/turns?device_id=${daemon.daemon_device_id}`, null, browserAuth);
   const offlineTurnsBody = await offlineTurns.json();
-  assert.equal(offlineTurnsBody.turns.length, 100);
-  assert.equal(offlineTurnsBody.synced_turn_count, 100);
+  assert.equal(offlineTurnsBody.turns.length, 0);
+  assert.equal(offlineTurnsBody.synced_turn_count, 0);
   assert.equal(offlineTurnsBody.total_turn_count, 240);
   assert.equal(offlineTurnsBody.has_older_turns, true);
 });

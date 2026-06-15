@@ -1244,6 +1244,108 @@ func TestSyncChangedNexusSessionsUploadsOnlyNewTailWhenServerWindowOverlaps(t *t
 	}
 }
 
+func TestSyncChangedNexusSessionsIgnoresBackfillCursorForAutomaticHotSync(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 240)
+	tailReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_hot_tail_only",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 100},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta := tailReq.Sessions[0]
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "hot tail only")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var uploadedSeqs []int
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_hot_tail_only",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			var req pair.SyncRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode sync request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			for _, turn := range req.Turns {
+				uploadedSeqs = append(uploadedSeqs, turn.Seq)
+			}
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true, SessionCount: 1, TurnCount: len(req.Turns)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	syncedSessions, syncedTurns := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{{
+			SessionID:         sessionID,
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               meta.Cwd,
+			LastTimestamp:     time.Now().UTC().Format(time.RFC3339),
+			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
+			TurnCount:         meta.TurnCount,
+		}},
+		map[string]string{},
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		map[string]syncHint{
+			sessionID: {
+				Reason:          "recently_opened",
+				PreferredMin:    100,
+				SyncedTurnCount: 100,
+				SyncedMinSeq:    141,
+				SyncedMaxSeq:    240,
+				NextBeforeSeq:   141,
+				TotalTurnCount:  240,
+				HasOlderTurns:   true,
+			},
+		},
+		newPushedHintStore(),
+		nil,
+		map[string]time.Time{},
+		0,
+	)
+	if syncedSessions != 1 || syncedTurns != 100 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/100", syncedSessions, syncedTurns)
+	}
+	if got := syncPosts.Load(); got != 1 {
+		t.Fatalf("sync POST count = %d, want 1", got)
+	}
+	if len(uploadedSeqs) != 100 || uploadedSeqs[0] != 141 || uploadedSeqs[len(uploadedSeqs)-1] != 240 {
+		t.Fatalf("uploaded seqs = %v..%v len=%d, want tail 141..240", uploadedSeqs[0], uploadedSeqs[len(uploadedSeqs)-1], len(uploadedSeqs))
+	}
+}
+
 func TestCatalogSyncSignatureIgnoresHelloButTracksCatalogChanges(t *testing.T) {
 	req := pair.SyncRequest{
 		Hello:         pair.HelloMessage{DeviceID: "dd_test", Version: "v1"},
@@ -2016,13 +2118,13 @@ func TestPushedHintStoreConsumesRecentlyOpenedAfterOneWindow(t *testing.T) {
 
 	hint := store.Snapshot(now)["sess-large"]
 	if before := beforeSeqForHint(hint); before != 141 {
-		t.Fatalf("beforeSeqForHint = %d, want 141", before)
+		t.Fatalf("beforeSeqForHint = %d, want explicit backfill cursor 141", before)
 	}
 
 	store.UpdateAfterSync("sess-large", pair.SyncSession{
 		SessionID: "sess-large",
-		MinSeq:    41,
-		MaxSeq:    140,
+		MinSeq:    141,
+		MaxSeq:    240,
 		TurnCount: 240,
 		HasOlder:  true,
 	}, now.Add(time.Second))
@@ -2048,34 +2150,19 @@ func TestPushedHintStoreTracksPinnedBackfillCursor(t *testing.T) {
 
 	hint := store.Snapshot(now)["sess-large"]
 	if before := beforeSeqForHint(hint); before != 141 {
-		t.Fatalf("beforeSeqForHint = %d, want 141", before)
+		t.Fatalf("beforeSeqForHint = %d, want explicit backfill cursor 141", before)
 	}
 
 	store.UpdateAfterSync("sess-large", pair.SyncSession{
 		SessionID: "sess-large",
-		MinSeq:    41,
-		MaxSeq:    140,
+		MinSeq:    141,
+		MaxSeq:    240,
 		TurnCount: 240,
 		HasOlder:  true,
 	}, now.Add(time.Second))
 
-	hint = store.Snapshot(now.Add(time.Second))["sess-large"]
-	if hint.SyncedMinSeq != 41 || hint.SyncedMaxSeq != 240 || hint.SyncedTurnCount != 200 || hint.NextBeforeSeq != 41 || !hint.HasOlderTurns {
-		t.Fatalf("hint after middle window = %+v, want 41..240/200/before=41/older", hint)
-	}
-	if before := beforeSeqForHint(hint); before != 41 {
-		t.Fatalf("second beforeSeqForHint = %d, want 41", before)
-	}
-
-	store.UpdateAfterSync("sess-large", pair.SyncSession{
-		SessionID: "sess-large",
-		MinSeq:    1,
-		MaxSeq:    40,
-		TurnCount: 240,
-		HasOlder:  false,
-	}, now.Add(2*time.Second))
-	if hints := store.Snapshot(now.Add(2 * time.Second)); len(hints) != 0 {
-		t.Fatalf("completed hint should be removed, got %+v", hints)
+	if hints := store.Snapshot(now.Add(time.Second)); len(hints) != 0 {
+		t.Fatalf("pinned hint should be consumed after the durable tail window, got %+v", hints)
 	}
 }
 

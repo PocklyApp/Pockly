@@ -387,6 +387,9 @@ export class InMemoryControlHub {
         await this.dispatch(spec.daemonDeviceID, spec.envelope);
         this.sendBrowserCommandAck(browserSocket, requestID, command, spec.ack || { status: "accepted", device_id: spec.daemonDeviceID, session_id: spec.sessionID || "" });
         return;
+      case "ack":
+        this.sendBrowserCommandAck(browserSocket, requestID, command, spec.ack || { status: "accepted", device_id: spec.daemonDeviceID || "", session_id: spec.sessionID || "" });
+        return;
       case "request_response":
         return await this.runBrowserCommandRequestResponse(browserSocket, requestID, command, spec);
       case "terminal_create": {

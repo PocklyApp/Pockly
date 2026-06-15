@@ -422,6 +422,10 @@ export class InMemoryNexusStore {
     return next;
   }
 
+  async deleteSessionOpenHint(userID, deviceID, sessionID) {
+    this.sessionOpenHints.delete(sessionKey(userID, deviceID, sessionID));
+  }
+
   async listProjectPrefsForUser(userID) {
     return [...this.projectPrefs.values()].filter((pref) => pref.user_id === userID);
   }
@@ -1582,6 +1586,12 @@ export class SQLNexusStore {
     return await this.db.prepare(`
       SELECT * FROM session_open_hints WHERE user_id = ? AND device_id = ? AND session_id = ?
     `).bind(hint.user_id, hint.device_id, hint.session_id).first();
+  }
+
+  async deleteSessionOpenHint(userID, deviceID, sessionID) {
+    await this.db.prepare(`
+      DELETE FROM session_open_hints WHERE user_id = ? AND device_id = ? AND session_id = ?
+    `).bind(userID, deviceID, sessionID).run();
   }
 
   async listProjectPrefsForUser(userID) {

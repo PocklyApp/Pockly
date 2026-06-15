@@ -2565,6 +2565,14 @@ func (s *pushedHintStore) UpdateAfterSync(sessionID string, meta pair.SyncSessio
 		delete(s.entries, sessionID)
 		return
 	}
+	if !syncWindowIsLatestTail(meta) {
+		delete(s.entries, sessionID)
+		return
+	}
+	if entry.hint.Reason == "pinned" {
+		delete(s.entries, sessionID)
+		return
+	}
 	entry.hint = mergeSyncHintAfterWindow(entry.hint, meta)
 	if syncHintBackfillComplete(entry.hint) {
 		delete(s.entries, sessionID)
@@ -2572,6 +2580,17 @@ func (s *pushedHintStore) UpdateAfterSync(sessionID string, meta pair.SyncSessio
 	}
 	entry.pushedAt = now
 	s.entries[sessionID] = entry
+}
+
+func syncWindowIsLatestTail(meta pair.SyncSession) bool {
+	total := meta.TurnCount
+	if total <= 0 {
+		total = meta.LastSeq
+	}
+	if total <= 0 || meta.MaxSeq <= 0 {
+		return true
+	}
+	return meta.MaxSeq >= total
 }
 
 func (s *pushedHintStore) Snapshot(now time.Time) map[string]syncHint {
@@ -2672,7 +2691,6 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		hint, hasHint := hints[session.SessionID]
 		if hasHint {
 			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
-			beforeSeq = beforeSeqForHint(hint)
 		}
 		req, err := relay.BuildSingleSessionWindowSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, relay.SessionWindow{Limit: limit, BeforeSeq: beforeSeq}, nil)
 		if err != nil {
