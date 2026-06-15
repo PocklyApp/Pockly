@@ -33,6 +33,7 @@ import {
   shouldLoadMoreSessionCatalogFromScroll,
   shouldPollWorkspacePresence,
   shouldRefreshSessionCatalog,
+  shouldRunWorkspaceNetworkLeader,
   shouldFallbackToFullSessionCatalog,
   shouldRefreshPersistentTurnsAfterSync,
   shouldScheduleInjectRefreshAfterStream,
@@ -653,6 +654,11 @@ test("workspace presence polling pauses after a tab has been backgrounded for te
     hiddenSinceAt: 1_000,
     force: true,
   }), true);
+});
+
+test("workspace network leader suppresses duplicate realtime and polling work in follower tabs", () => {
+  assert.equal(shouldRunWorkspaceNetworkLeader(true), true);
+  assert.equal(shouldRunWorkspaceNetworkLeader(false), false);
 });
 
 test("session websocket requires explicit runtime support", () => {

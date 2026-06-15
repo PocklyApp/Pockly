@@ -3111,7 +3111,7 @@ async function terminalSessionByID(request, store, env, terminalSessionID, actio
         return jsonResponse(await control.unsubscribeTerminalSession(user.user_id, terminalSessionID));
       case "events":
         if (request.method !== "GET") return methodNotAllowed("GET");
-        return jsonResponse(await listTerminalEvents(store, control, request, user.user_id, terminalSessionID));
+        return jsonResponse(await listTerminalEvents(store, control, request, env, user.user_id, terminalSessionID));
       case "stream":
         if (request.method !== "GET") return methodNotAllowed("GET");
         if (!terminalStreamingEnabled(env)) {
@@ -3122,6 +3122,7 @@ async function terminalSessionByID(request, store, env, terminalSessionID, actio
         return errorResponse("not found", ErrorCode.NotFound, { status: 404 });
     }
   } catch (error) {
+    if (error?.response instanceof Response) return error.response;
     const message = error instanceof Error ? error.message : String(error);
     if (message === "terminal session not found") {
       return errorResponse(message, ErrorCode.NotFound, { status: 404 });
@@ -3444,7 +3445,7 @@ async function cancelInject(request, store, env, requestID) {
   }
 }
 
-async function listTerminalEvents(store, control, request, userID, terminalSessionID) {
+async function listTerminalEvents(store, control, request, env, userID, terminalSessionID) {
   const url = new URL(request.url);
   const options = {
     after: url.searchParams.get("after") || "",
@@ -3461,7 +3462,21 @@ async function listTerminalEvents(store, control, request, userID, terminalSessi
       next_cursor: events.at(-1)?.cursor || options.after,
     };
   }
+  if (managedRuntime(env) && !terminalEventCacheEnabled(env)) {
+    throw unsupportedTerminalPollingError();
+  }
   return control.listTerminalEvents(userID, terminalSessionID, options);
+}
+
+function managedRuntime(env = {}) {
+  const value = String(env.POCKLY_NEXUS_RUNTIME || env.NEXUS_RUNTIME || "");
+  return value === "managed";
+}
+
+function unsupportedTerminalPollingError() {
+  const error = new Error("terminal event polling requires browser realtime or terminal event cache in this runtime");
+  error.response = errorResponse(error.message, ErrorCode.UnsupportedRuntime, { status: 501 });
+  return error;
 }
 
 async function unsupportedControl(request, action) {

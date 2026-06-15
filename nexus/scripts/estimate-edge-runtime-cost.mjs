@@ -30,6 +30,28 @@ const profiles = Object.freeze({
     objectGBMonth: 0.05,
     coordinationDurationGBSPerMonth: 120,
   }),
+  multi_tab_visible: Object.freeze({
+    foregroundMinutesPerDay: 30,
+    hostPollIntervalSeconds: 15,
+    catalogRefreshIntervalSeconds: 60,
+    activeTurnMinutesPerDay: 10,
+    activeEventPollIntervalSeconds: 2,
+    openedSessionsPerDay: 10,
+    openHintsPerDay: 10,
+    sessionMetadataWritesPerDay: 10,
+    agentTurnsPerDay: 10,
+    averageBlocksPerTurn: 4,
+    // Three visible tabs share one workspace network leader. Follower tabs
+    // receive local BroadcastChannel updates and do not multiply presence,
+    // catalog, or realtime coordination work.
+    visibleTabs: 3,
+    followerLocalBroadcastOnly: true,
+    sqlReadRowsPerMonth: 260_000,
+    objectWritesPerMonth: 0,
+    objectReadsPerMonth: 0,
+    objectGBMonth: 0.05,
+    coordinationDurationGBSPerMonth: 120,
+  }),
   background_hanging_tab: Object.freeze({
     foregroundMinutesPerDay: 0,
     hostPollIntervalSeconds: 15,

@@ -3622,9 +3622,8 @@ describe("Nexus api", () => {
     assert.equal(store.counts.appendSessionEventRows, 1);
   });
 
-  it("falls back to live control terminal events when persisted cache is disabled", async () => {
+  it("falls back to live control terminal events in self-hosted runtime when persisted cache is disabled", async () => {
     const env = testEnv();
-    env.POCKLY_NEXUS_RUNTIME = "managed";
     env.TERMINAL_EVENT_CACHE_ENABLED = "0";
     const cookie = await loginCookie(env);
     const browserKeys = await generateSigningKeyPair();
@@ -3666,6 +3665,47 @@ describe("Nexus api", () => {
     });
     assert.equal(second.status, 200);
     assert.deepEqual(await second.json(), { events: [], next_cursor: firstBody.next_cursor });
+  });
+
+  it("does not poll live control terminal events in managed runtime when persisted cache is disabled", async () => {
+    const env = testEnv();
+    env.POCKLY_NEXUS_RUNTIME = "managed";
+    env.TERMINAL_EVENT_CACHE_ENABLED = "0";
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+
+    env.POCKLY_CONTROL_HUB.attachDaemonForTest(daemon.daemon_device_id, "usr_test", async () => {});
+
+    const terminalCreate = await call(env, "POST", "/api/terminal-sessions", {
+      daemon_device_id: daemon.daemon_device_id,
+      session_id: "sess_managed_events",
+      agent: "claude-code",
+      cwd: "/work/app",
+    }, { authorization: `Bearer ${browser.device_access_token}` });
+    assert.equal(terminalCreate.status, 200);
+    const terminal = (await terminalCreate.json()).terminal_session;
+
+    env.POCKLY_CONTROL_HUB.receiveDaemonEnvelope(daemon.daemon_device_id, {
+      type: "TERMINAL_EVENT",
+      terminal_event: {
+        terminal_session_id: terminal.terminal_session_id,
+        kind: "text_delta",
+        payload: "live terminal batch",
+        session_id: "sess_managed_events",
+        timestamp: "2026-06-06T01:00:03Z",
+      },
+    });
+
+    const events = await call(env, "GET", `/api/terminal-sessions/${terminal.terminal_session_id}/events`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(events.status, 501);
+    assert.deepEqual(await events.json(), {
+      error: "terminal event polling requires browser realtime or terminal event cache in this runtime",
+      code: "unsupported_runtime",
+    });
   });
 
   it("exposes request-scoped events for polling fallback new-session starts before a session id exists", async () => {

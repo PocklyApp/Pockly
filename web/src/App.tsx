@@ -83,6 +83,7 @@ import {
   type Device,
   type InjectEvent,
   type ListDirResult,
+  type HostStatusUpdate,
   type HostSummary,
   type NexusRuntimeCapabilities,
   type SessionListItem,
@@ -110,6 +111,10 @@ import {
   mergeSessionTurnsCache,
   saveSessionTurnsCache,
 } from "./session-turns-cache";
+import {
+  createWorkspaceTabLeader,
+  type WorkspaceTabLeaderHandle,
+} from "./workspace-tab-leader";
 import { clearBrowserDeviceState, ensureBrowserDeviceState, loadBrowserDeviceState, persistBrowserTokens } from "./crypto";
 import { AppShell, Workspace } from "./components/layout/app-shell";
 import { ThemeToggle } from "./components/layout/theme-toggle";
@@ -649,6 +654,10 @@ export function App() {
   const [cliAuthorization, setCliAuthorization] = useState<DaemonDeviceAuthorization | null>(null);
   const [cliStatus, setCliStatus] = useState("");
   const [realtimeVisibilityTick, setRealtimeVisibilityTick] = useState(0);
+  const [workspaceLeaderTick, setWorkspaceLeaderTick] = useState(0);
+  const workspaceLeaderRef = useRef<WorkspaceTabLeaderHandle | null>(null);
+  const workspaceLeaderSubscriptionsRef = useRef<Map<string, { sessionId: string; deviceId: string; afterSeq: number }>>(new Map());
+  const workspaceRouteActive = auth.status === "authenticated" && isAuthenticatedWorkspaceRoute(route);
   const injectRefreshRef = useRef<number | null>(null);
   const subscriptionRef = useRef<SessionSubscription | null>(null);
   const realtimeSessionSubscriptionRef = useRef<{ sessionId: string; deviceId: string } | null>(null);
@@ -1118,51 +1127,116 @@ export function App() {
   }
 
   useEffect(() => {
+    workspaceLeaderRef.current?.close();
+    workspaceLeaderRef.current = null;
+    workspaceLeaderSubscriptionsRef.current.clear();
+    setWorkspaceLeaderTick((value) => value + 1);
+    if (!workspaceRouteActive || auth.status !== "authenticated") return;
+    const leader = createWorkspaceTabLeader(auth.email);
+    workspaceLeaderRef.current = leader;
+    const unsubscribe = leader.onChange(() => setWorkspaceLeaderTick((value) => value + 1));
+    const unsubscribeMessages = leader.onMessage((message) => {
+      if (!message || typeof message !== "object") return;
+      if (message.type === "host_status" && !leader.isLeader && isHostStatusUpdate(message.host)) {
+        applyRealtimeHostStatus(message.host);
+        return;
+      }
+      if (message.type === "turn" && !leader.isLeader && isSessionTurn(message.turn)) {
+        applyRealtimeTurn(message.turn);
+        return;
+      }
+      if (message.type === "session_status" && !leader.isLeader) {
+        realtimeLiveRef.current = message.status === "live";
+        return;
+      }
+      if (leader.isLeader) {
+        if (message.type === "subscribe_session" && message.tab_id !== leader.tabID) {
+          workspaceLeaderSubscriptionsRef.current.set(`${message.tab_id}:${message.device_id}:${message.session_id}`, {
+            sessionId: message.session_id,
+            deviceId: message.device_id,
+            afterSeq: message.after_seq,
+          });
+          subscriptionRef.current?.subscribeSession?.(message.session_id, message.device_id, message.after_seq);
+        } else if (message.type === "unsubscribe_session" && message.tab_id !== leader.tabID) {
+          workspaceLeaderSubscriptionsRef.current.delete(`${message.tab_id}:${message.device_id}:${message.session_id}`);
+          if (!leaderStillNeedsSessionSubscription(message.device_id, message.session_id)) {
+            subscriptionRef.current?.unsubscribeSession?.(message.session_id, message.device_id);
+          }
+        }
+      }
+    });
+    return () => {
+      unsubscribe();
+      unsubscribeMessages();
+      leader.close();
+      if (workspaceLeaderRef.current === leader) workspaceLeaderRef.current = null;
+      workspaceLeaderSubscriptionsRef.current.clear();
+      setWorkspaceLeaderTick((value) => value + 1);
+    };
+  }, [auth.status, auth.status === "authenticated" ? auth.email : "", workspaceRouteActive]);
+
+  function isWorkspaceLeaderTab() {
+    return shouldRunWorkspaceNetworkLeader(workspaceLeaderRef.current?.isLeader !== false);
+  }
+
+  function leaderStillNeedsSessionSubscription(deviceId: string, sessionId: string) {
+    const own = realtimeSessionSubscriptionRef.current;
+    if (own?.deviceId === deviceId && own.sessionId === sessionId) return true;
+    for (const subscription of workspaceLeaderSubscriptionsRef.current.values()) {
+      if (subscription.deviceId === deviceId && subscription.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  function applyRealtimeTurn(turn: SessionTurn) {
+    const current = selectedRef.current;
+    if (!current) return;
+    if (turn.session_id !== current.sessionId || (turn.device_id && turn.device_id !== current.deviceId)) return;
+    const hydratedTurn = { ...turn, device_id: current.deviceId };
+    setTurns((currentTurns) => reconcileHydratedTurns(currentTurns, [hydratedTurn]));
+  }
+
+  function applyRealtimeHostStatus(status: HostStatusUpdate) {
+    setHosts((current) => {
+      const next = current.map((host) => host.device_id === status.device_id
+        ? {
+            ...host,
+            ...(status.presence_status ? { presence_status: status.presence_status as NonNullable<HostSummary["presence_status"]> } : {}),
+            ...(status.presence_reason ? { presence_reason: status.presence_reason } : {}),
+            ...(status.control_connected === undefined ? {} : { control_connected: status.control_connected }),
+            ...(status.app_version ? { app_version: status.app_version } : {}),
+          }
+        : host);
+      hostsRef.current = next;
+      queueMicrotask(() => setSessions((sessions) => mergeHostPresenceIntoSessions(sessions, next)));
+      return next;
+    });
+  }
+
+  useEffect(() => {
     subscriptionRef.current?.close();
     subscriptionRef.current = null;
     realtimeSessionSubscriptionRef.current = null;
     if (
       !shouldUseBrowserRealtime(runtimeCapabilities) ||
+      !isWorkspaceLeaderTab() ||
       auth.status !== "authenticated"
     ) {
       return;
     }
     const subscription = subscribeToSession({
       onTurn: (turn) => {
-        const current = selectedRef.current;
-        if (!current) return;
-        if (turn.session_id !== current.sessionId || (turn.device_id && turn.device_id !== current.deviceId)) return;
-        const hydratedTurn = { ...turn, device_id: current.deviceId };
-        // The realtime WS push and the live SSE bridge are independent,
-        // unordered writers of the same reply. For SDK sessions the bridge
-        // adds an optimistic assistant turn (seq >= 9e8) and this push later
-        // carries the confirmed real-seq copy; a plain mergeTurns keeps BOTH
-        // (they key on distinct seqs) so the reply double-bubbles until a
-        // reload. Reconcile here — the same primitive scheduleInjectRefresh
-        // uses — so the confirmed copy supersedes its optimistic twin. A turn
-        // that matches no optimistic twin is just appended (reconcile is a
-        // no-op on a still-streaming reply the confirmed set hasn't reached).
-        setTurns((current) => reconcileHydratedTurns(current, [hydratedTurn]));
+        applyRealtimeTurn(turn);
+        workspaceLeaderRef.current?.post({ type: "turn", turn });
       },
       onStatus: (status) => {
         realtimeLiveRef.current = status === "live";
+        workspaceLeaderRef.current?.post({ type: "session_status", status });
       },
       onHostStatus: (status) => {
         // Presence pushed over the socket replaces most foreground polling.
-        setHosts((current) => {
-          const next = current.map((host) => host.device_id === status.device_id
-            ? {
-                ...host,
-                ...(status.presence_status ? { presence_status: status.presence_status as NonNullable<HostSummary["presence_status"]> } : {}),
-                ...(status.presence_reason ? { presence_reason: status.presence_reason } : {}),
-                ...(status.control_connected === undefined ? {} : { control_connected: status.control_connected }),
-                ...(status.app_version ? { app_version: status.app_version } : {}),
-              }
-            : host);
-          hostsRef.current = next;
-          queueMicrotask(() => setSessions((sessions) => mergeHostPresenceIntoSessions(sessions, next)));
-          return next;
-        });
+        applyRealtimeHostStatus(status);
+        workspaceLeaderRef.current?.post({ type: "host_status", host: status });
       },
     });
     subscriptionRef.current = subscription;
@@ -1173,7 +1247,7 @@ export function App() {
       if (subscriptionRef.current === subscription) realtimeSessionSubscriptionRef.current = null;
       subscription.close();
     };
-  }, [auth.status, runtimeCapabilities?.browser_realtime, runtimeCapabilities?.browser_realtime_control, realtimeVisibilityTick]);
+  }, [auth.status, runtimeCapabilities?.browser_realtime, runtimeCapabilities?.browser_realtime_control, realtimeVisibilityTick, workspaceLeaderTick]);
 
   useEffect(() => {
     const subscription = subscriptionRef.current;
@@ -1182,14 +1256,34 @@ export function App() {
       ? { sessionId: selected.sessionId, deviceId: selected.deviceId, afterSeq: turns.at(-1)?.seq ?? 0 }
       : null;
     if (previous && (!next || previous.sessionId !== next.sessionId || previous.deviceId !== next.deviceId)) {
-      subscription?.unsubscribeSession?.(previous.sessionId, previous.deviceId);
+      if (subscription) {
+        subscription.unsubscribeSession?.(previous.sessionId, previous.deviceId);
+      } else if (!isWorkspaceLeaderTab()) {
+        workspaceLeaderRef.current?.post({
+          type: "unsubscribe_session",
+          tab_id: workspaceLeaderRef.current.tabID,
+          session_id: previous.sessionId,
+          device_id: previous.deviceId,
+        });
+      }
       realtimeSessionSubscriptionRef.current = null;
     }
     if (next && (!previous || previous.sessionId !== next.sessionId || previous.deviceId !== next.deviceId)) {
-      subscription?.subscribeSession?.(next.sessionId, next.deviceId, next.afterSeq);
+      if (subscription) {
+        subscription.subscribeSession?.(next.sessionId, next.deviceId, next.afterSeq);
+      } else if (!isWorkspaceLeaderTab()) {
+        const leader = workspaceLeaderRef.current;
+        leader?.post({
+          type: "subscribe_session",
+          tab_id: leader.tabID,
+          session_id: next.sessionId,
+          device_id: next.deviceId,
+          after_seq: next.afterSeq,
+        });
+      }
       realtimeSessionSubscriptionRef.current = { sessionId: next.sessionId, deviceId: next.deviceId };
     }
-  }, [route.view, selected?.deviceId, selected?.sessionId, turnsStatus]);
+  }, [route.view, selected?.deviceId, selected?.sessionId, turnsStatus, workspaceLeaderTick]);
 
   useEffect(() => {
     if (!realtimeLiveRef.current || document.visibilityState !== "hidden") return;
@@ -1703,7 +1797,8 @@ export function App() {
   }
 
   useEffect(() => {
-    if (auth.status !== "authenticated" || !isAuthenticatedWorkspaceRoute(route)) return;
+    if (!workspaceRouteActive || auth.status !== "authenticated") return;
+    if (!isWorkspaceLeaderTab()) return;
     let stopped = false;
     let refreshTimer: number | null = null;
     let inFlight = false;
@@ -1771,7 +1866,7 @@ export function App() {
       if (refreshTimer != null) window.clearInterval(refreshTimer);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [auth.status, auth.status === "authenticated" ? auth.email : "", route.view]);
+  }, [auth.status, auth.status === "authenticated" ? auth.email : "", workspaceRouteActive, workspaceLeaderTick]);
 
   async function refreshApp(targetRoute = route, preserveCurrentSelection = false) {
     autoConnectGenerationRef.current += 1;
@@ -13739,11 +13834,15 @@ export function shouldUseBrowserRealtimeControl(capabilities: NexusRuntimeCapabi
 }
 
 export function shouldAutoAttachReaderTerminalBridge(capabilities: NexusRuntimeCapabilities | null | undefined) {
-  // SaaS managed runtimes keep browser reader pages local-first and polling
+  // Managed runtimes keep browser reader pages local-first and polling
   // based; terminal streaming is an explicit user action, not an automatic
   // read-screen side effect. Unknown runtime defaults closed so bootstrap does
   // not briefly open a terminal poll before /api/runtime resolves.
   return capabilities?.runtime === "self_hosted";
+}
+
+export function shouldRunWorkspaceNetworkLeader(isLeader: boolean) {
+  return isLeader;
 }
 
 export function shouldRefreshSessionCatalog({
@@ -13806,6 +13905,19 @@ export function shouldPollWorkspacePresence({
   if (force || visible) return true;
   if (!hiddenSinceAt) return true;
   return now - hiddenSinceAt <= pauseAfterMs;
+}
+
+function isHostStatusUpdate(value: unknown): value is HostStatusUpdate {
+  return Boolean(value && typeof value === "object" && typeof (value as { device_id?: unknown }).device_id === "string");
+}
+
+function isSessionTurn(value: unknown): value is SessionTurn {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    typeof (value as { session_id?: unknown }).session_id === "string" &&
+    typeof (value as { kind?: unknown }).kind === "string",
+  );
 }
 
 export function mergeHostPresenceIntoSessions(sessions: SessionListItem[], hosts: HostSummary[]) {

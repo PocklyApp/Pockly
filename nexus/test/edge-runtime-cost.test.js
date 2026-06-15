@@ -29,6 +29,15 @@ describe("edge runtime cost estimator", () => {
     assert.ok(estimate.background_hanging_tab.marginal_usd_per_month.total <= 0.0001);
   });
 
+  it("models multiple visible tabs as one network leader plus local followers", async () => {
+    const estimate = await runCostEstimator("multi_tab_visible");
+    assert.equal(estimate.multi_tab_visible.assumptions.visibleTabs, 3);
+    assert.equal(estimate.multi_tab_visible.assumptions.followerLocalBroadcastOnly, true);
+    assert.ok(estimate.multi_tab_visible.usage.edge_requests <= 15_000);
+    assert.ok(estimate.multi_tab_visible.usage.coordination_requests <= 4_500);
+    assert.ok(estimate.multi_tab_visible.marginal_usd_per_month.total <= 0.01);
+  });
+
   it("accepts dashed pricing overrides", async () => {
     const estimate = await runCostEstimator("typical", [
       "--edge-request-usd-per-million",
