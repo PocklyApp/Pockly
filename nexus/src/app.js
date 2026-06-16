@@ -1471,9 +1471,11 @@ function sessionMatchesExisting(session, existing) {
     ["turn_count", numberValue],
     ["last_sync_error", stringOrNull],
     ["synced_turn_count", numberValue],
+    ["actual_turn_count", numberValue],
     ["synced_min_seq", numberValue],
     ["synced_max_seq", numberValue],
     ["synced_window_hash", stringOrEmpty],
+    ["latest_contiguous_min_seq", numberValue],
     ["has_older_turns", boolIntValue],
   ];
   return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
@@ -4028,9 +4030,11 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
     turn_count: durableTail || !existing ? Number(session.turn_count ?? 0) : Number(existing.turn_count ?? session.turn_count ?? 0),
     last_sync_error: preserveExisting ? (existing.last_sync_error || "") : "",
     synced_turn_count: persistedTurnCount,
+    actual_turn_count: Number(stats?.count ?? existing?.actual_turn_count ?? persistedTurnCount) || 0,
     synced_min_seq: syncedMinSeq,
     synced_max_seq: syncedMaxSeq,
     synced_window_hash: syncedWindowHash,
+    latest_contiguous_min_seq: Number(stats?.latest_contiguous_min_seq ?? existing?.latest_contiguous_min_seq ?? syncedMinSeq) || 0,
     has_older_turns: durableTail
       ? mergedHasOlderTurns(existing, session, uploadedTurnCount, {
           persistedTurnCount,
@@ -4059,10 +4063,11 @@ function syncedWindowHashForSession(session, stats, syncedMinSeq, syncedMaxSeq, 
 async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnStats, changedTurnStats) {
   const uploadedTurnCount = Number(uploadedTurnStats?.count ?? 0) || 0;
   const changedTurnCount = Number(changedTurnStats?.count ?? 0) || 0;
+  if (changedTurnCount > 0 && existing) {
+    const merged = mergeUploadedTurnStats(existing, session, changedTurnStats);
+    if (!merged.requires_full_stats) return merged;
+  }
   if (changedTurnCount > 0) {
-    // Turns are written before session metadata and may be pruned by the
-    // hot-window retention policy. Use the store's seq-only stats query so catalog
-    // metadata reflects the rows actually retained in Nexus, not just uploaded.
     return await sessionTurnStats(store, userID, deviceID, sessionID);
   }
   if (uploadedTurnCount > 0 && existing) {
@@ -4083,10 +4088,13 @@ function mergeUploadedTurnStats(existing, session, uploadedTurnStats) {
   if (uploadedCount <= 0 || uploadedMinSeq <= 0 || uploadedMaxSeq <= 0 || uploadedMaxSeq < uploadedMinSeq) {
     return { requires_full_stats: true };
   }
+  const uploadedSpan = uploadedMaxSeq - uploadedMinSeq + 1;
+  if (uploadedCount < uploadedSpan) return { requires_full_stats: true };
 
   const currentCount = Number(existing?.synced_turn_count ?? 0) || 0;
   const currentMinSeq = Number(existing?.synced_min_seq ?? 0) || 0;
   const currentMaxSeq = Number(existing?.synced_max_seq ?? 0) || 0;
+  const currentLatestContiguousMinSeq = Number(existing?.latest_contiguous_min_seq ?? currentMinSeq) || currentMinSeq;
   if (currentCount <= 0 || currentMinSeq <= 0 || currentMaxSeq <= 0 || currentMaxSeq < currentMinSeq) {
     return {
       count: uploadedCount,
@@ -4118,11 +4126,21 @@ function mergeUploadedTurnStats(existing, session, uploadedTurnStats) {
   const nextMaxSeq = Math.max(currentMaxSeq, uploadedMaxSeq);
   const nextCount = currentCount + additionalCount;
   const nextSpan = nextMaxSeq - nextMinSeq + 1;
+  let latestContiguousMinSeq = currentLatestContiguousMinSeq;
+  if (uploadedMaxSeq > currentMaxSeq) {
+    latestContiguousMinSeq = uploadedMinSeq <= currentMaxSeq + 1
+      ? Math.min(uploadedMinSeq, currentLatestContiguousMinSeq)
+      : uploadedMinSeq;
+  } else if (uploadedMinSeq <= currentLatestContiguousMinSeq && uploadedMaxSeq >= currentMaxSeq) {
+    latestContiguousMinSeq = uploadedMinSeq;
+  } else if (uploadedMaxSeq >= currentLatestContiguousMinSeq - 1 && uploadedMinSeq <= currentLatestContiguousMinSeq) {
+    latestContiguousMinSeq = Math.min(uploadedMinSeq, currentLatestContiguousMinSeq);
+  }
   return {
     count: Math.min(nextCount, nextSpan),
     min_seq: nextMinSeq,
     max_seq: nextMaxSeq,
-    latest_contiguous_min_seq: nextCount >= nextSpan ? nextMinSeq : currentMinSeq,
+    latest_contiguous_min_seq: nextCount >= nextSpan ? nextMinSeq : latestContiguousMinSeq,
   };
 }
 
@@ -4151,6 +4169,13 @@ async function sessionTurnStats(store, userID, deviceID, sessionID) {
 async function sessionWithTurnStats(store, userID, deviceID, sessionID, options = {}) {
   const session = await store.getSession(userID, deviceID, sessionID);
   if (!session) return null;
+  if (sessionHasMaterializedTurnStats(session)) {
+    return {
+      ...session,
+      actual_turn_count: Number(session.actual_turn_count ?? session.synced_turn_count ?? 0) || 0,
+      latest_contiguous_min_seq: Number(session.latest_contiguous_min_seq ?? session.synced_min_seq ?? 0) || 0,
+    };
+  }
   const stats = await sessionTurnStats(store, userID, deviceID, sessionID);
   const syncedMinSeq = Number(stats.min_seq ?? 0) || 0;
   const syncedMaxSeq = Number(stats.max_seq ?? 0) || 0;
@@ -4171,8 +4196,10 @@ async function sessionWithTurnStats(store, userID, deviceID, sessionID, options 
         syncedMaxSeq: next.synced_max_seq,
       }),
       synced_turn_count: next.synced_turn_count,
+      actual_turn_count: next.actual_turn_count,
       synced_min_seq: next.synced_min_seq,
       synced_max_seq: next.synced_max_seq,
+      latest_contiguous_min_seq: next.latest_contiguous_min_seq,
       synced_window_hash: "",
       has_older_turns: mergedHasOlderTurns(session, session, 0, {
         persistedTurnCount: next.synced_turn_count,
@@ -4207,8 +4234,10 @@ async function repairPrunedTurnSessions(store, user, device, prunedSessions = []
           })
         : "catalog_only",
       synced_turn_count: stats.count,
+      actual_turn_count: stats.count,
       synced_min_seq: Number(stats.min_seq ?? 0) || 0,
       synced_max_seq: Number(stats.max_seq ?? 0) || 0,
+      latest_contiguous_min_seq: Number(stats.latest_contiguous_min_seq ?? stats.min_seq ?? 0) || 0,
       synced_window_hash: "",
       has_older_turns: hasRetainedTurns
         ? mergedHasOlderTurns(existing, existing, 0, {
@@ -4236,8 +4265,20 @@ async function repairPrunedTurnSessions(store, user, device, prunedSessions = []
 
 function sessionNeedsStatsRepair(session, next) {
   return Number(session.synced_turn_count ?? 0) !== Number(next.synced_turn_count ?? 0) ||
+    Number(session.actual_turn_count ?? session.synced_turn_count ?? 0) !== Number(next.actual_turn_count ?? next.synced_turn_count ?? 0) ||
     Number(session.synced_min_seq ?? 0) !== Number(next.synced_min_seq ?? 0) ||
-    Number(session.synced_max_seq ?? 0) !== Number(next.synced_max_seq ?? 0);
+    Number(session.synced_max_seq ?? 0) !== Number(next.synced_max_seq ?? 0) ||
+    Number(session.latest_contiguous_min_seq ?? session.synced_min_seq ?? 0) !== Number(next.latest_contiguous_min_seq ?? next.synced_min_seq ?? 0);
+}
+
+function sessionHasMaterializedTurnStats(session) {
+  const actual = Number(session?.actual_turn_count ?? 0) || 0;
+  const synced = Number(session?.synced_turn_count ?? 0) || 0;
+  const minSeq = Number(session?.synced_min_seq ?? 0) || 0;
+  const maxSeq = Number(session?.synced_max_seq ?? 0) || 0;
+  const contiguousMin = Number(session?.latest_contiguous_min_seq ?? 0) || 0;
+  if (synced === 0 && actual === 0 && minSeq === 0 && maxSeq === 0) return true;
+  return actual > 0 && maxSeq > 0 && contiguousMin > 0;
 }
 
 function sessionSyncHintPayload(session, fallbackSessionID = "") {

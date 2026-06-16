@@ -28,13 +28,13 @@ function execMigration(db, sql) {
   try {
     db.exec(sql);
   } catch (error) {
-    if (isDuplicateSessionWindowHashColumn(sql, error)) return;
+    if (isDuplicateSessionAddColumn(sql, error)) return;
     throw error;
   }
 }
 
-function isDuplicateSessionWindowHashColumn(sql, error) {
-  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+synced_window_hash\b/i.test(sql) &&
+function isDuplicateSessionAddColumn(sql, error) {
+  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+\w+\b/i.test(sql) &&
     /duplicate column name/i.test(String(error?.message || error));
 }
 

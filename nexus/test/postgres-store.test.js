@@ -47,11 +47,15 @@ describe("Node production Postgres Nexus store adapter", () => {
     assert.equal(client.closed, true);
   });
 
-  it("allows replaying the session window hash migration", async () => {
-    const client = new FakePostgresClient({ duplicateWindowHashColumn: true });
+  it("allows replaying session add-column migrations", async () => {
+    const client = new FakePostgresClient({ duplicateSessionAddColumns: true });
     const store = await createPostgresNexusStore({ client });
     assert.equal(
       client.queries.some((query) => query.sql.includes("ALTER TABLE sessions ADD COLUMN synced_window_hash")),
+      true,
+    );
+    assert.equal(
+      client.queries.some((query) => query.sql.includes("ALTER TABLE sessions ADD COLUMN actual_turn_count")),
       true,
     );
     await store.close();
@@ -141,13 +145,14 @@ class FakePostgresClient {
     this.queries = [];
     this.usersByEmail = new Map();
     this.closed = false;
-    this.duplicateWindowHashColumn = Boolean(options.duplicateWindowHashColumn);
+    this.duplicateSessionAddColumns = Boolean(options.duplicateSessionAddColumns);
   }
 
   async query(sql, values = []) {
     this.queries.push({ sql, values });
-    if (this.duplicateWindowHashColumn && sql.includes("ALTER TABLE sessions ADD COLUMN synced_window_hash")) {
-      const error = new Error('column "synced_window_hash" of relation "sessions" already exists');
+    if (this.duplicateSessionAddColumns && sql.includes("ALTER TABLE sessions ADD COLUMN")) {
+      const column = sql.match(/ADD COLUMN\s+(\w+)/i)?.[1] || "unknown";
+      const error = new Error(`column "${column}" of relation "sessions" already exists`);
       error.code = "42701";
       throw error;
     }

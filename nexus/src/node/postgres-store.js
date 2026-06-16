@@ -28,14 +28,14 @@ async function execMigration(client, sql) {
   try {
     await client.query(sql);
   } catch (error) {
-    if (isDuplicateSessionWindowHashColumn(sql, error)) return;
+    if (isDuplicateSessionAddColumn(sql, error)) return;
     throw error;
   }
 }
 
-function isDuplicateSessionWindowHashColumn(sql, error) {
-  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+synced_window_hash\b/i.test(sql) &&
-    (error?.code === "42701" || /column .*synced_window_hash.* already exists|duplicate column/i.test(String(error?.message || error)));
+function isDuplicateSessionAddColumn(sql, error) {
+  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+\w+\b/i.test(sql) &&
+    (error?.code === "42701" || /column .+ already exists|duplicate column/i.test(String(error?.message || error)));
 }
 
 export class PostgresStatementAdapter {

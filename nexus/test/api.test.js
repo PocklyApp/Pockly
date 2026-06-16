@@ -495,6 +495,61 @@ describe("Nexus api", () => {
     assert.equal(store.counts.listTurns, 0);
   });
 
+  it("serves hot-window reads with materialized turn stats instead of repair scans", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({
+      store,
+      extra: {
+        POCKLY_HOT_TURNS_PER_SESSION: "200",
+        POCKLY_HOT_TURNS_PER_USER: "1000",
+      },
+    });
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const turns = Array.from({ length: 150 }, (_, index) => ({
+      session_id: "sess_materialized_stats",
+      seq: index + 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: new Date(Date.UTC(2026, 5, 6, 5, 0, index % 60)).toISOString(),
+      payload: { text: `turn ${index + 1}` },
+    }));
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_materialized_stats",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "materialized stats",
+        last_seq: 150,
+        last_timestamp: "2026-06-06T05:02:30.000Z",
+        turn_count: 150,
+        min_seq: 1,
+        max_seq: 150,
+      }],
+      turns,
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+
+    store.resetCounts();
+    const response = await call(env, "GET", `/api/sessions/sess_materialized_stats/turns?device_id=${daemon.daemon_device_id}&limit=20`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.turns.map((turn) => turn.seq), Array.from({ length: 20 }, (_, index) => 131 + index));
+    assert.equal(body.synced_turn_count, 150);
+    assert.equal(body.synced_min_seq, 1);
+    assert.equal(body.synced_max_seq, 150);
+    assert.equal(store.counts.getSession, 1);
+    assert.equal(store.counts.getSessionTurnStats, 0);
+    assert.equal(store.counts.listTurns, 1);
+    assert.equal(store.counts.upsertSessionRows, 0);
+  });
+
   it("keeps only bounded hot turns per session in remote storage", async () => {
     const env = testEnv({
       extra: {
@@ -4683,6 +4738,76 @@ describe("Nexus api", () => {
     const session = (await listed.json()).sessions.find((item) => item.session_id === "sess_noncontiguous");
     assert.equal(session.has_older_turns, true);
     assert.equal(session.sync_state, "partial");
+  });
+
+  it("keeps the newest contiguous cursor when appending after non-contiguous older history", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const keys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, keys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const auth = { authorization: `Bearer ${browser.device_access_token}` };
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+
+    const syncWindow = async (min, max, total = 260) => {
+      const turns = [];
+      for (let seq = min; seq <= max; seq += 1) {
+        turns.push({
+          session_id: "sess_noncontiguous_append",
+          seq,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: `2026-06-06T08:${String(seq % 60).padStart(2, "0")}:00.000Z`,
+          payload: { text: `turn ${seq}` },
+        });
+      }
+      const res = await call(env, "POST", "/api/daemon/sync", {
+        hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+        sessions: [{
+          session_id: "sess_noncontiguous_append",
+          agent: "claude-code",
+          cwd: "/work/app",
+          snippet: "gap append",
+          last_seq: total,
+          last_timestamp: "2026-06-06T08:59:00.000Z",
+          sync_state: "partial",
+          turn_count: total,
+          min_seq: min,
+          max_seq: max,
+          has_older: true,
+        }],
+        turns,
+      }, daemonAuth);
+      assert.equal(res.status, 200);
+    };
+
+    await syncWindow(141, 240, 260);
+    const existing = await store.getSession("usr_test", daemon.daemon_device_id, "sess_noncontiguous_append");
+    await store.upsertSession({
+      ...existing,
+      synced_turn_count: 140,
+      actual_turn_count: 140,
+      synced_min_seq: 1,
+      synced_max_seq: 240,
+      latest_contiguous_min_seq: 141,
+      has_older_turns: true,
+    });
+    await syncWindow(241, 260, 260);
+
+    const opened = await call(env, "POST", "/api/sessions/sess_noncontiguous_append/opened", {
+      device_id: daemon.daemon_device_id,
+    }, auth);
+    assert.equal(opened.status, 200);
+
+    const hints = await call(env, "GET", "/api/daemon/sync-hints", null, daemonAuth);
+    assert.equal(hints.status, 200);
+    const body = await hints.json();
+    assert.equal(body.sessions[0].synced_turn_count, 160);
+    assert.equal(body.sessions[0].synced_min_seq, 1);
+    assert.equal(body.sessions[0].synced_max_seq, 260);
+    assert.equal(body.sessions[0].latest_contiguous_min_seq, 141);
+    assert.equal(body.sessions[0].next_before_seq, 141);
   });
 
   it("does not persist older backfill windows into the durable hot-turn cache", async () => {
