@@ -1433,9 +1433,9 @@ func TestCatalogSyncSignatureIgnoresHelloButTracksCatalogChanges(t *testing.T) {
 	}
 	changedCatalog := req
 	changedCatalog.Sessions = append([]pair.SyncSession{}, req.Sessions...)
-	changedCatalog.Sessions[0].LastSeq = 2
+	changedCatalog.Sessions[0].Cwd = "/work/renamed"
 	if catalogSyncSignature(req) == catalogSyncSignature(changedCatalog) {
-		t.Fatal("catalog signature must change when session metadata changes")
+		t.Fatal("catalog signature must change when stable session metadata changes")
 	}
 	changedTitle := req
 	changedTitle.Sessions = append([]pair.SyncSession{}, req.Sessions...)
@@ -1628,6 +1628,42 @@ func TestServePollingDefaultsUseLowCostCadence(t *testing.T) {
 	}
 }
 
+func TestCatalogSyncSignatureIgnoresVolatileTurnFields(t *testing.T) {
+	base := pair.SyncRequest{
+		FullReconcile: true,
+		Sessions: []pair.SyncSession{{
+			SessionID:         "sid-1",
+			Agent:             "claude-code",
+			RunnerAlias:       "claude",
+			Cwd:               "/repo",
+			Title:             "First prompt",
+			Snippet:           "First prompt",
+			FirstMessage:      "First prompt",
+			LastSeq:           10,
+			LastTimestamp:     "2026-06-16T07:00:00Z",
+			ChannelLastSeenAt: "2026-06-16T07:00:00Z",
+			TurnCount:         10,
+			SyncState:         "catalog_only",
+		}},
+	}
+	changedTurns := base
+	changedTurns.Sessions = append([]pair.SyncSession(nil), base.Sessions...)
+	changedTurns.Sessions[0].LastSeq = 45
+	changedTurns.Sessions[0].TurnCount = 45
+	changedTurns.Sessions[0].LastTimestamp = "2026-06-16T07:05:00Z"
+	changedTurns.Sessions[0].ChannelLastSeenAt = "2026-06-16T07:05:00Z"
+	if got, want := catalogSyncSignature(changedTurns), catalogSyncSignature(base); got != want {
+		t.Fatalf("catalogSyncSignature changed for volatile turn fields\n got: %q\nwant: %q", got, want)
+	}
+
+	changedTitle := base
+	changedTitle.Sessions = append([]pair.SyncSession(nil), base.Sessions...)
+	changedTitle.Sessions[0].Title = "Renamed"
+	if got, want := catalogSyncSignature(changedTitle), catalogSyncSignature(base); got == want {
+		t.Fatalf("catalogSyncSignature did not change for title update: %q", got)
+	}
+}
+
 func TestRecentNexusSessionsSkipsPassiveHistoryByDefault(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	sessions := []pair.SyncSession{
@@ -1639,6 +1675,27 @@ func TestRecentNexusSessionsSkipsPassiveHistoryByDefault(t *testing.T) {
 	got := recentNexusSessions(sessions, 0, nexusSyncPolicy{ProactiveHistorySync: false, SyncWindowDays: 0, InitialTurnLimit: 20, PriorityTurnLimit: 100}, nil, now)
 	if len(got) != 1 || got[0].SessionID != "active" {
 		t.Fatalf("recentNexusSessions = %+v, want only active session when proactive history sync is disabled", got)
+	}
+}
+
+func TestRecentNexusSessionsDoesNotCapPrioritySessions(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	sessions := make([]pair.SyncSession, 0, maxNexusHistorySessionsPerTick+3)
+	for i := 0; i < maxNexusHistorySessionsPerTick+3; i++ {
+		sessions = append(sessions, pair.SyncSession{
+			SessionID:     fmt.Sprintf("active-%02d", i),
+			LastTimestamp: now.Add(-time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+
+	got := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, nexusSyncPolicy{
+		ProactiveHistorySync: false,
+		SyncWindowDays:       0,
+		InitialTurnLimit:     20,
+		PriorityTurnLimit:    100,
+	}, nil, now)
+	if len(got) != len(sessions) {
+		t.Fatalf("recentNexusSessions capped priority sessions: got %d, want %d", len(got), len(sessions))
 	}
 }
 

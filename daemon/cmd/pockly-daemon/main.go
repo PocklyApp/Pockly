@@ -2776,7 +2776,11 @@ func candidateSessionIDs(sessions []pair.SyncSession) []string {
 }
 
 func knownWindowSessionIDsForCatalog(sessions []pair.SyncSession, policy nexusSyncPolicy, hints map[string]syncHint, now time.Time) []string {
-	return candidateSessionIDs(recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now))
+	ids := candidateSessionIDs(recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now))
+	if len(ids) > maxNexusHistorySessionsPerTick {
+		return ids[:maxNexusHistorySessionsPerTick]
+	}
+	return ids
 }
 
 func knownWindowHintsFromSyncResponse(res pair.SyncResponse) map[string]syncHint {
@@ -3098,6 +3102,20 @@ func recentNexusSessions(sessions []pair.SyncSession, max int, policy nexusSyncP
 		return candidates[i].LastTimestamp > candidates[j].LastTimestamp
 	})
 	if max > 0 && len(candidates) > max {
+		priorityCount := 0
+		for _, candidate := range candidates {
+			if !sessionSyncPriority(candidate, hints, now) {
+				break
+			}
+			priorityCount++
+		}
+		// The cap protects proactive history backfill cost. It must not
+		// starve active or explicitly opened sessions, otherwise the web
+		// reader can stop receiving hot-window updates while many sessions are
+		// active at once.
+		if priorityCount > max {
+			return candidates[:priorityCount]
+		}
 		return candidates[:max]
 	}
 	return candidates
@@ -3215,15 +3233,16 @@ func defaultAgent(v string) string {
 }
 
 func nexusSessionSyncSignature(session pair.SyncSession) string {
-	if session.LastTimestamp == "" {
-		return ""
-	}
+	// Catalog pushes are the sidebar/device catalog path. Volatile turn fields
+	// are synced through the bounded per-session window path; including them
+	// here makes active sessions force catalog POSTs every heartbeat.
 	return strings.Join([]string{
 		session.Agent,
 		session.RunnerAlias,
 		session.Cwd,
-		session.LastTimestamp,
-		session.ChannelLastSeenAt,
+		session.Title,
+		session.Snippet,
+		session.FirstMessage,
 	}, "\x00")
 }
 
@@ -3239,11 +3258,6 @@ func catalogSyncSignature(req pair.SyncRequest) string {
 		parts = append(parts,
 			session.SessionID,
 			nexusSessionSyncSignature(session),
-			session.Title,
-			session.Snippet,
-			session.FirstMessage,
-			strconv.Itoa(session.LastSeq),
-			strconv.Itoa(session.TurnCount),
 			session.SyncState,
 		)
 	}
