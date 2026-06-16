@@ -16,12 +16,26 @@ export async function createPostgresNexusStore(options = {}) {
   });
   if (!client) throw new Error("Postgres client required");
   if (options.migrate !== false) {
-    for (const sql of readMigrationSQLFiles()) await client.query(sql);
+    for (const sql of readMigrationSQLFiles()) await execMigration(client, sql);
   }
   const store = new SQLNexusStore(new PostgresStatementAdapter(client));
   store.databaseURL = redactDatabaseURL(options.connectionString || process.env.POCKLY_NEXUS_DATABASE_URL || process.env.DATABASE_URL || "");
   store.close = typeof client.end === "function" ? () => client.end() : () => Promise.resolve();
   return store;
+}
+
+async function execMigration(client, sql) {
+  try {
+    await client.query(sql);
+  } catch (error) {
+    if (isDuplicateSessionWindowHashColumn(sql, error)) return;
+    throw error;
+  }
+}
+
+function isDuplicateSessionWindowHashColumn(sql, error) {
+  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+synced_window_hash\b/i.test(sql) &&
+    (error?.code === "42701" || /column .*synced_window_hash.* already exists|duplicate column/i.test(String(error?.message || error)));
 }
 
 export class PostgresStatementAdapter {

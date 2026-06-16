@@ -1210,10 +1210,10 @@ export class SQLNexusStore {
         user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
         snippet, first_message, title, last_seq, last_timestamp,
         channel_last_seen_at, sync_state, turn_count, last_sync_error,
-        synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+        synced_turn_count, synced_min_seq, synced_max_seq, synced_window_hash, has_older_turns,
         updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, device_id, session_id) DO UPDATE SET
         computer_id = excluded.computer_id,
         agent = excluded.agent,
@@ -1231,6 +1231,7 @@ export class SQLNexusStore {
         synced_turn_count = excluded.synced_turn_count,
         synced_min_seq = excluded.synced_min_seq,
         synced_max_seq = excluded.synced_max_seq,
+        synced_window_hash = excluded.synced_window_hash,
         has_older_turns = excluded.has_older_turns,
         updated_at = excluded.updated_at
       WHERE
@@ -1250,6 +1251,7 @@ export class SQLNexusStore {
         sessions.synced_turn_count IS DISTINCT FROM excluded.synced_turn_count OR
         sessions.synced_min_seq IS DISTINCT FROM excluded.synced_min_seq OR
         sessions.synced_max_seq IS DISTINCT FROM excluded.synced_max_seq OR
+        sessions.synced_window_hash IS DISTINCT FROM excluded.synced_window_hash OR
         sessions.has_older_turns IS DISTINCT FROM excluded.has_older_turns
     `).bind(
       session.user_id,
@@ -1271,6 +1273,7 @@ export class SQLNexusStore {
       session.synced_turn_count ?? 0,
       session.synced_min_seq ?? 0,
       session.synced_max_seq ?? 0,
+      session.synced_window_hash ?? "",
       session.has_older_turns ? 1 : 0,
       session.updated_at,
     );
@@ -1285,7 +1288,7 @@ export class SQLNexusStore {
     const deduped = dedupeSessionRows(sessions);
     if (!deduped.length) return;
     // The default keeps the batch below SQLite's conservative 999
-    // bind-parameter floor: sessions has 21 columns, so 40 rows => 840
+    // bind-parameter floor: sessions has 22 columns, so 40 rows => 880
     // parameters. Runtime adapters with stricter limits can lower this via
     // the constructor without changing the sync path.
     const CHUNK = this.sessionUpsertBatchSize;
@@ -1297,14 +1300,14 @@ export class SQLNexusStore {
   _upsertSessionsStatement(sessions) {
     if (sessions.length === 1) return this._upsertSessionStatement(sessions[0]);
     const placeholders = sessions
-      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .join(", ");
     return this.db.prepare(`
       INSERT INTO sessions (
         user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
         snippet, first_message, title, last_seq, last_timestamp,
         channel_last_seen_at, sync_state, turn_count, last_sync_error,
-        synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+        synced_turn_count, synced_min_seq, synced_max_seq, synced_window_hash, has_older_turns,
         updated_at
       )
       VALUES ${placeholders}
@@ -1325,6 +1328,7 @@ export class SQLNexusStore {
         synced_turn_count = excluded.synced_turn_count,
         synced_min_seq = excluded.synced_min_seq,
         synced_max_seq = excluded.synced_max_seq,
+        synced_window_hash = excluded.synced_window_hash,
         has_older_turns = excluded.has_older_turns,
         updated_at = excluded.updated_at
       WHERE
@@ -1344,6 +1348,7 @@ export class SQLNexusStore {
         sessions.synced_turn_count IS DISTINCT FROM excluded.synced_turn_count OR
         sessions.synced_min_seq IS DISTINCT FROM excluded.synced_min_seq OR
         sessions.synced_max_seq IS DISTINCT FROM excluded.synced_max_seq OR
+        sessions.synced_window_hash IS DISTINCT FROM excluded.synced_window_hash OR
         sessions.has_older_turns IS DISTINCT FROM excluded.has_older_turns
     `).bind(...sessions.flatMap(sessionUpsertValues));
   }
@@ -1513,7 +1518,7 @@ export class SQLNexusStore {
         user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
         snippet, first_message, title, last_seq, last_timestamp,
         channel_last_seen_at, sync_state, turn_count, last_sync_error,
-        synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+        synced_turn_count, synced_min_seq, synced_max_seq, synced_window_hash, has_older_turns,
         updated_at
       FROM sessions
       WHERE user_id = ? AND device_id = ?
@@ -1535,7 +1540,7 @@ export class SQLNexusStore {
           user_id, computer_id, device_id, session_id, agent, runner_alias, cwd,
           snippet, first_message, title, last_seq, last_timestamp,
           channel_last_seen_at, sync_state, turn_count, last_sync_error,
-          synced_turn_count, synced_min_seq, synced_max_seq, has_older_turns,
+          synced_turn_count, synced_min_seq, synced_max_seq, synced_window_hash, has_older_turns,
           updated_at
         FROM sessions
         WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
@@ -1549,7 +1554,7 @@ export class SQLNexusStore {
     const result = await this.db.prepare(`
       SELECT
         user_id, device_id, session_id, turn_count, synced_turn_count,
-        synced_min_seq, synced_max_seq, has_older_turns
+        synced_min_seq, synced_max_seq, synced_window_hash, has_older_turns
       FROM sessions
       WHERE user_id = ? AND device_id = ?
     `).bind(userID, deviceID).all();
@@ -2579,6 +2584,7 @@ function normalizeDeviceRow(row) {
 function normalizeSessionRow(row) {
   return {
     ...row,
+    synced_window_hash: row.synced_window_hash ?? "",
     has_older_turns: Boolean(row.has_older_turns),
   };
 }
@@ -2643,6 +2649,7 @@ function sessionUpsertValues(session) {
     session.synced_turn_count ?? 0,
     session.synced_min_seq ?? 0,
     session.synced_max_seq ?? 0,
+    session.synced_window_hash ?? "",
     session.has_older_turns ? 1 : 0,
     session.updated_at,
   ];

@@ -1183,6 +1183,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   timings.mark("load_existing_sessions");
   let sessionFastPathCount = 0;
   const changedSessionRecords = [];
+  const catalogChangedSessionRecords = [];
   const currentSessionRecords = [];
   for (const session of sessions) {
     const sessionID = String(session.session_id);
@@ -1207,21 +1208,26 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       durableSession,
     );
     currentSessionRecords.push(record);
-    if (!sessionMatchesExisting(record, existing)) changedSessionRecords.push(record);
+    if (!sessionMatchesExisting(record, existing)) {
+      changedSessionRecords.push(record);
+      if (!sessionCatalogMatchesExisting(record, existing)) catalogChangedSessionRecords.push(record);
+    }
   }
   timings.mark("build_session_records");
   const changedSessionCount = changedSessionRecords.length;
   timings.mark("filter_unchanged_sessions");
   if (changedSessionCount > 0) {
     await store.upsertSessions(changedSessionRecords);
-    await appendSessionCatalogChanges(store, changedSessionRecords.map((session) => ({
-      type: "upsert",
-      user_id: user.user_id,
-      device_id: session.device_id,
-      session_id: session.session_id,
-      session,
-      at: now,
-    })));
+    if (catalogChangedSessionRecords.length > 0) {
+      await appendSessionCatalogChanges(store, catalogChangedSessionRecords.map((session) => ({
+        type: "upsert",
+        user_id: user.user_id,
+        device_id: session.device_id,
+        session_id: session.session_id,
+        session,
+        at: now,
+      })));
+    }
   }
   await deleteSessionOpenHintsBestEffort(store, user.user_id, device.device_id, openedBackfillSessionIDs);
   const repairedPrunedSessions = await repairPrunedTurnSessions(
@@ -1467,6 +1473,31 @@ function sessionMatchesExisting(session, existing) {
     ["synced_turn_count", numberValue],
     ["synced_min_seq", numberValue],
     ["synced_max_seq", numberValue],
+    ["synced_window_hash", stringOrEmpty],
+    ["has_older_turns", boolIntValue],
+  ];
+  return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
+}
+
+function sessionCatalogMatchesExisting(session, existing) {
+  if (!existing) return false;
+  const checks = [
+    ["computer_id", stringOrNull],
+    ["agent", stringOrEmpty],
+    ["runner_alias", stringOrNull],
+    ["cwd", stringOrEmpty],
+    ["snippet", stringOrEmpty],
+    ["first_message", stringOrEmpty],
+    ["title", stringOrNull],
+    ["last_seq", numberValue],
+    ["last_timestamp", stringOrNull],
+    ["channel_last_seen_at", stringOrNull],
+    ["sync_state", stringOrNull],
+    ["turn_count", numberValue],
+    ["last_sync_error", stringOrNull],
+    ["synced_turn_count", numberValue],
+    ["synced_min_seq", numberValue],
+    ["synced_max_seq", numberValue],
     ["has_older_turns", boolIntValue],
   ];
   return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
@@ -1478,6 +1509,20 @@ function unchangedCatalogSession(device, session, existing, changedTurnStats, du
   if (!durableSession) return true;
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
   const lastTimestamp = session.last_timestamp || "";
+  const windowHash = String(session.window_hash || "");
+  const minSeq = Number(session.min_seq ?? 0) || 0;
+  if (
+    windowHash &&
+    minSeq > 0 &&
+    maxSeq >= minSeq &&
+    (
+      String(existing.synced_window_hash || "") !== windowHash ||
+      Number(existing.synced_min_seq ?? 0) !== minSeq ||
+      Number(existing.synced_max_seq ?? 0) !== maxSeq
+    )
+  ) {
+    return false;
+  }
   const expected = {
     computer_id: device.computer_id ?? null,
     agent: session.agent || "claude-code",
@@ -3955,6 +4000,7 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
   const syncedMaxSeq = stats
     ? uploadedSyncedMaxSeq
     : Number(existing?.synced_max_seq ?? 0) || 0;
+  const syncedWindowHash = syncedWindowHashForSession(session, stats, syncedMinSeq, syncedMaxSeq, existing, durableTail);
   const preserveExisting = !durableTail && existing;
   return {
     user_id: user.user_id,
@@ -3984,6 +4030,7 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
     synced_turn_count: persistedTurnCount,
     synced_min_seq: syncedMinSeq,
     synced_max_seq: syncedMaxSeq,
+    synced_window_hash: syncedWindowHash,
     has_older_turns: durableTail
       ? mergedHasOlderTurns(existing, session, uploadedTurnCount, {
           persistedTurnCount,
@@ -3993,6 +4040,20 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
       : Boolean(existing?.has_older_turns),
     updated_at: durableTail || !existing ? (session.last_timestamp || now) : (existing.updated_at || now),
   };
+}
+
+function syncedWindowHashForSession(session, stats, syncedMinSeq, syncedMaxSeq, existing = null, durableTail = true) {
+  if (!durableTail) return existing?.synced_window_hash || "";
+  const windowHash = String(session?.window_hash || "");
+  const windowMinSeq = Number(session?.min_seq ?? 0) || 0;
+  const windowMaxSeq = Number(session?.max_seq ?? session?.last_seq ?? 0) || 0;
+  if (windowHash && windowMinSeq > 0 && windowMaxSeq >= windowMinSeq && syncedMinSeq === windowMinSeq && syncedMaxSeq === windowMaxSeq) {
+    return windowHash;
+  }
+  if (!stats && syncedMinSeq === Number(existing?.synced_min_seq ?? 0) && syncedMaxSeq === Number(existing?.synced_max_seq ?? 0)) {
+    return existing?.synced_window_hash || "";
+  }
+  return "";
 }
 
 async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnStats, changedTurnStats) {
@@ -4112,6 +4173,7 @@ async function sessionWithTurnStats(store, userID, deviceID, sessionID, options 
       synced_turn_count: next.synced_turn_count,
       synced_min_seq: next.synced_min_seq,
       synced_max_seq: next.synced_max_seq,
+      synced_window_hash: "",
       has_older_turns: mergedHasOlderTurns(session, session, 0, {
         persistedTurnCount: next.synced_turn_count,
         syncedMinSeq: next.synced_min_seq,
@@ -4147,6 +4209,7 @@ async function repairPrunedTurnSessions(store, user, device, prunedSessions = []
       synced_turn_count: stats.count,
       synced_min_seq: Number(stats.min_seq ?? 0) || 0,
       synced_max_seq: Number(stats.max_seq ?? 0) || 0,
+      synced_window_hash: "",
       has_older_turns: hasRetainedTurns
         ? mergedHasOlderTurns(existing, existing, 0, {
             persistedTurnCount: stats.count,
@@ -4205,6 +4268,8 @@ function sessionSyncHintPayload(session, fallbackSessionID = "") {
 }
 
 async function sessionWindowHash(store, userID, deviceID, sessionID, session) {
+  const stored = storedWindowHash(session);
+  if (stored) return stored;
   if (typeof store.listTurnPayloadsForWindow !== "function") return "";
   const minSeq = Number(session?.synced_min_seq ?? 0) || 0;
   const maxSeq = Number(session?.synced_max_seq ?? 0) || 0;
@@ -4216,14 +4281,29 @@ async function sessionWindowHash(store, userID, deviceID, sessionID, session) {
 }
 
 async function knownSessionWindows(store, userID, deviceID, sessions = []) {
-  if (typeof store.listTurnPayloadPointers !== "function") return [];
   const candidates = sessions
     .map((session) => knownWindowCandidate(session))
     .filter(Boolean);
   if (!candidates.length) return [];
-  const bySessionID = new Map(candidates.map((candidate) => [candidate.session_id, candidate]));
+  const out = [];
+  const unresolved = [];
+  for (const candidate of candidates) {
+    if (candidate.window_hash) {
+      out.push({
+        session_id: candidate.session_id,
+        synced_min_seq: candidate.synced_min_seq,
+        synced_max_seq: candidate.synced_max_seq,
+        synced_turn_count: candidate.synced_turn_count,
+        window_hash: candidate.window_hash,
+      });
+    } else {
+      unresolved.push(candidate);
+    }
+  }
+  if (!unresolved.length || typeof store.listTurnPayloadPointers !== "function") return out;
+  const bySessionID = new Map(unresolved.map((candidate) => [candidate.session_id, candidate]));
   const turnsBySessionID = new Map();
-  for (const turn of await store.listTurnPayloadPointers(userID, deviceID, candidates.map((candidate) => candidate.session_id))) {
+  for (const turn of await store.listTurnPayloadPointers(userID, deviceID, unresolved.map((candidate) => candidate.session_id))) {
     const candidate = bySessionID.get(String(turn.session_id || ""));
     if (!candidate) continue;
     const seq = Number(turn.seq ?? 0) || 0;
@@ -4232,8 +4312,7 @@ async function knownSessionWindows(store, userID, deviceID, sessions = []) {
     turns.push(turn);
     turnsBySessionID.set(candidate.session_id, turns);
   }
-  const out = [];
-  for (const candidate of candidates) {
+  for (const candidate of unresolved) {
     const turns = latestContiguousTurnTail(turnsBySessionID.get(candidate.session_id) || [], candidate.synced_max_seq);
     if (!turns.length) continue;
     out.push({
@@ -4277,7 +4356,18 @@ function knownWindowCandidate(session) {
     synced_min_seq: minSeq,
     synced_max_seq: maxSeq,
     synced_turn_count: count,
+    window_hash: storedWindowHash(session),
   };
+}
+
+function storedWindowHash(session) {
+  const hash = String(session?.synced_window_hash || "");
+  if (!hash) return "";
+  const minSeq = Number(session?.synced_min_seq ?? 0) || 0;
+  const maxSeq = Number(session?.synced_max_seq ?? 0) || 0;
+  const count = Number(session?.synced_turn_count ?? 0) || 0;
+  if (minSeq <= 0 || maxSeq < minSeq || count < maxSeq - minSeq + 1) return "";
+  return hash;
 }
 
 async function turnWindowHash(turns) {

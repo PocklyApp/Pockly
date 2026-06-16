@@ -656,6 +656,7 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenHintWindowHashMatches(t *testing
 			TurnCount:         meta.TurnCount,
 		}},
 		map[string]string{},
+		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		hints.Snapshot(now),
 		hints,
@@ -736,6 +737,7 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenKnownWindowHashMatches(t *testin
 			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
 			TurnCount:         meta.TurnCount,
 		}},
+		map[string]string{},
 		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		nil,
@@ -824,6 +826,7 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenKnownServerTailCoversLocalWindow
 			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
 			TurnCount:         meta.TurnCount,
 		}},
+		map[string]string{},
 		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		nil,
@@ -959,6 +962,7 @@ func TestDaemonRestartKnownWindowProbeAvoidsWindowReupload(t *testing.T) {
 		idx,
 		candidates,
 		lastHistorySync,
+		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		hints,
 		newPushedHintStore(),
@@ -1044,6 +1048,7 @@ func TestSyncChangedNexusSessionsSkipsRepeatedHintedWindowWhenLocalSignatureMatc
 			TurnCount:         meta.TurnCount,
 		}},
 		lastHistorySync,
+		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		map[string]syncHint{
 			sessionID: {Reason: "recently_opened", PreferredMin: 20},
@@ -1137,6 +1142,7 @@ func TestSyncChangedNexusSessionsUploadsFirstHintedWindowWithoutLocalSignature(t
 			TurnCount:         meta.TurnCount,
 		}},
 		lastHistorySync,
+		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		map[string]syncHint{
 			sessionID: {Reason: "recently_opened", PreferredMin: 20},
@@ -1154,6 +1160,53 @@ func TestSyncChangedNexusSessionsUploadsFirstHintedWindowWithoutLocalSignature(t
 	}
 	if lastHistorySync[sessionID] == "" {
 		t.Fatal("first hinted upload should seed local history signature")
+	}
+}
+
+func TestSyncChangedNexusSessionsSkipsWindowBuildWhenCandidateMetadataUnchanged(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "metadata skip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	idx := index.New(index.Config{})
+	now := time.Now().UTC().Format(time.RFC3339)
+	candidate := pair.SyncSession{
+		SessionID:         "sess_meta_skip",
+		Agent:             "claude-code",
+		RunnerAlias:       "claude",
+		Cwd:               "work",
+		LastTimestamp:     now,
+		ChannelLastSeenAt: now,
+		TurnCount:         20,
+	}
+	lastHistorySync := map[string]string{candidate.SessionID: "already-confirmed"}
+	lastWindowMeta := map[string]string{
+		candidate.SessionID: historyCandidateMetaSignature(candidate, defaultInitialTurnLimit, 0),
+	}
+	lastWindowPushAt := map[string]time.Time{}
+
+	result := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient("http://127.0.0.1:1"),
+		identity,
+		idx,
+		[]pair.SyncSession{candidate},
+		lastHistorySync,
+		lastWindowMeta,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		nil,
+		newPushedHintStore(),
+		nil,
+		lastWindowPushAt,
+		0,
+	)
+	if result.Sessions != 0 || result.Turns != 0 || result.ReceivedTurns != 0 {
+		t.Fatalf("synced = %+v, want zero", result)
+	}
+	if lastWindowPushAt[candidate.SessionID].IsZero() {
+		t.Fatal("metadata skip should update the window floor without building the session window")
 	}
 }
 
@@ -1229,6 +1282,7 @@ func TestSyncChangedNexusSessionsUploadsOnlyNewTailWhenServerWindowOverlaps(t *t
 			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
 			TurnCount:         meta.TurnCount,
 		}},
+		map[string]string{},
 		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		nil,
@@ -1322,6 +1376,7 @@ func TestSyncChangedNexusSessionsIgnoresBackfillCursorForAutomaticHotSync(t *tes
 			ChannelLastSeenAt: time.Now().UTC().Format(time.RFC3339),
 			TurnCount:         meta.TurnCount,
 		}},
+		map[string]string{},
 		map[string]string{},
 		runner.Profile{ClaudeAlias: runner.AliasClaude},
 		map[string]syncHint{

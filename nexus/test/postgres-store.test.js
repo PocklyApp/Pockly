@@ -47,6 +47,16 @@ describe("Node production Postgres Nexus store adapter", () => {
     assert.equal(client.closed, true);
   });
 
+  it("allows replaying the session window hash migration", async () => {
+    const client = new FakePostgresClient({ duplicateWindowHashColumn: true });
+    const store = await createPostgresNexusStore({ client });
+    assert.equal(
+      client.queries.some((query) => query.sql.includes("ALTER TABLE sessions ADD COLUMN synced_window_hash")),
+      true,
+    );
+    await store.close();
+  });
+
   it("uses a lightweight session sync snapshot query", async () => {
     const client = new FakePostgresClient();
     const store = await createPostgresNexusStore({
@@ -127,15 +137,21 @@ describe("Node production Postgres Nexus store adapter", () => {
 });
 
 class FakePostgresClient {
-  constructor() {
+  constructor(options = {}) {
     this.queries = [];
     this.usersByEmail = new Map();
     this.closed = false;
+    this.duplicateWindowHashColumn = Boolean(options.duplicateWindowHashColumn);
   }
 
   async query(sql, values = []) {
     this.queries.push({ sql, values });
-    if (sql.includes("CREATE TABLE IF NOT EXISTS") || sql.includes("CREATE INDEX IF NOT EXISTS")) return { rows: [], rowCount: 0 };
+    if (this.duplicateWindowHashColumn && sql.includes("ALTER TABLE sessions ADD COLUMN synced_window_hash")) {
+      const error = new Error('column "synced_window_hash" of relation "sessions" already exists');
+      error.code = "42701";
+      throw error;
+    }
+    if (sql.includes("CREATE TABLE IF NOT EXISTS") || sql.includes("CREATE INDEX IF NOT EXISTS") || sql.includes("ALTER TABLE sessions ADD COLUMN")) return { rows: [], rowCount: 0 };
     if (sql.includes("INSERT INTO users")) {
       const [user_id, email, name, password_hash, created_at, updated_at] = values;
       this.usersByEmail.set(email, { user_id, email, name, password_hash, created_at, updated_at });
@@ -173,6 +189,7 @@ class FakePostgresClient {
           synced_turn_count: 0,
           synced_min_seq: 0,
           synced_max_seq: 0,
+          synced_window_hash: "",
           has_older_turns: 0,
           updated_at: "2026-06-06T00:00:00Z",
         }],

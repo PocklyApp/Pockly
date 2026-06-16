@@ -1647,6 +1647,60 @@ describe("Nexus api", () => {
     assert.equal(store.counts.listTurns, 0);
   });
 
+  it("returns stored known hot-window hashes without reading turn payloads", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const windowHash = "sha256:stored-known-window";
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      sessions: [{
+        session_id: "sess_known_window_stored",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "known",
+        last_seq: 3,
+        last_timestamp: "2026-06-06T04:03:00.000Z",
+        turn_count: 3,
+        min_seq: 1,
+        max_seq: 3,
+        window_hash: windowHash,
+      }],
+      turns: [1, 2, 3].map((seq) => ({
+        session_id: "sess_known_window_stored",
+        seq,
+        agent: "claude-code",
+        kind: "assistant_text",
+        timestamp: `2026-06-06T04:0${seq}:00.000Z`,
+        payload: { text: `turn ${seq}` },
+      })),
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+    const stored = await store.getSession("usr_test", daemon.daemon_device_id, "sess_known_window_stored");
+    assert.equal(stored.synced_window_hash, windowHash);
+    store.resetCounts();
+
+    const second = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      known_window_session_ids: ["sess_known_window_stored"],
+    }, daemonAuth);
+    assert.equal(second.status, 200);
+    const body = await second.json();
+    assert.deepEqual(body.known_windows, [{
+      session_id: "sess_known_window_stored",
+      synced_min_seq: 1,
+      synced_max_seq: 3,
+      synced_turn_count: 3,
+      window_hash: windowHash,
+    }]);
+    assert.equal(store.counts.listDeviceSessionSyncSnapshotsByIDs, 1);
+    assert.equal(store.counts.listTurnPayloadPointers, 0);
+    assert.equal(store.counts.listTurns, 0);
+  });
+
   it("returns known hot-window hashes on lightweight probe sync without session rows", async () => {
     const store = new CountingNexusStore();
     const env = testEnv({ store });

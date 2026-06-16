@@ -17,11 +17,25 @@ export function createSQLiteNexusStore(options = {}) {
   const db = new Database(databasePath);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
-  for (const sql of readMigrationSQLFiles()) db.exec(sql);
+  for (const sql of readMigrationSQLFiles()) execMigration(db, sql);
   const store = new SQLNexusStore(new SQLiteStatementAdapter(db));
   store.databasePath = databasePath;
   store.close = () => db.close();
   return store;
+}
+
+function execMigration(db, sql) {
+  try {
+    db.exec(sql);
+  } catch (error) {
+    if (isDuplicateSessionWindowHashColumn(sql, error)) return;
+    throw error;
+  }
+}
+
+function isDuplicateSessionWindowHashColumn(sql, error) {
+  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+synced_window_hash\b/i.test(sql) &&
+    /duplicate column name/i.test(String(error?.message || error));
 }
 
 export function defaultNexusDataDir() {

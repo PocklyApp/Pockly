@@ -2267,6 +2267,7 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 	var lastCatalogPushAt time.Time
 	lastCatalogMembership := ""
 	lastWindowPushAt := map[string]time.Time{}
+	lastWindowMeta := map[string]string{}
 	lastKnownWindowProbeAt := map[string]time.Time{}
 	runSync := func() {
 		if !idx.FirstScanComplete() {
@@ -2349,7 +2350,7 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		// catalog above carries metadata + snippets for every session; this
 		// only uploads the bounded turn window the web reader needs by
 		// default. Older windows are pulled through explicit lazy backfill.
-		if result := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, profile, hints, pushedHints, knownWindows, lastWindowPushAt, windowMinInterval); result.Sessions > 0 || result.Turns > 0 || result.ReceivedTurns > 0 {
+		if result := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, lastWindowMeta, profile, hints, pushedHints, knownWindows, lastWindowPushAt, windowMinInterval); result.Sessions > 0 || result.Turns > 0 || result.ReceivedTurns > 0 {
 			log.Printf("Nexus history sync ok: sessions=%d turns=%d received_turns=%d device=%s", result.Sessions, result.Turns, result.ReceivedTurns, id.DeviceID)
 		}
 		// Success telemetry is a liveness signal, not metrics: every 30 minutes
@@ -2676,7 +2677,7 @@ type historySyncResult struct {
 	ReceivedTurns int
 }
 
-func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hints map[string]syncHint, pushedHints *pushedHintStore, knownWindows map[string]syncHint, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) historySyncResult {
+func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, lastWindowMeta map[string]string, profile runner.Profile, hints map[string]syncHint, pushedHints *pushedHintStore, knownWindows map[string]syncHint, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) historySyncResult {
 	policy := defaultNexusSyncPolicy()
 	now := time.Now()
 	candidates := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now)
@@ -2699,6 +2700,11 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		if hasHint {
 			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
 		}
+		metaSignature := historyCandidateMetaSignature(session, limit, beforeSeq)
+		if !freshlyHinted && lastHistorySync[session.SessionID] != "" && lastWindowMeta[session.SessionID] == metaSignature {
+			lastWindowPushAt[session.SessionID] = now
+			continue
+		}
 		req, err := relay.BuildSingleSessionWindowSyncRequestContext(ctx, idx, id.DeviceID, session.SessionID, profile, relay.SessionWindow{Limit: limit, BeforeSeq: beforeSeq}, nil)
 		if err != nil {
 			log.Printf("Nexus history sync snapshot session=%s: %v", session.SessionID, err)
@@ -2706,6 +2712,7 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		}
 		if len(req.Turns) == 0 {
 			lastHistorySync[session.SessionID] = historySyncSignature(req)
+			lastWindowMeta[session.SessionID] = metaSignature
 			lastWindowPushAt[session.SessionID] = now
 			continue
 		}
@@ -2716,6 +2723,7 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		}
 		if shouldSkipWindowUpload(hasHint, hint, knownWindows, session.SessionID, req, lastHistorySync[session.SessionID]) {
 			lastHistorySync[session.SessionID] = signature
+			lastWindowMeta[session.SessionID] = metaSignature
 			lastWindowPushAt[session.SessionID] = now
 			if hasHint && pushedHints != nil && len(req.Sessions) > 0 {
 				pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
@@ -2725,6 +2733,7 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		req = trimKnownUploadedTurns(req, knownWindows[strings.TrimSpace(session.SessionID)])
 		if len(req.Turns) == 0 {
 			lastHistorySync[session.SessionID] = signature
+			lastWindowMeta[session.SessionID] = metaSignature
 			lastWindowPushAt[session.SessionID] = now
 			if hasHint && pushedHints != nil && len(req.Sessions) > 0 {
 				pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
@@ -2737,6 +2746,7 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 			continue
 		}
 		lastHistorySync[session.SessionID] = signature
+		lastWindowMeta[session.SessionID] = metaSignature
 		lastWindowPushAt[session.SessionID] = now
 		if pushedHints != nil && len(req.Sessions) > 0 {
 			pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
@@ -3267,6 +3277,21 @@ func historySyncSignature(req pair.SyncRequest) string {
 		)
 	}
 	return strings.Join(parts, "\x00")
+}
+
+func historyCandidateMetaSignature(session pair.SyncSession, limit, beforeSeq int) string {
+	return strings.Join([]string{
+		session.SessionID,
+		session.Agent,
+		session.RunnerAlias,
+		session.Cwd,
+		session.LastTimestamp,
+		session.ChannelLastSeenAt,
+		strconv.Itoa(session.LastSeq),
+		strconv.Itoa(session.TurnCount),
+		strconv.Itoa(limit),
+		strconv.Itoa(beforeSeq),
+	}, "\x00")
 }
 
 func promptAllow(req pair.PendingRequest) (bool, error) {
