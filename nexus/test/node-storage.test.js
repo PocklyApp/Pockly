@@ -347,6 +347,54 @@ describe("Node self-hosted Nexus storage adapters", () => {
     }
   });
 
+  it("persists batched SQL session events through the SQLite adapter", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-events-batch-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      const userID = "usr_event_batch";
+      await store.upsertUser({
+        user_id: userID,
+        email: "event-batch@example.local",
+        name: "Event Batch User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+
+      const saved = await store.appendSessionEvents([
+        {
+          event_id: "ev_batch_0002",
+          user_id: userID,
+          device_id: "dd_event_batch",
+          session_id: "sess_event_batch",
+          request_id: "inj_event_batch",
+          event_type: "inject_delta",
+          payload: { index: 2 },
+          created_at: "2026-06-06T00:00:02Z",
+        },
+        {
+          event_id: "ev_batch_0001",
+          user_id: userID,
+          device_id: "dd_event_batch",
+          session_id: "sess_event_batch",
+          request_id: "inj_event_batch",
+          event_type: "inject_started",
+          payload: JSON.stringify({ index: 1 }),
+          created_at: "2026-06-06T00:00:01Z",
+        },
+      ]);
+
+      assert.deepEqual(saved.map((event) => event.event_id), ["ev_batch_0002", "ev_batch_0001"]);
+      assert.equal(saved[0].payload, JSON.stringify({ index: 2 }));
+      const events = await store.listSessionEvents(userID, "dd_event_batch", "sess_event_batch", { limit: 10 });
+      assert.deepEqual(events.map((event) => event.event_id), ["ev_batch_0001", "ev_batch_0002"]);
+      assert.deepEqual(events.map((event) => JSON.parse(event.payload).index), [1, 2]);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("caps SQL session event cache to the newest 5000 rows per user", async () => {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-events-user-cap-"));
     const databasePath = path.join(dir, "nexus.sqlite");

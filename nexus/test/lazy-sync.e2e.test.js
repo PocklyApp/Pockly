@@ -140,7 +140,9 @@ test("lazy session sync E2E keeps old catalog visible and backfills on demand", 
     turns: buildTurns("sess_old", 141, 240, "codex"),
   }, daemonAuth);
   assert.equal(oldBackfillSync.status, 200);
-  assert.equal((await oldBackfillSync.json()).turn_count, 100);
+  const oldBackfillBody = await oldBackfillSync.json();
+  assert.equal(oldBackfillBody.turn_count, 0);
+  assert.equal(oldBackfillBody.received_turn_count, 100);
 
   const oldAfterBackfill = await call(env, "GET", `/api/sessions/sess_old/turns?device_id=${daemon.daemon_device_id}`, null, browserAuth);
   const oldAfterBackfillBody = await oldAfterBackfill.json();

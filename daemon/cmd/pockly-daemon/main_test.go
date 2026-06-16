@@ -641,7 +641,7 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenHintWindowHashMatches(t *testing
 		WindowHash:      meta.WindowHash,
 	}, now)
 
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -663,8 +663,8 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenHintWindowHashMatches(t *testing
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 0 || syncedTurns != 0 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	if result.Sessions != 0 || result.Turns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", result.Sessions, result.Turns)
 	}
 	if got := syncPosts.Load(); got != 0 {
 		t.Fatalf("sync POST count = %d, want 0", got)
@@ -722,7 +722,7 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenKnownWindowHashMatches(t *testin
 	}))
 	defer srv.Close()
 
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -751,8 +751,8 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenKnownWindowHashMatches(t *testin
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 0 || syncedTurns != 0 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	if result.Sessions != 0 || result.Turns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", result.Sessions, result.Turns)
 	}
 	if got := syncPosts.Load(); got != 0 {
 		t.Fatalf("sync POST count = %d, want 0", got)
@@ -810,7 +810,7 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenKnownServerTailCoversLocalWindow
 	}))
 	defer srv.Close()
 
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -839,8 +839,8 @@ func TestSyncChangedNexusSessionsSkipsUploadWhenKnownServerTailCoversLocalWindow
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 0 || syncedTurns != 0 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	if result.Sessions != 0 || result.Turns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", result.Sessions, result.Turns)
 	}
 	if got := syncPosts.Load(); got != 0 {
 		t.Fatalf("sync POST count = %d, want 0", got)
@@ -952,7 +952,7 @@ func TestDaemonRestartKnownWindowProbeAvoidsWindowReupload(t *testing.T) {
 	if knownWindows[sessionID].WindowHash != meta.WindowHash {
 		t.Fatalf("known window hash = %q, want %q", knownWindows[sessionID].WindowHash, meta.WindowHash)
 	}
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -966,8 +966,8 @@ func TestDaemonRestartKnownWindowProbeAvoidsWindowReupload(t *testing.T) {
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 0 || syncedTurns != 0 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	if result.Sessions != 0 || result.Turns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", result.Sessions, result.Turns)
 	}
 	if got := windowUploads.Load(); got != 0 {
 		t.Fatalf("window upload requests = %d, want 0", got)
@@ -1029,7 +1029,7 @@ func TestSyncChangedNexusSessionsSkipsRepeatedHintedWindowWhenLocalSignatureMatc
 	defer srv.Close()
 
 	lastHistorySync := map[string]string{sessionID: historySyncSignature(windowReq)}
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -1053,8 +1053,8 @@ func TestSyncChangedNexusSessionsSkipsRepeatedHintedWindowWhenLocalSignatureMatc
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 0 || syncedTurns != 0 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", syncedSessions, syncedTurns)
+	if result.Sessions != 0 || result.Turns != 0 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", result.Sessions, result.Turns)
 	}
 	if got := syncPosts.Load(); got != 0 {
 		t.Fatalf("sync POST count = %d, want 0", got)
@@ -1122,7 +1122,7 @@ func TestSyncChangedNexusSessionsUploadsFirstHintedWindowWithoutLocalSignature(t
 	defer srv.Close()
 
 	lastHistorySync := map[string]string{}
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -1146,8 +1146,8 @@ func TestSyncChangedNexusSessionsUploadsFirstHintedWindowWithoutLocalSignature(t
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 1 || syncedTurns != len(windowReq.Turns) {
-		t.Fatalf("synced sessions/turns = %d/%d, want 1/%d", syncedSessions, syncedTurns, len(windowReq.Turns))
+	if result.Sessions != 1 || result.Turns != len(windowReq.Turns) {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/%d", result.Sessions, result.Turns, len(windowReq.Turns))
 	}
 	if got := syncPosts.Load(); got != 1 {
 		t.Fatalf("sync POST count = %d, want 1", got)
@@ -1215,7 +1215,7 @@ func TestSyncChangedNexusSessionsUploadsOnlyNewTailWhenServerWindowOverlaps(t *t
 	}))
 	defer srv.Close()
 
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -1239,8 +1239,8 @@ func TestSyncChangedNexusSessionsUploadsOnlyNewTailWhenServerWindowOverlaps(t *t
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 1 || syncedTurns != 3 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 1/3", syncedSessions, syncedTurns)
+	if result.Sessions != 1 || result.Turns != 3 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/3", result.Sessions, result.Turns)
 	}
 	if got := syncPosts.Load(); got != 1 {
 		t.Fatalf("sync POST count = %d, want 1", got)
@@ -1308,7 +1308,7 @@ func TestSyncChangedNexusSessionsIgnoresBackfillCursorForAutomaticHotSync(t *tes
 	}))
 	defer srv.Close()
 
-	syncedSessions, syncedTurns := syncChangedNexusSessions(
+	result := syncChangedNexusSessions(
 		context.Background(),
 		pair.NewClient(srv.URL),
 		identity,
@@ -1341,8 +1341,8 @@ func TestSyncChangedNexusSessionsIgnoresBackfillCursorForAutomaticHotSync(t *tes
 		map[string]time.Time{},
 		0,
 	)
-	if syncedSessions != 1 || syncedTurns != 100 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 1/100", syncedSessions, syncedTurns)
+	if result.Sessions != 1 || result.Turns != 100 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/100", result.Sessions, result.Turns)
 	}
 	if got := syncPosts.Load(); got != 1 {
 		t.Fatalf("sync POST count = %d, want 1", got)

@@ -48,6 +48,8 @@ const defaultEdgeRetentionProfile = "standard";
 const defaultHotTurnMaxPayloadBytes = 32 * 1024;
 const defaultGlobalHotTurnPruneIntervalMs = 10 * 60 * 1000;
 const maxScopedHotTurnPruneSessions = 25;
+const defaultSessionEventBatchMs = 200;
+const defaultSessionEventBatchMax = 64;
 const edgeRetentionProfiles = Object.freeze({
   standard: Object.freeze({
     hotTurnsPerSession: 100,
@@ -1140,7 +1142,10 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     uploadedTurnStatsBySession.set(sessionID, stats);
   }
   const turnRecords = durableTurns.map((turn) => syncTurnRecord(user, device, turn, now));
-  const prunedTurnSessions = await upsertChangedTurns(store, turnRecords, env, providers);
+  const turnWrite = await upsertChangedTurns(store, turnRecords, env, providers);
+  const changedTurns = turnWrite.changedTurns ?? [];
+  const changedTurnStatsBySession = turnStatsBySession(changedTurns);
+  const prunedTurnSessions = turnWrite.prunedSessions ?? [];
   timings.mark("upsert_turns");
   let deletedSessionCount = 0;
   let deletedSessions = [];
@@ -1182,9 +1187,10 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   for (const session of sessions) {
     const sessionID = String(session.session_id);
     const uploadedTurnStats = uploadedTurnStatsBySession.get(sessionID);
+    const changedTurnStats = changedTurnStatsBySession.get(sessionID);
     const existing = existingBySessionID.get(sessionID) ?? null;
     const durableSession = durableSessionIDs.has(sessionID);
-    if (unchangedCatalogSession(device, session, existing, uploadedTurnStats, durableSession)) {
+    if (unchangedCatalogSession(device, session, existing, changedTurnStats, durableSession)) {
       sessionFastPathCount += 1;
       if (existing) currentSessionRecords.push(existing);
       continue;
@@ -1196,6 +1202,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       session,
       now,
       uploadedTurnStats,
+      changedTurnStats,
       existing,
       durableSession,
     );
@@ -1242,7 +1249,8 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     session_repair_count: repairedPrunedSessions.length,
     session_delete_count: deletedSessionCount,
     session_fast_path_count: sessionFastPathCount,
-    turn_count: turns.length,
+    turn_count: changedTurns.length,
+    received_turn_count: turns.length,
     daemon_device: device.device_id,
     daemon_version: body.hello?.version ?? "",
     timings_ms: timings.finish(),
@@ -1259,6 +1267,23 @@ function mergeSessionRecordsByID(base = [], updates = []) {
 function missingDeviceSessions(existingSessions, keepSessionIDs) {
   const keep = new Set(keepSessionIDs.map((id) => String(id)));
   return existingSessions.filter((session) => !keep.has(String(session.session_id)));
+}
+
+function turnStatsBySession(turns = []) {
+  const out = new Map();
+  for (const turn of turns) {
+    const sessionID = String(turn?.session_id ?? "");
+    const seq = Number(turn?.seq ?? 0) || 0;
+    if (!sessionID) continue;
+    const stats = out.get(sessionID) || { count: 0, min_seq: 0, max_seq: 0 };
+    stats.count += 1;
+    if (seq > 0) {
+      stats.min_seq = stats.min_seq > 0 ? Math.min(stats.min_seq, seq) : seq;
+      stats.max_seq = Math.max(stats.max_seq, seq);
+    }
+    out.set(sessionID, stats);
+  }
+  return out;
 }
 
 async function openedBackfillSessionIDsForDaemonSync(store, userID, deviceID, sessions = [], existingBySessionID = new Map(), turns = []) {
@@ -1447,8 +1472,9 @@ function sessionMatchesExisting(session, existing) {
   return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
 }
 
-function unchangedCatalogSession(device, session, existing, uploadedTurnStats, durableSession = true) {
-  if (!existing || Number(uploadedTurnStats?.count ?? 0) > 0) return false;
+function unchangedCatalogSession(device, session, existing, changedTurnStats, durableSession = true) {
+  if (!existing) return false;
+  if (Number(changedTurnStats?.count ?? 0) > 0) return false;
   if (!durableSession) return true;
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
   const lastTimestamp = session.last_timestamp || "";
@@ -2652,6 +2678,7 @@ export function createSessionEventSink(store, options = {}) {
   const env = options.env || {};
   const providers = options.providers || {};
   const persistActiveFinalTurns = activeFinalTurnPersistenceEnabled(env);
+  const eventBatcher = createSessionEventBatcher(store, env);
   return {
     async onControlEvent(payload, meta = {}) {
       // Active stream deltas stay in the control hub's short-lived cache. Only
@@ -2670,7 +2697,7 @@ export function createSessionEventSink(store, options = {}) {
       const event = sessionEventRecord(payload, meta, { turnPersisted: Boolean(turnRow && persistActiveFinalTurns) });
       if (!event) return;
       try {
-        await store.appendSessionEvent(event);
+        await eventBatcher.append(event);
       } catch {
         // Recent events are an active-turn optimization. The daemon catalog and
         // window sync remain the source of truth, so sink failures must not
@@ -2682,7 +2709,7 @@ export function createSessionEventSink(store, options = {}) {
       const event = terminalEventRecord(payload, meta);
       if (!event) return;
       try {
-        await store.appendSessionEvent(event);
+        await eventBatcher.append(event);
       } catch {
         // Terminal event polling is only a fallback for runtimes without a long
         // terminal stream. Terminal streams and daemon-local buffers remain the
@@ -2690,6 +2717,69 @@ export function createSessionEventSink(store, options = {}) {
       }
     },
   };
+}
+
+function createSessionEventBatcher(store, env = {}) {
+  const delayMs = sessionEventBatchDelayMs(env);
+  const maxBatchSize = sessionEventBatchMax(env);
+  let queue = [];
+  let flushTimer = null;
+  let flushPromise = null;
+  let flushResolve = null;
+  let flushReject = null;
+  const flush = async () => {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    const events = queue;
+    queue = [];
+    const resolve = flushResolve;
+    const reject = flushReject;
+    flushPromise = null;
+    flushResolve = null;
+    flushReject = null;
+    try {
+      if (events.length) {
+        if (typeof store.appendSessionEvents === "function") {
+          await store.appendSessionEvents(events);
+        } else {
+          for (const event of events) await store.appendSessionEvent(event);
+        }
+      }
+      resolve?.();
+    } catch (error) {
+      reject?.(error);
+    }
+  };
+  return {
+    append(event) {
+      queue.push(event);
+      if (!flushPromise) {
+        flushPromise = new Promise((resolve, reject) => {
+          flushResolve = resolve;
+          flushReject = reject;
+        });
+        flushTimer = setTimeout(() => {
+          void flush();
+        }, delayMs);
+      }
+      const pending = flushPromise;
+      if (queue.length >= maxBatchSize) void flush();
+      return pending;
+    },
+  };
+}
+
+function sessionEventBatchDelayMs(env = {}) {
+  const fallback = managedRuntime(env) ? defaultSessionEventBatchMs : 0;
+  const parsed = Number(env.POCKLY_SESSION_EVENT_BATCH_MS ?? fallback);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(1000, Math.floor(parsed));
+}
+
+function sessionEventBatchMax(env = {}) {
+  return boundedPositiveInteger(env.POCKLY_SESSION_EVENT_BATCH_MAX, defaultSessionEventBatchMax);
 }
 
 function activeFinalTurnPersistenceEnabled(env = {}) {
@@ -3847,10 +3937,10 @@ async function assertDaemonAssignable(store, daemonDeviceID, userID, publicKey) 
   }
 }
 
-async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats, existing = null, durableSession = true) {
+async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats, changedTurnStats, existing = null, durableSession = true) {
   const sessionID = requiredString(session.session_id, "session_id");
   const durableTail = Boolean(durableSession);
-  const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnStats);
+  const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnStats, changedTurnStats);
   const persistedTurnCount = stats
     ? stats.count
     : Number(existing?.synced_turn_count ?? 0);
@@ -3905,13 +3995,22 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
   };
 }
 
-async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnStats) {
+async function syncSessionTurnStats(store, userID, deviceID, sessionID, existing, session, uploadedTurnStats, changedTurnStats) {
   const uploadedTurnCount = Number(uploadedTurnStats?.count ?? 0) || 0;
-  if (uploadedTurnCount > 0) {
+  const changedTurnCount = Number(changedTurnStats?.count ?? 0) || 0;
+  if (changedTurnCount > 0) {
     // Turns are written before session metadata and may be pruned by the
     // hot-window retention policy. Use the store's seq-only stats query so catalog
     // metadata reflects the rows actually retained in Nexus, not just uploaded.
     return await sessionTurnStats(store, userID, deviceID, sessionID);
+  }
+  if (uploadedTurnCount > 0 && existing) {
+    return {
+      count: Number(existing.synced_turn_count ?? 0) || 0,
+      min_seq: Number(existing.synced_min_seq ?? 0) || 0,
+      max_seq: Number(existing.synced_max_seq ?? 0) || 0,
+      latest_contiguous_min_seq: Number(existing.latest_contiguous_min_seq ?? existing.synced_min_seq ?? 0) || 0,
+    };
   }
   return null;
 }
@@ -4517,21 +4616,22 @@ async function externalizeTurnPayloads(turns, env = {}, providers = {}) {
 
 async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
   const deduped = dedupeTurnRecords(turns);
-  if (!deduped.length) return [];
+  if (!deduped.length) return { changedTurns: [], prunedSessions: [] };
   const hotCandidates = selectHotTurnCandidates(deduped, env);
-  if (!hotCandidates.length) return [];
+  if (!hotCandidates.length) return { changedTurns: [], prunedSessions: [] };
   const useHistoryBlobStorage = historyBlobStorageEnabled(env) && providers.historyBlobStore;
   const candidates = useHistoryBlobStorage ? hotCandidates : await applyHotTurnPayloadPolicy(hotCandidates, env);
   const changed = await filterChangedTurnRecords(store, candidates);
-  if (!changed.length) return [];
+  if (!changed.length) return { changedTurns: [], prunedSessions: [] };
   await store.upsertTurns(useHistoryBlobStorage ? await externalizeTurnPayloads(changed, env, providers) : changed);
+  let prunedSessions = [];
   if (typeof store.pruneHotTurnCache === "function") {
     const perUser = hotTurnsPerUser(env);
     const userIDs = [...new Set(changed.map((turn) => String(turn.user_id)).filter(Boolean))];
     const changedSessionKeys = [...new Set(changed.map((turn) => turnSessionKey(turn)).filter(Boolean))];
     const sessionKeys = changedSessionKeys.length <= maxScopedHotTurnPruneSessions ? changedSessionKeys : [];
     const runGlobalPrune = shouldRunGlobalHotTurnPrune(userIDs, changed.length, perUser, env);
-    return await store.pruneHotTurnCache({
+    prunedSessions = await store.pruneHotTurnCache({
       perSession: hotTurnsPerSession(env),
       perUser: runGlobalPrune ? perUser : 0,
       inactiveBefore: runGlobalPrune ? hotTurnInactiveBefore(env) : "",
@@ -4539,7 +4639,7 @@ async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
       sessionKeys,
     });
   }
-  return [];
+  return { changedTurns: changed, prunedSessions };
 }
 
 function shouldRunGlobalHotTurnPrune(userIDs, changedCount, perUser, env = {}, nowMs = Date.now()) {

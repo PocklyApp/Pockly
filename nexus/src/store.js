@@ -659,6 +659,26 @@ export class InMemoryNexusStore {
     return next;
   }
 
+  async appendSessionEvents(events = []) {
+    const out = [];
+    const affected = new Set();
+    for (const event of events) {
+      const next = {
+        ...event,
+        event_id: event.event_id || eventID(),
+        payload: typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload ?? {}),
+      };
+      this.sessionEvents.push(next);
+      out.push(next);
+      affected.add(`${next.user_id}\x00${next.device_id}\x00${next.session_id}`);
+    }
+    for (const key of affected) {
+      const [userID, deviceID, sessionID] = key.split("\x00");
+      this.pruneInMemorySessionEvents(userID, deviceID, sessionID);
+    }
+    return out;
+  }
+
   pruneInMemorySessionEvents(userID, deviceID, sessionID) {
     const forSession = this.sessionEvents
       .filter((event) => event.user_id === userID && event.device_id === deviceID && event.session_id === sessionID)
@@ -2108,6 +2128,34 @@ export class SQLNexusStore {
     ).run();
     await this.pruneSessionEventsIfDue(event.user_id);
     return { ...event, event_id: eventIDValue, payload };
+  }
+
+  async appendSessionEvents(events = []) {
+    if (!events.length) return [];
+    const out = [];
+    const userIDs = new Set();
+    const statements = events.map((event) => {
+      const payload = typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload ?? {});
+      const eventIDValue = event.event_id || eventID();
+      out.push({ ...event, event_id: eventIDValue, payload });
+      if (event.user_id) userIDs.add(event.user_id);
+      return this.db.prepare(`
+        INSERT INTO session_events (event_id, user_id, device_id, session_id, request_id, event_type, payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        eventIDValue,
+        event.user_id,
+        event.device_id,
+        event.session_id,
+        event.request_id ?? null,
+        event.event_type,
+        payload,
+        event.created_at,
+      );
+    });
+    await this.db.batch(statements);
+    await Promise.all([...userIDs].map((userID) => this.pruneSessionEventsIfDue(userID)));
+    return out;
   }
 
   async listSessionEvents(userID, deviceID, sessionID, options = {}) {

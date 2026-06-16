@@ -205,6 +205,22 @@ function FixturePage({ fixtureName }: { fixtureName: string }) {
 // component — this is the production component, fetching through the real
 // getAgentSettings/auth path, with Playwright page.route controlling the wire.
 function PillsRetryFixture({ agent }: { agent: string }) {
+  const turns: SessionTurn[] = [{
+    session_id: "fx",
+    seq: 1,
+    agent,
+    kind: "tool_call",
+    timestamp: "2026-06-03T00:00:01Z",
+    payload: {
+      tool: "Edit",
+      id: "tool_1",
+      input: {
+        file_path: "/tmp/example.ts",
+        old_string: "const value = 1",
+        new_string: "const value = 2",
+      },
+    },
+  }];
   return (
     <div className="fixture-root" data-fixture="pills-retry">
       <div className="composer-pills-row" style={{ padding: "12px 4px" }}>
@@ -212,6 +228,7 @@ function PillsRetryFixture({ agent }: { agent: string }) {
           sessionId="fx"
           deviceId="fx"
           agent={agent}
+          turns={turns}
           disabled={false}
           onModelChange={() => {}}
           onEffortChange={() => {}}

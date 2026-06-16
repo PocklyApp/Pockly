@@ -6625,6 +6625,7 @@ function WorkspaceComposerDock({
 // Codex / future agents don't render an unsupported control surface.
 const AGENT_SETTINGS_RETRY_BASE_MS = 4000;
 const AGENT_SETTINGS_RETRY_MAX_MS = 60000;
+const AGENT_SETTINGS_MAX_AUTO_RETRIES = 5;
 const SESSION_DIFF_RETRYABLE_ERROR_COOLDOWN_MS = 60000;
 
 function isRetryableDaemonReadError(error: unknown): boolean {
@@ -6686,24 +6687,41 @@ export function ClaudeCodePillsRow({
   // under the run-config pills forever.
   const [retryTick, setRetryTick] = useState(0);
   const agentSettingsRetryAttemptRef = useRef(0);
+  const configWasOpenRef = useRef(false);
   const [busyField, setBusyField] = useState<"" | "model" | "effort" | "permission_mode">("");
   // The model/effort/permission settings live in one combined "Run config"
   // pill whose popover is a 3-column panel; this tracks its open state.
   const [configOpen, setConfigOpen] = useState(false);
-  // Session diffs: the "Diffs · N" pill opens a bottom-sheet drawer of the
-  // daemon's real `git diff` — uncommitted changes vs HEAD + untracked files,
-  // in the session's working tree. Because it's a live git diff, a commit
-  // clears it (unlike the old full-session aggregation). Fetched on session
-  // change, after activity settles (debounced), and when the drawer opens.
+  // Session diffs: show a cheap local hint from tool calls, then fetch the
+  // daemon's live `git diff` only when the user opens the drawer. The live diff
+  // endpoint depends on the daemon/control path, so prefetching it on every
+  // session open creates avoidable background failures and request spend.
+  const toolDiffs = useMemo(() => sessionDiffs(turns ?? []), [turns]);
   const [sheetDiffs, setSheetDiffs] = useState<SessionFileDiff[]>([]);
   const [diffsOpen, setDiffsOpen] = useState(false);
+  const liveDiffLoadedKeyRef = useRef("");
   const diffFailureCooldownRef = useRef<{ key: string; retryAfterMs: number } | null>(null);
   useEffect(() => {
     if (draftMode || !sessionId || !deviceId) {
       setSheetDiffs([]);
+      liveDiffLoadedKeyRef.current = "";
       return;
     }
     const diffKey = `${deviceId}:${sessionId}`;
+    setSheetDiffs(toolDiffs);
+    liveDiffLoadedKeyRef.current = "";
+    diffFailureCooldownRef.current = diffFailureCooldownRef.current?.key === diffKey
+      ? diffFailureCooldownRef.current
+      : null;
+  }, [sessionId, deviceId, draftMode, toolDiffs]);
+  useEffect(() => {
+    if (draftMode || !sessionId || !deviceId || !diffsOpen) {
+      return;
+    }
+    const diffKey = `${deviceId}:${sessionId}`;
+    if (liveDiffLoadedKeyRef.current === diffKey) {
+      return;
+    }
     const cooldown = diffFailureCooldownRef.current;
     if (cooldown && cooldown.key !== diffKey) {
       diffFailureCooldownRef.current = null;
@@ -6716,10 +6734,12 @@ export function ClaudeCodePillsRow({
       void getSessionDiff({ sessionId, deviceId, signal: ctrl.signal })
         .then((res) => {
           if (cancelled) return;
+          liveDiffLoadedKeyRef.current = diffKey;
           if (diffFailureCooldownRef.current?.key === diffKey) {
             diffFailureCooldownRef.current = null;
           }
-          setSheetDiffs(res.status === "ok" ? parseUnifiedDiff(res.diff || "") : []);
+          const liveDiffs = res.status === "ok" ? parseUnifiedDiff(res.diff || "") : [];
+          setSheetDiffs(liveDiffs.length > 0 ? liveDiffs : toolDiffs);
         })
         .catch((err: unknown) => {
           if (cancelled || ctrl.signal.aborted) return;
@@ -6739,7 +6759,7 @@ export function ClaudeCodePillsRow({
       ctrl.abort();
       window.clearTimeout(timer);
     };
-  }, [sessionId, deviceId, draftMode, turns.length, diffsOpen]);
+  }, [sessionId, deviceId, draftMode, diffsOpen, toolDiffs]);
 
   // Draft and real sessions intentionally use separate effects. The draft
   // path depends on draftModel/draftPermissionMode/draftEffort, but the real
@@ -6838,6 +6858,25 @@ export function ClaudeCodePillsRow({
   }, [sessionId, deviceId, draftMode, onModelChange, onEffortChange, onPermissionModeChange]);
 
   useEffect(() => {
+    const justOpened = configOpen && !configWasOpenRef.current;
+    configWasOpenRef.current = configOpen;
+    if (!justOpened || draftMode || !sessionId || !deviceId || loading || !error) return;
+    agentSettingsRetryAttemptRef.current = 0;
+    setRetryTick((t) => t + 1);
+  }, [configOpen, draftMode, sessionId, deviceId, loading, error]);
+
+  useEffect(() => {
+    if (draftMode || !sessionId || !deviceId || !error) return;
+    const handleVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      agentSettingsRetryAttemptRef.current = 0;
+      setRetryTick((t) => t + 1);
+    };
+    document.addEventListener("visibilitychange", handleVisible);
+    return () => document.removeEventListener("visibilitychange", handleVisible);
+  }, [draftMode, sessionId, deviceId, error]);
+
+  useEffect(() => {
     if (!sessionId || !deviceId || draftMode) return;
     const ctrl = new AbortController();
     let retryTimer = 0;
@@ -6860,7 +6899,7 @@ export function ClaudeCodePillsRow({
         // — see the composer-pills-error gate — so a background-refresh blip
         // after the pills loaded never flashes the alarm.
         setError(err instanceof Error ? err.message : String(err));
-        if (isRetryableDaemonReadError(err)) {
+        if (isRetryableDaemonReadError(err) && agentSettingsRetryAttemptRef.current < AGENT_SETTINGS_MAX_AUTO_RETRIES && document.visibilityState !== "hidden") {
           const delayMs = daemonReadRetryDelayMs(agentSettingsRetryAttemptRef.current);
           agentSettingsRetryAttemptRef.current += 1;
           retryTimer = window.setTimeout(() => setRetryTick((t) => t + 1), delayMs);

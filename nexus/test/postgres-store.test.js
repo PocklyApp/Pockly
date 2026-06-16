@@ -80,6 +80,50 @@ describe("Node production Postgres Nexus store adapter", () => {
     assert.doesNotMatch(query.sql, /snippet/i);
     assert.deepEqual(query.values, ["usr_pg", "dd_pg"]);
   });
+
+  it("persists batched session events through translated Postgres statements", async () => {
+    const client = new FakePostgresClient();
+    const store = await createPostgresNexusStore({
+      client,
+      migrate: false,
+    });
+
+    const saved = await store.appendSessionEvents([
+      {
+        event_id: "ev_pg_batch_0001",
+        user_id: "usr_pg",
+        device_id: "dd_pg",
+        session_id: "sess_pg",
+        request_id: "inj_pg",
+        event_type: "inject_started",
+        payload: { phase: "start" },
+        created_at: "2026-06-06T00:00:01Z",
+      },
+      {
+        event_id: "ev_pg_batch_0002",
+        user_id: "usr_pg",
+        device_id: "dd_pg",
+        session_id: "sess_pg",
+        request_id: "inj_pg",
+        event_type: "inject_completed",
+        payload: JSON.stringify({ phase: "done" }),
+        created_at: "2026-06-06T00:00:02Z",
+      },
+    ]);
+
+    assert.deepEqual(saved.map((event) => event.payload), [
+      JSON.stringify({ phase: "start" }),
+      JSON.stringify({ phase: "done" }),
+    ]);
+    const inserts = client.queries.filter((query) => query.sql.includes("INSERT INTO session_events"));
+    assert.equal(inserts.length, 2);
+    assert.equal(inserts[0].sql.includes("VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"), true);
+    assert.deepEqual(inserts.map((query) => query.values[0]), ["ev_pg_batch_0001", "ev_pg_batch_0002"]);
+    assert.deepEqual(inserts.map((query) => query.values[6]), [
+      JSON.stringify({ phase: "start" }),
+      JSON.stringify({ phase: "done" }),
+    ]);
+  });
 });
 
 class FakePostgresClient {
@@ -100,6 +144,12 @@ class FakePostgresClient {
     if (sql.includes("SELECT * FROM users WHERE email")) {
       const row = this.usersByEmail.get(values[0]);
       return { rows: row ? [row] : [], rowCount: row ? 1 : 0 };
+    }
+    if (sql.includes("INSERT INTO session_events")) {
+      return { rows: [], rowCount: 1 };
+    }
+    if (sql.includes("DELETE FROM session_events")) {
+      return { rows: [], rowCount: 0 };
     }
     if (sql.includes("FROM sessions") && sql.includes("session_id") && !sql.includes("SELECT *")) {
       return {

@@ -36,6 +36,12 @@ export class PostgresStatementAdapter {
   prepare(sql) {
     return new PostgresStatement(this.client, translateSQLPlaceholders(sql));
   }
+
+  async batch(statements = []) {
+    const out = [];
+    for (const statement of statements) out.push(await statement.run());
+    return out;
+  }
 }
 
 class PostgresStatement {

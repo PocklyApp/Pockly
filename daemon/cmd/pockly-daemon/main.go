@@ -2349,8 +2349,8 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		// catalog above carries metadata + snippets for every session; this
 		// only uploads the bounded turn window the web reader needs by
 		// default. Older windows are pulled through explicit lazy backfill.
-		if syncedSessions, syncedTurns := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, profile, hints, pushedHints, knownWindows, lastWindowPushAt, windowMinInterval); syncedSessions > 0 || syncedTurns > 0 {
-			log.Printf("Nexus history sync ok: sessions=%d turns=%d device=%s", syncedSessions, syncedTurns, id.DeviceID)
+		if result := syncChangedNexusSessions(ctx, client, id, idx, historyCandidates, lastHistorySync, profile, hints, pushedHints, knownWindows, lastWindowPushAt, windowMinInterval); result.Sessions > 0 || result.Turns > 0 || result.ReceivedTurns > 0 {
+			log.Printf("Nexus history sync ok: sessions=%d turns=%d received_turns=%d device=%s", result.Sessions, result.Turns, result.ReceivedTurns, id.DeviceID)
 		}
 		// Success telemetry is a liveness signal, not metrics: every 30 minutes
 		// keeps a day of fleet data at 48 events/daemon instead of 144.
@@ -2670,19 +2670,24 @@ func windowSyncMinInterval() time.Duration {
 	return envDuration("POCKLY_WINDOW_SYNC_MIN_INTERVAL", 60*time.Second, 0, time.Hour)
 }
 
-func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hints map[string]syncHint, pushedHints *pushedHintStore, knownWindows map[string]syncHint, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) (int, int) {
+type historySyncResult struct {
+	Sessions      int
+	Turns         int
+	ReceivedTurns int
+}
+
+func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, sessions []pair.SyncSession, lastHistorySync map[string]string, profile runner.Profile, hints map[string]syncHint, pushedHints *pushedHintStore, knownWindows map[string]syncHint, lastWindowPushAt map[string]time.Time, windowMinInterval time.Duration) historySyncResult {
 	policy := defaultNexusSyncPolicy()
 	now := time.Now()
 	candidates := recentNexusSessions(sessions, maxNexusHistorySessionsPerTick, policy, hints, now)
 	if len(candidates) == 0 {
-		return 0, 0
+		return historySyncResult{}
 	}
 
-	syncedSessions := 0
-	syncedTurns := 0
+	result := historySyncResult{}
 	for _, session := range candidates {
 		if err := ctx.Err(); err != nil {
-			return syncedSessions, syncedTurns
+			return result
 		}
 		freshlyHinted := pushedHints != nil && pushedHints.PushedWithin(session.SessionID, now, pushedHintFreshFor)
 		if !shouldPushWindow(now, lastWindowPushAt[session.SessionID], windowMinInterval, freshlyHinted) {
@@ -2736,10 +2741,11 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 		if pushedHints != nil && len(req.Sessions) > 0 {
 			pushedHints.UpdateAfterSync(session.SessionID, req.Sessions[0], now)
 		}
-		syncedSessions += res.SessionCount
-		syncedTurns += res.TurnCount
+		result.Sessions += res.SessionCount
+		result.Turns += res.TurnCount
+		result.ReceivedTurns += res.ReceivedTurnCount
 	}
-	return syncedSessions, syncedTurns
+	return result
 }
 
 func candidateSessionIDs(sessions []pair.SyncSession) []string {

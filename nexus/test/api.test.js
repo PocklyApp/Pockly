@@ -211,6 +211,7 @@ describe("Nexus api", () => {
       ok: syncBody.ok,
       session_count: syncBody.session_count,
       turn_count: syncBody.turn_count,
+      received_turn_count: syncBody.received_turn_count,
       session_upsert_count: syncBody.session_upsert_count,
       daemon_device: syncBody.daemon_device,
       daemon_version: syncBody.daemon_version,
@@ -218,6 +219,7 @@ describe("Nexus api", () => {
       ok: true,
       session_count: 2,
       turn_count: 2,
+      received_turn_count: 2,
       session_upsert_count: 2,
       daemon_device: daemon.daemon_device_id,
       daemon_version: "0.1.0-test",
@@ -596,7 +598,8 @@ describe("Nexus api", () => {
     assert.equal(sync.status, 200);
     const syncBody = await sync.json();
     assert.equal(syncBody.session_count, sessionCount);
-    assert.equal(syncBody.turn_count, turnCount);
+    assert.equal(syncBody.turn_count, 100);
+    assert.equal(syncBody.received_turn_count, turnCount);
     assert.equal(store.counts.listExistingTurnKeys, 1);
     assert.equal(store.counts.listExistingTurnPayloads, 0);
     assert.equal(store.counts.upsertTurnRows, 100);
@@ -632,6 +635,9 @@ describe("Nexus api", () => {
       turns,
     }, daemonAuth);
     assert.equal(retry.status, 200);
+    const retryBody = await retry.json();
+    assert.equal(retryBody.turn_count, 0);
+    assert.equal(retryBody.received_turn_count, turnCount);
     assert.equal(store.counts.listExistingTurnKeys, 1);
     assert.equal(store.counts.listExistingTurnPayloads, 1);
     assert.equal(store.counts.upsertTurns, 0);
@@ -958,6 +964,9 @@ describe("Nexus api", () => {
 
     const retry = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
     assert.equal(retry.status, 200);
+    const retryBody = await retry.json();
+    assert.equal(retryBody.turn_count, 0);
+    assert.equal(retryBody.received_turn_count, 1);
     assert.equal(objectStore.putCalls.length, 1);
   });
 
@@ -1080,6 +1089,113 @@ describe("Nexus api", () => {
     const retry = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
     assert.equal(retry.status, 200);
     assert.equal(objectStore.putCalls.length, 1);
+  });
+
+  it("fast-paths repeated hot-window sync without stats reads or session writes", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const body = {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        session_id: "sess_repeated_hot_window",
+        agent: "claude-code",
+        cwd: "/work/app",
+        snippet: "tail",
+        last_seq: 60,
+        last_timestamp: "2026-06-06T04:00:59.000Z",
+        turn_count: 60,
+        min_seq: 41,
+        max_seq: 60,
+        has_older: true,
+      }],
+      turns: Array.from({ length: 20 }, (_, index) => {
+        const seq = 41 + index;
+        return {
+          session_id: "sess_repeated_hot_window",
+          seq,
+          agent: "claude-code",
+          kind: "assistant_text",
+          timestamp: `2026-06-06T04:00:${String(index).padStart(2, "0")}.000Z`,
+          payload: { text: `turn ${seq}` },
+        };
+      }),
+    };
+
+    const first = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    assert.equal(firstBody.turn_count, 20);
+    assert.equal(firstBody.received_turn_count, 20);
+
+    store.resetCounts();
+    const retry = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(retry.status, 200);
+    const retryBody = await retry.json();
+    assert.equal(retryBody.turn_count, 0);
+    assert.equal(retryBody.received_turn_count, 20);
+    assert.equal(retryBody.session_upsert_count, 0);
+    assert.equal(retryBody.session_fast_path_count, 1);
+    assert.equal(store.counts.listExistingTurnKeys, 1);
+    assert.equal(store.counts.listExistingTurnPayloads, 1);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.getSessionTurnStats, 0);
+    assert.equal(store.counts.upsertSessionRows, 0);
+    assert.equal(store.counts.appendSessionCatalogChangeRows, 0);
+  });
+
+  it("updates catalog metadata when a repeated hot-window sync changes the session row", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const turns = [{
+      session_id: "sess_repeated_hot_window_catalog_change",
+      seq: 1,
+      agent: "claude-code",
+      kind: "assistant_text",
+      timestamp: "2026-06-06T04:00:00.000Z",
+      payload: { text: "turn 1" },
+    }];
+    const baseSession = {
+      session_id: "sess_repeated_hot_window_catalog_change",
+      agent: "claude-code",
+      cwd: "/work/app",
+      snippet: "old snippet",
+      last_seq: 1,
+      last_timestamp: "2026-06-06T04:00:00.000Z",
+      turn_count: 1,
+      min_seq: 1,
+      max_seq: 1,
+    };
+    const body = {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [baseSession],
+      turns,
+    };
+
+    const first = await call(env, "POST", "/api/daemon/sync", body, daemonAuth);
+    assert.equal(first.status, 200);
+
+    store.resetCounts();
+    const retry = await call(env, "POST", "/api/daemon/sync", {
+      ...body,
+      sessions: [{ ...baseSession, snippet: "new snippet" }],
+    }, daemonAuth);
+    assert.equal(retry.status, 200);
+    const retryBody = await retry.json();
+    assert.equal(retryBody.turn_count, 0);
+    assert.equal(retryBody.received_turn_count, 1);
+    assert.equal(retryBody.session_upsert_count, 1);
+    assert.equal(retryBody.session_fast_path_count, 0);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.getSessionTurnStats, 0);
+    assert.equal(store.counts.upsertSessionRows, 1);
+    const session = await store.getSession("usr_test", daemon.daemon_device_id, "sess_repeated_hot_window_catalog_change");
+    assert.equal(session.snippet, "new snippet");
   });
 
   it("reports history storage usage for inline, blob, and batched payloads", async () => {
@@ -3387,9 +3503,9 @@ describe("Nexus api", () => {
     });
     const turnsAfterInjectBody = await turnsAfterInject.json();
     assert.deepEqual(turnsAfterInjectBody.turns.map((turn) => turn.seq).filter((seq) => seq >= 2), []);
-    const persistedInjectEvents = await env.POCKLY_NEXUS_STORE.listSessionEvents("usr_test", daemon.daemon_device_id, "sess_low", {
+    const persistedInjectEvents = await listSessionEventsEventually(env.POCKLY_NEXUS_STORE, "usr_test", daemon.daemon_device_id, "sess_low", {
       request_id: injectBody.request_id,
-    });
+    }, 1);
     assert.equal(persistedInjectEvents.length, 1);
     const persistedInjectPayload = JSON.parse(persistedInjectEvents[0].payload);
     assert.equal(persistedInjectPayload.turn, undefined);
@@ -3419,9 +3535,9 @@ describe("Nexus api", () => {
     assert.deepEqual(syncEventBody.events[0].payload.turns.map((turn) => [turn.seq, turn.payload.text]), [
       [41, "transient older window"],
     ]);
-    const persistedSyncEvents = await env.POCKLY_NEXUS_STORE.listSessionEvents("usr_test", daemon.daemon_device_id, "sess_low", {
+    const persistedSyncEvents = await listSessionEventsEventually(env.POCKLY_NEXUS_STORE, "usr_test", daemon.daemon_device_id, "sess_low", {
       request_id: syncBody.request_id,
-    });
+    }, 1);
     assert.equal(persistedSyncEvents.length, 1);
     const persistedSyncPayload = JSON.parse(persistedSyncEvents[0].payload);
     assert.equal(persistedSyncPayload.turns, undefined);
@@ -4587,7 +4703,8 @@ describe("Nexus api", () => {
     }, daemonAuth);
     assert.equal(old.status, 200);
     const oldBody = await old.json();
-    assert.equal(oldBody.turn_count, 100);
+    assert.equal(oldBody.turn_count, 0);
+    assert.equal(oldBody.received_turn_count, 100);
     assert.equal(store.counts.upsertTurnRows, 0);
     assert.equal(store.counts.pruneHotTurnCache, 0);
     assert.equal(store.counts.appendSessionCatalogChangeRows, 0);
@@ -4794,6 +4911,7 @@ function testEnv(options = {}) {
     POCKLY_NEXUS_STORE: options.store || new InMemoryNexusStore(),
     POCKLY_CONTROL_HUB: new InMemoryControlHub(),
     POCKLY_HOSTS_ONLINE_CACHE_SCOPE: randomIDForTest("cache"),
+    POCKLY_SESSION_EVENT_BATCH_MS: "1",
     ...(options.devLogin === false ? {} : { POCKLY_NEXUS_DEV_LOGIN_ENABLED: "1" }),
     ...(options.extra || {}),
   };
@@ -4886,6 +5004,16 @@ async function readEventsEventually(env, path, headers, count) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
   return body;
+}
+
+async function listSessionEventsEventually(store, userID, deviceID, sessionID, options, count) {
+  let events = [];
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    events = await store.listSessionEvents(userID, deviceID, sessionID, options);
+    if (events.length >= count) return events;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return events;
 }
 
 async function readSSE(response) {
@@ -5087,6 +5215,12 @@ class CountingNexusStore extends InMemoryNexusStore {
     this.counts.appendSessionEvents += 1;
     this.counts.appendSessionEventRows += 1;
     return await super.appendSessionEvent(event);
+  }
+
+  async appendSessionEvents(events = []) {
+    this.counts.appendSessionEvents += 1;
+    this.counts.appendSessionEventRows += events.length;
+    return await super.appendSessionEvents(events);
   }
 
   async pruneHotTurnCache(options = {}) {

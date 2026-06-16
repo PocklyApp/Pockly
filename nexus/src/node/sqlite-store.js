@@ -40,6 +40,11 @@ class SQLiteStatementAdapter {
   prepare(sql) {
     return new SQLiteStatement(this.db.prepare(translateSQLiteSQL(sql)));
   }
+
+  async batch(statements = []) {
+    const run = this.db.transaction((items) => items.map((statement) => statement.run()));
+    return run(statements);
+  }
 }
 
 function translateSQLiteSQL(sql) {

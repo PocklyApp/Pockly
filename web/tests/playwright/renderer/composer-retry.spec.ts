@@ -30,12 +30,29 @@ const SNAPSHOT = {
 async function installRoutes(
   page: import("@playwright/test").Page,
   getPhase: () => Phase,
+  options: { onDiff?: () => void } = {},
 ) {
   await page.route("**/api/**", async (route) => {
     const url = route.request().url();
     const json = (body: unknown, status = 200) =>
       route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
 
+    if (url.includes("/diff")) {
+      options.onDiff?.();
+      return json({
+        status: "ok",
+        truncated: false,
+        diff: [
+          "diff --git a/example.ts b/example.ts",
+          "--- a/example.ts",
+          "+++ b/example.ts",
+          "@@ -1 +1 @@",
+          "-const value = 1",
+          "+const value = 2",
+          "",
+        ].join("\n"),
+      });
+    }
     // The one phase-controlled endpoint: the daemon-backed run config.
     if (url.includes("/agent-settings")) {
       if (getPhase() === "fail") {
@@ -115,5 +132,20 @@ test.describe("composer run-config pills — stale daemon-offline self-heal", ()
     }
     expect(everHidden).toBe(false);
     await expect(errorLabel).toHaveText(/daemon offline/i);
+  });
+
+  test("does not request live diff until the diff drawer is opened", async ({ page }) => {
+    let phase: Phase = "ok";
+    let diffRequests = 0;
+    await installRoutes(page, () => phase, { onDiff: () => { diffRequests += 1; } });
+
+    await page.goto("/test/renderer?fixture=pills-retry");
+    await expect(page.locator(".composer-pill-config")).toContainText(/sonnet/i, { timeout: 8000 });
+    await page.waitForTimeout(1200);
+    expect(diffRequests).toBe(0);
+
+    await page.locator(".composer-diff-pill").click();
+    await expect(page.locator(".diffsheet-layer.is-open")).toBeVisible();
+    await expect.poll(() => diffRequests).toBe(1);
   });
 });

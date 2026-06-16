@@ -200,6 +200,7 @@ type SyncResponse struct {
 	SessionDeleteCount   int                `json:"session_delete_count"`
 	SessionFastPathCount int                `json:"session_fast_path_count"`
 	TurnCount            int                `json:"turn_count"`
+	ReceivedTurnCount    int                `json:"received_turn_count,omitempty"`
 	DaemonDevice         string             `json:"daemon_device"`
 	DaemonVersion        string             `json:"daemon_version"`
 	TimingsMS            map[string]float64 `json:"timings_ms,omitempty"`
