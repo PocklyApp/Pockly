@@ -79,6 +79,198 @@ describe("Node self-hosted Nexus storage adapters", () => {
     }
   });
 
+  it("supersedes SQL daemon devices and migrates session state", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-supersede-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      await store.upsertUser({
+        user_id: "usr_supersede",
+        email: "supersede@example.local",
+        name: "Supersede User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+      await store.upsertComputer({
+        computer_id: "dc_old",
+        user_id: "usr_supersede",
+        display_name: "Old computer",
+        status: "active",
+        current_daemon_device_id: "dd_old",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+      await store.upsertComputer({
+        computer_id: "dc_new",
+        user_id: "usr_supersede",
+        display_name: "New computer",
+        status: "active",
+        current_daemon_device_id: "dd_new",
+        created_at: "2026-06-06T00:01:00Z",
+        updated_at: "2026-06-06T00:01:00Z",
+      });
+      await store.upsertDevice({
+        device_id: "dd_old",
+        user_id: "usr_supersede",
+        computer_id: "dc_old",
+        device_type: "daemon",
+        device_name: "Old daemon",
+        public_key: "old-pub",
+        status: "active",
+        remote_access_enabled: true,
+        machine_fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+      await store.upsertDevice({
+        device_id: "dd_new",
+        user_id: "usr_supersede",
+        computer_id: "dc_new",
+        device_type: "daemon",
+        device_name: "New daemon",
+        public_key: "new-pub",
+        status: "active",
+        remote_access_enabled: true,
+        machine_fingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        created_at: "2026-06-06T00:01:00Z",
+        updated_at: "2026-06-06T00:01:00Z",
+      });
+      await store.upsertDevice({
+        device_id: "bd_1",
+        user_id: "usr_supersede",
+        device_type: "browser",
+        device_name: "Browser",
+        public_key: "browser-pub",
+        status: "active",
+        remote_access_enabled: false,
+        created_at: "2026-06-06T00:00:01Z",
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertSession({
+        user_id: "usr_supersede",
+        computer_id: "dc_old",
+        device_id: "dd_old",
+        session_id: "sess_move",
+        agent: "claude-code",
+        cwd: "/work/move",
+        snippet: "move",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T00:00:01Z",
+        turn_count: 1,
+        synced_turn_count: 1,
+        synced_min_seq: 1,
+        synced_max_seq: 1,
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertSession({
+        user_id: "usr_supersede",
+        computer_id: "dc_old",
+        device_id: "dd_old",
+        session_id: "sess_conflict",
+        agent: "claude-code",
+        cwd: "/work/conflict",
+        snippet: "old conflict",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T00:00:01Z",
+        turn_count: 1,
+        synced_turn_count: 1,
+        synced_min_seq: 1,
+        synced_max_seq: 1,
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertSession({
+        user_id: "usr_supersede",
+        computer_id: "dc_new",
+        device_id: "dd_new",
+        session_id: "sess_conflict",
+        agent: "claude-code",
+        cwd: "/work/conflict",
+        snippet: "new conflict wins",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T00:01:01Z",
+        turn_count: 1,
+        synced_turn_count: 1,
+        synced_min_seq: 1,
+        synced_max_seq: 1,
+        updated_at: "2026-06-06T00:01:01Z",
+      });
+      await store.upsertTurn({
+        user_id: "usr_supersede",
+        device_id: "dd_old",
+        session_id: "sess_move",
+        seq: 1,
+        agent: "claude-code",
+        kind: "user_message",
+        timestamp: "2026-06-06T00:00:01Z",
+        payload: JSON.stringify({ text: "move" }),
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertTurn({
+        user_id: "usr_supersede",
+        device_id: "dd_old",
+        session_id: "sess_conflict",
+        seq: 1,
+        agent: "claude-code",
+        kind: "user_message",
+        timestamp: "2026-06-06T00:00:01Z",
+        payload: JSON.stringify({ text: "old conflict turn" }),
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertTurn({
+        user_id: "usr_supersede",
+        device_id: "dd_new",
+        session_id: "sess_conflict",
+        seq: 1,
+        agent: "claude-code",
+        kind: "user_message",
+        timestamp: "2026-06-06T00:01:01Z",
+        payload: JSON.stringify({ text: "new conflict turn" }),
+        updated_at: "2026-06-06T00:01:01Z",
+      });
+      await store.upsertSessionPref({
+        user_id: "usr_supersede",
+        device_id: "dd_old",
+        session_id: "sess_move",
+        pinned: 1,
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertProjectPref({
+        user_id: "usr_supersede",
+        device_id: "dd_old",
+        cwd: "/work/move",
+        pinned: 1,
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+      await store.upsertDeviceBinding({
+        user_id: "usr_supersede",
+        daemon_device_id: "dd_old",
+        browser_device_id: "bd_1",
+        status: "active",
+        created_at: "2026-06-06T00:00:01Z",
+        updated_at: "2026-06-06T00:00:01Z",
+      });
+
+      const result = await store.supersedeDaemonDevice("usr_supersede", "dd_old", "dd_new", "2026-06-06T00:02:00Z");
+      assert.equal(result.superseded, true);
+      assert.equal(result.deleted_sessions.length, 2);
+      assert.equal(result.upserted_sessions.length, 1);
+      assert.equal((await store.getDevice("dd_old")).superseded_by_device_id, "dd_new");
+      assert.equal((await store.getDevice("dd_old")).status, "offline");
+      assert.equal((await store.getSession("usr_supersede", "dd_old", "sess_move")), null);
+      assert.equal((await store.getSession("usr_supersede", "dd_new", "sess_move")).computer_id, "dc_new");
+      assert.equal((await store.listTurns("usr_supersede", "dd_new", "sess_move")).length, 1);
+      const conflictTurns = await store.listTurns("usr_supersede", "dd_new", "sess_conflict");
+      assert.equal(conflictTurns.length, 1);
+      assert.equal(JSON.parse(conflictTurns[0].payload).text, "new conflict turn");
+      assert.equal((await store.listSessionPrefsForDevice("usr_supersede", "dd_new")).length, 1);
+      assert.equal((await store.listProjectPrefsForUser("usr_supersede")).find((pref) => pref.device_id === "dd_new")?.cwd, "/work/move");
+      assert.equal((await store.getDeviceBinding("usr_supersede", "dd_new", "bd_1"))?.status, "active");
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("reports SQL history storage usage without double-counting batched blobs", async () => {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-history-usage-"));
     const databasePath = path.join(dir, "nexus.sqlite");

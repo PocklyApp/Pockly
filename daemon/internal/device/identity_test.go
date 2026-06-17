@@ -55,6 +55,9 @@ func TestStableComputerIdentitySurvivesDaemonIdentityRecreate(t *testing.T) {
 	if first.ComputerID == "" || first.ComputerPublicKey == "" {
 		t.Fatalf("missing stable computer identity: %+v", first)
 	}
+	if first.MachineFingerprint == "" {
+		t.Fatalf("missing machine fingerprint: %+v", first)
+	}
 	firstDeviceID := first.DeviceID
 	if _, err := first.ComputerPrivateKeyBytes(); err != nil {
 		t.Fatalf("computer private key should be readable in plaintext fallback: %v", err)
@@ -69,6 +72,9 @@ func TestStableComputerIdentitySurvivesDaemonIdentityRecreate(t *testing.T) {
 	}
 	if second.DeviceID == firstDeviceID {
 		t.Fatalf("expected daemon device_id to be recreated after deleting device.json")
+	}
+	if second.MachineFingerprint != first.MachineFingerprint {
+		t.Fatalf("machine fingerprint changed after daemon identity recreate: first=%q second=%q", first.MachineFingerprint, second.MachineFingerprint)
 	}
 	if second.ComputerID != first.ComputerID || second.ComputerPublicKey != first.ComputerPublicKey {
 		t.Fatalf("stable computer identity changed: first=%+v second=%+v", first, second)

@@ -58,6 +58,9 @@ export async function requireDeviceAuth(request, store, expectedType, expectedAu
   if (!record || isExpired(record.expires_at)) throw unauthorized();
   const device = await store.getDevice(record.device_id);
   if (!device || device.status === "revoked") throw unauthorized("device revoked");
+  if ((expectedType === "daemon" || device.device_type === "daemon") && device.superseded_by_device_id) {
+    throw unauthorized("device superseded");
+  }
   if (expectedType && device.device_type !== expectedType) {
     throw forbidden(`expected ${expectedType} device token`);
   }

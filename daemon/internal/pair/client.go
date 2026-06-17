@@ -577,6 +577,9 @@ func (c *Client) AuthenticateIdentityContext(ctx context.Context, id device.Iden
 }
 
 func addComputerIdentity(body map[string]any, id device.Identity) error {
+	if id.MachineFingerprint != "" {
+		body["machine_fingerprint"] = id.MachineFingerprint
+	}
 	if id.ComputerID == "" || id.ComputerPublicKey == "" {
 		return nil
 	}

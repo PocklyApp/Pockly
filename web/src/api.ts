@@ -43,6 +43,7 @@ export type Device = {
   remote_access_enabled?: boolean;
   computer_id?: string;
   computer_public_key?: string;
+  machine_fingerprint_bound?: boolean;
   superseded_by_device_id?: string;
 };
 

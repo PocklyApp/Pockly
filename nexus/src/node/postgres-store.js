@@ -28,13 +28,13 @@ async function execMigration(client, sql) {
   try {
     await client.query(sql);
   } catch (error) {
-    if (isDuplicateSessionAddColumn(sql, error)) return;
+    if (isDuplicateAddColumn(sql, error)) return;
     throw error;
   }
 }
 
-function isDuplicateSessionAddColumn(sql, error) {
-  return /\bALTER\s+TABLE\s+sessions\s+ADD\s+COLUMN\s+\w+\b/i.test(sql) &&
+function isDuplicateAddColumn(sql, error) {
+  return /\bALTER\s+TABLE\s+\w+\s+ADD\s+COLUMN\s+\w+\b/i.test(sql) &&
     (error?.code === "42701" || /column .+ already exists|duplicate column/i.test(String(error?.message || error)));
 }
 

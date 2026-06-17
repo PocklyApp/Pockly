@@ -16,10 +16,12 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/denisbrodbeck/machineid"
 	"github.com/zalando/go-keyring"
 )
 
 const keyringService = "pockly-daemon"
+const machineFingerprintAppID = "pockly-daemon-machine-v1"
 
 // allowPlaintextKey returns true when the caller has explicitly accepted
 // storing the device private key alongside device.json (instead of in the
@@ -43,6 +45,7 @@ type Identity struct {
 	ComputerID         string `json:"computer_id,omitempty"`
 	ComputerPublicKey  string `json:"computer_public_key,omitempty"`
 	ComputerPrivateKey string `json:"computer_private_key,omitempty"`
+	MachineFingerprint string `json:"machine_fingerprint,omitempty"`
 }
 
 type StableComputerIdentity struct {
@@ -96,6 +99,7 @@ func LoadOrCreate(path string, deviceName string) (Identity, error) {
 		if err := json.Unmarshal(raw, &id); err != nil {
 			return Identity{}, fmt.Errorf("decode identity: %w", err)
 		}
+		id.MachineFingerprint = resolveMachineFingerprint()
 		if id.DeviceName == "" && deviceName != "" {
 			id.DeviceName = deviceName
 		}
@@ -148,6 +152,7 @@ func LoadOrCreate(path string, deviceName string) (Identity, error) {
 		ComputerID:         computer.ComputerID,
 		ComputerPublicKey:  computer.ComputerPublicKey,
 		ComputerPrivateKey: computer.ComputerPrivateKey,
+		MachineFingerprint: resolveMachineFingerprint(),
 	}
 	privateKey := base64.RawURLEncoding.EncodeToString(priv)
 	if err := keyring.Set(keyringService, keyringUsername(id.DeviceID), privateKey); err != nil {
@@ -380,4 +385,12 @@ func resolveHostnameFrom(baseHost string, baseErr error, getenv func(string) str
 		}
 	}
 	return ""
+}
+
+func resolveMachineFingerprint() string {
+	id, err := machineid.ProtectedID(machineFingerprintAppID)
+	if err != nil {
+		return ""
+	}
+	return id
 }

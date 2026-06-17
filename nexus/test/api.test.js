@@ -149,6 +149,187 @@ describe("Nexus api", () => {
     assert.deepEqual(await sessions.json(), { sessions: [] });
   });
 
+  it("supersedes older daemon devices with the same machine fingerprint and migrates sessions", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const machineFingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    const first = await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_machine_old",
+      computerID: "dc_machine_old",
+      machineFingerprint,
+    });
+    const firstSync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: first.daemon_device_id, version: "0.1.0-test" },
+      full_reconcile: true,
+      sessions: [{
+        session_id: "sess_machine_migrated",
+        agent: "claude-code",
+        cwd: "/work/same-machine",
+        snippet: "old daemon session",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T01:00:01.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+      turns: [{
+        session_id: "sess_machine_migrated",
+        seq: 1,
+        agent: "claude-code",
+        kind: "user_message",
+        timestamp: "2026-06-06T01:00:01.000Z",
+        payload: { text: "old daemon session" },
+      }],
+    }, { authorization: `Bearer ${first.device_access_token}` });
+    assert.equal(firstSync.status, 200);
+    const connected = await call(env, "POST", `/api/hosts/${first.daemon_device_id}/connect`, {
+      browser_device_id: browser.browser_device_id,
+      browser_device_pubkey: browserKeys.publicKey,
+      device_name: "Test Browser",
+      user_agent: "node-test",
+    }, { cookie });
+    assert.equal(connected.status, 200);
+
+    const second = await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_machine_new",
+      computerID: "dc_machine_new",
+      machineFingerprint,
+    });
+
+    const devices = await call(env, "GET", "/api/devices", null, { cookie });
+    const rows = (await devices.json()).devices;
+    const oldDevice = rows.find((device) => device.device_id === first.daemon_device_id);
+    const newDevice = rows.find((device) => device.device_id === second.daemon_device_id);
+
+    assert.equal(oldDevice.superseded_by_device_id, second.daemon_device_id);
+    assert.equal(oldDevice.status, "offline");
+    assert.equal(newDevice.superseded_by_device_id ?? null, null);
+    assert.equal(newDevice.status, "active");
+    assert.equal(newDevice.machine_fingerprint_bound, true);
+    assert.equal(newDevice.machine_fingerprint, undefined);
+
+    const sessions = await call(env, "GET", "/api/sessions", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const sessionRows = (await sessions.json()).sessions;
+    assert.equal(sessionRows.some((session) => session.device_id === first.daemon_device_id), false);
+    const migrated = sessionRows.find((session) => session.session_id === "sess_machine_migrated");
+    assert.equal(migrated?.device_id, second.daemon_device_id);
+    assert.equal(migrated?.computer_id, "dc_machine_new");
+
+    const turns = await call(env, "GET", `/api/sessions/${encodeURIComponent("sess_machine_migrated")}/turns?device_id=${encodeURIComponent(second.daemon_device_id)}`, null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const turnRows = (await turns.json()).turns;
+    assert.equal(turnRows.length, 1);
+    assert.equal(turnRows[0].device_id, second.daemon_device_id);
+
+    const hosts = await call(env, "GET", "/api/hosts/online", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const hostRows = (await hosts.json()).hosts;
+    assert.equal(hostRows.some((host) => host.device_id === first.daemon_device_id), false);
+    assert.equal(hostRows.some((host) => host.device_id === second.daemon_device_id), true);
+
+    const staleSync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: first.daemon_device_id, version: "0.1.0-test" },
+      full_reconcile: true,
+      sessions: [{
+        session_id: "sess_machine_stale",
+        agent: "claude-code",
+        cwd: "/work/same-machine",
+        snippet: "stale daemon should not come back",
+        last_seq: 1,
+        last_timestamp: "2026-06-06T01:00:02.000Z",
+        turn_count: 1,
+        min_seq: 1,
+        max_seq: 1,
+      }],
+    }, { authorization: `Bearer ${first.device_access_token}` });
+    assert.equal(staleSync.status, 401);
+
+    const staleHints = await call(env, "GET", "/api/daemon/sync-hints", null, {
+      authorization: `Bearer ${first.device_access_token}`,
+    });
+    assert.equal(staleHints.status, 401);
+
+    const afterStale = await call(env, "GET", "/api/sessions", null, {
+      authorization: `Bearer ${browser.device_access_token}`,
+    });
+    const afterStaleRows = (await afterStale.json()).sessions;
+    assert.equal(afterStaleRows.some((session) => session.device_id === first.daemon_device_id), false);
+    assert.equal(afterStaleRows.some((session) => session.session_id === "sess_machine_stale"), false);
+  });
+
+  it("does not issue new tokens for superseded daemon devices", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const machineFingerprint = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    const first = await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_machine_reauth_old",
+      computerID: "dc_machine_reauth_old",
+      machineFingerprint,
+      returnKeys: true,
+    });
+    const challengeBeforeSupersede = await call(env, "POST", "/api/device-challenge", {
+      device_id: first.daemon_device_id,
+      audience: "daemon-ws",
+    });
+    assert.equal(challengeBeforeSupersede.status, 200);
+    const pendingChallenge = await challengeBeforeSupersede.json();
+
+    await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_machine_reauth_new",
+      computerID: "dc_machine_reauth_new",
+      machineFingerprint,
+    });
+
+    const challengeAfterSupersede = await call(env, "POST", "/api/device-challenge", {
+      device_id: first.daemon_device_id,
+      audience: "daemon-ws",
+    });
+    assert.equal(challengeAfterSupersede.status, 404);
+
+    const signature = await first.keys.sign(challengeMessage(pendingChallenge));
+    const verified = await call(env, "POST", "/api/device-challenge/verify", {
+      device_id: first.daemon_device_id,
+      audience: "daemon-ws",
+      challenge_id: pendingChallenge.challenge_id,
+      signature,
+    });
+    assert.equal(verified.status, 401);
+  });
+
+  it("does not merge same-host daemon devices without a valid machine fingerprint", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+
+    const first = await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_same_host_without_fp_1",
+      computerID: "dc_same_host_without_fp_1",
+      machineFingerprint: "not-a-valid-fingerprint",
+    });
+    const second = await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_same_host_without_fp_2",
+      computerID: "dc_same_host_without_fp_2",
+      machineFingerprint: "not-a-valid-fingerprint",
+    });
+
+    const devices = await call(env, "GET", "/api/devices", null, { cookie });
+    const rows = (await devices.json()).devices;
+    const firstDevice = rows.find((device) => device.device_id === first.daemon_device_id);
+    const secondDevice = rows.find((device) => device.device_id === second.daemon_device_id);
+
+    assert.equal(firstDevice.superseded_by_device_id, undefined);
+    assert.equal(secondDevice.superseded_by_device_id, undefined);
+    assert.equal(firstDevice.machine_fingerprint_bound, false);
+    assert.equal(secondDevice.machine_fingerprint_bound, false);
+  });
+
   it("binds a daemon, accepts sync, and exposes sessions, turns, and host presence", async () => {
     const env = testEnv();
     env.RELEASES = new FakeObjectStore({
@@ -5116,22 +5297,32 @@ async function registerBrowser(env, cookie, publicKey) {
 }
 
 async function loginDaemon(env, cookie) {
+  return await loginDaemonWithIdentity(env, cookie, {
+    daemonDeviceID: "dd_test",
+    computerID: "dc_test",
+  });
+}
+
+async function loginDaemonWithIdentity(env, cookie, options = {}) {
   const keys = await generateSigningKeyPair();
   const codeRes = await call(env, "POST", "/api/daemon/login-codes", null, { cookie });
   const code = await codeRes.json();
+  const daemonDeviceID = options.daemonDeviceID || "dd_test";
   const login = await call(env, "POST", "/api/daemon/login", {
     login_code: code.login_code,
-    daemon_device_id: "dd_test",
+    daemon_device_id: daemonDeviceID,
     daemon_pubkey: keys.publicKey,
-    device_name: "Pockly Test Host",
+    device_name: options.deviceName || "Pockly Test Host",
     hostname: "test-host",
     os: "linux",
     app_version: "0.1.0-test",
-    computer_id: "dc_test",
+    computer_id: options.computerID || "dc_test",
+    ...(options.machineFingerprint ? { machine_fingerprint: options.machineFingerprint } : {}),
   });
   assert.equal(login.status, 200);
   const body = await login.json();
   assert.match(body.device_refresh_token, /^drt_/);
+  if (options.returnKeys) body.keys = keys;
   return body;
 }
 

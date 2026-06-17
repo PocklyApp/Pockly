@@ -98,6 +98,7 @@ export class InMemoryNexusStore {
       ...(existing ?? {}),
       ...computer,
       created_at: existing?.created_at ?? computer.created_at,
+      machine_fingerprint: computer.machine_fingerprint || existing?.machine_fingerprint,
       last_seen_at: computer.last_seen_at ?? existing?.last_seen_at,
     };
     this.computers.set(next.computer_id, next);
@@ -110,6 +111,7 @@ export class InMemoryNexusStore {
       ...(existing ?? {}),
       ...device,
       created_at: existing?.created_at ?? device.created_at,
+      machine_fingerprint: device.machine_fingerprint || existing?.machine_fingerprint,
       remote_access_enabled: Boolean(device.remote_access_enabled ?? existing?.remote_access_enabled),
     };
     this.devices.set(next.device_id, next);
@@ -118,6 +120,18 @@ export class InMemoryNexusStore {
 
   async getDevice(deviceID) {
     return this.devices.get(deviceID) ?? null;
+  }
+
+  async listDaemonDevicesByMachineFingerprint(userID, machineFingerprint) {
+    if (!userID || !machineFingerprint) return [];
+    return [...this.devices.values()]
+      .filter((device) => (
+        device.user_id === userID &&
+        device.device_type === "daemon" &&
+        device.machine_fingerprint === machineFingerprint &&
+        device.status !== "revoked"
+      ))
+      .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   }
 
   async listDevicesForUser(userID) {
@@ -144,6 +158,92 @@ export class InMemoryNexusStore {
     const next = { ...existing, ...patch };
     this.devices.set(deviceID, next);
     return next;
+  }
+
+  async supersedeDaemonDevice(userID, oldDeviceID, newDeviceID, at) {
+    const oldDevice = this.devices.get(oldDeviceID);
+    const newDevice = this.devices.get(newDeviceID);
+    if (!oldDevice || oldDevice.user_id !== userID || !newDevice || newDevice.user_id !== userID) {
+      return { superseded: false, deleted_sessions: [], upserted_sessions: [] };
+    }
+    this.devices.set(oldDeviceID, {
+      ...oldDevice,
+      superseded_by_device_id: newDeviceID,
+      status: "offline",
+      updated_at: at,
+    });
+
+    const deletedSessions = [];
+    const upsertedSessions = [];
+    const moveSessionKey = (sessionID) => sessionKey(userID, newDeviceID, sessionID);
+    for (const session of [...this.sessions.values()]) {
+      if (session.user_id !== userID || session.device_id !== oldDeviceID) continue;
+      const oldKey = sessionKey(userID, oldDeviceID, session.session_id);
+      const nextKey = moveSessionKey(session.session_id);
+      const existingNew = this.sessions.get(nextKey);
+      deletedSessions.push(session);
+      if (existingNew) {
+        this.sessions.delete(oldKey);
+        continue;
+      }
+      const moved = {
+        ...session,
+        computer_id: newDevice.computer_id ?? session.computer_id,
+        device_id: newDeviceID,
+        updated_at: at,
+      };
+      this.sessions.delete(oldKey);
+      this.sessions.set(nextKey, moved);
+      upsertedSessions.push(moved);
+    }
+    const movedSessionIDs = new Set(upsertedSessions.map((session) => String(session.session_id)));
+
+    for (const [key, turn] of [...this.turns.entries()]) {
+      if (turn.user_id !== userID || turn.device_id !== oldDeviceID) continue;
+      const nextKey = turnKey(userID, newDeviceID, turn.session_id, turn.seq);
+      this.turns.delete(key);
+      if (movedSessionIDs.has(String(turn.session_id)) && !this.turns.has(nextKey)) {
+        this.turns.set(nextKey, { ...turn, device_id: newDeviceID, updated_at: at });
+      }
+    }
+    for (const [key, pref] of [...this.sessionPrefs.entries()]) {
+      if (pref.user_id !== userID || pref.device_id !== oldDeviceID) continue;
+      this.sessionPrefs.delete(key);
+      if (!movedSessionIDs.has(String(pref.session_id))) continue;
+      const nextKey = sessionKey(userID, newDeviceID, pref.session_id);
+      if (!this.sessionPrefs.has(nextKey)) this.sessionPrefs.set(nextKey, { ...pref, device_id: newDeviceID, updated_at: at });
+    }
+    for (const [key, hint] of [...this.sessionOpenHints.entries()]) {
+      if (hint.user_id !== userID || hint.device_id !== oldDeviceID) continue;
+      this.sessionOpenHints.delete(key);
+      if (!movedSessionIDs.has(String(hint.session_id))) continue;
+      const nextKey = sessionKey(userID, newDeviceID, hint.session_id);
+      if (!this.sessionOpenHints.has(nextKey)) this.sessionOpenHints.set(nextKey, { ...hint, device_id: newDeviceID, updated_at: at });
+    }
+    for (const [key, pref] of [...this.projectPrefs.entries()]) {
+      if (pref.user_id !== userID || pref.device_id !== oldDeviceID) continue;
+      this.projectPrefs.delete(key);
+      const nextKey = sessionKey(userID, newDeviceID, pref.cwd);
+      if (!this.projectPrefs.has(nextKey)) this.projectPrefs.set(nextKey, { ...pref, device_id: newDeviceID, updated_at: at });
+    }
+    this.sessionEvents = this.sessionEvents.flatMap((event) => {
+      if (event.user_id !== userID || event.device_id !== oldDeviceID) return [event];
+      if (!movedSessionIDs.has(String(event.session_id))) return [];
+      return [{ ...event, device_id: newDeviceID }];
+    });
+    for (const [key, binding] of [...this.deviceBindings.entries()]) {
+      if (binding.user_id !== userID || binding.daemon_device_id !== oldDeviceID) continue;
+      this.deviceBindings.delete(key);
+      const nextKey = bindingKey(newDeviceID, binding.browser_device_id);
+      if (!this.deviceBindings.has(nextKey)) {
+        this.deviceBindings.set(nextKey, {
+          ...binding,
+          daemon_device_id: newDeviceID,
+          updated_at: at,
+        });
+      }
+    }
+    return { superseded: true, deleted_sessions: deletedSessions, upserted_sessions: upsertedSessions };
   }
 
   async touchDevice(deviceID, at) {
@@ -181,6 +281,11 @@ export class InMemoryNexusStore {
     const binding = this.deviceBindings.get(bindingKey(daemonDeviceID, browserDeviceID));
     if (!binding || binding.user_id !== userID || binding.status !== "active") return null;
     return binding;
+  }
+
+  async listDeviceBindingsForDaemon(userID, daemonDeviceID) {
+    return [...this.deviceBindings.values()]
+      .filter((binding) => binding.user_id === userID && binding.daemon_device_id === daemonDeviceID && binding.status === "active");
   }
 
   async deleteDeviceBinding(userID, daemonDeviceID, browserDeviceID, at) {
@@ -819,15 +924,16 @@ export class SQLNexusStore {
   async upsertComputer(computer) {
     await this.db.prepare(`
       INSERT INTO computers (
-        computer_id, user_id, display_name, hostname, os, status,
+        computer_id, user_id, display_name, hostname, os, machine_fingerprint, status,
         current_daemon_device_id, created_at, updated_at, last_seen_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(computer_id) DO UPDATE SET
         user_id = excluded.user_id,
         display_name = COALESCE(NULLIF(excluded.display_name, ''), computers.display_name),
         hostname = excluded.hostname,
         os = excluded.os,
+        machine_fingerprint = COALESCE(excluded.machine_fingerprint, computers.machine_fingerprint),
         status = excluded.status,
         current_daemon_device_id = excluded.current_daemon_device_id,
         updated_at = excluded.updated_at,
@@ -838,6 +944,7 @@ export class SQLNexusStore {
       computer.display_name ?? "",
       computer.hostname ?? null,
       computer.os ?? null,
+      computer.machine_fingerprint ?? null,
       computer.status,
       computer.current_daemon_device_id ?? null,
       computer.created_at,
@@ -852,10 +959,10 @@ export class SQLNexusStore {
       INSERT INTO devices (
         device_id, user_id, computer_id, device_type, device_name, public_key,
         browser_public_key, status, remote_access_enabled, superseded_by_device_id,
-        hostname, os, user_agent, app_version, capabilities,
+        hostname, os, machine_fingerprint, user_agent, app_version, capabilities,
         created_at, updated_at, last_seen_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(device_id) DO UPDATE SET
         user_id = excluded.user_id,
         computer_id = excluded.computer_id,
@@ -868,6 +975,7 @@ export class SQLNexusStore {
         superseded_by_device_id = excluded.superseded_by_device_id,
         hostname = excluded.hostname,
         os = excluded.os,
+        machine_fingerprint = COALESCE(excluded.machine_fingerprint, devices.machine_fingerprint),
         user_agent = excluded.user_agent,
         app_version = excluded.app_version,
         capabilities = excluded.capabilities,
@@ -886,6 +994,7 @@ export class SQLNexusStore {
       device.superseded_by_device_id ?? null,
       device.hostname ?? null,
       device.os ?? null,
+      device.machine_fingerprint ?? null,
       device.user_agent ?? null,
       device.app_version ?? null,
       device.capabilities ? JSON.stringify(device.capabilities) : null,
@@ -899,6 +1008,19 @@ export class SQLNexusStore {
   async getDevice(deviceID) {
     const row = await this.db.prepare(`SELECT * FROM devices WHERE device_id = ?`).bind(deviceID).first();
     return row ? normalizeDeviceRow(row) : null;
+  }
+
+  async listDaemonDevicesByMachineFingerprint(userID, machineFingerprint) {
+    if (!userID || !machineFingerprint) return [];
+    const result = await this.db.prepare(`
+      SELECT * FROM devices
+      WHERE user_id = ?
+        AND device_type = 'daemon'
+        AND machine_fingerprint = ?
+        AND status != 'revoked'
+      ORDER BY updated_at DESC
+    `).bind(userID, machineFingerprint).all();
+    return (result.results ?? []).map(normalizeDeviceRow);
   }
 
   async listDevicesForUser(userID) {
@@ -935,6 +1057,110 @@ export class SQLNexusStore {
     const next = { ...existing, ...patch };
     await this.upsertDevice(next);
     return this.getDevice(deviceID);
+  }
+
+  async supersedeDaemonDevice(userID, oldDeviceID, newDeviceID, at) {
+    if (!userID || !oldDeviceID || !newDeviceID || oldDeviceID === newDeviceID) {
+      return { superseded: false, deleted_sessions: [], upserted_sessions: [] };
+    }
+    const oldDevice = await this.getDevice(oldDeviceID);
+    const newDevice = await this.getDevice(newDeviceID);
+    if (!oldDevice || oldDevice.user_id !== userID || !newDevice || newDevice.user_id !== userID) {
+      return { superseded: false, deleted_sessions: [], upserted_sessions: [] };
+    }
+
+    const oldSessions = await this.listDeviceSessions(userID, oldDeviceID);
+    const newSessionIDs = new Set((await this.listDeviceSessions(userID, newDeviceID)).map((session) => String(session.session_id)));
+    const upsertedSessions = [];
+    for (const session of oldSessions) {
+      const sessionID = String(session.session_id);
+      if (newSessionIDs.has(sessionID)) continue;
+      const moved = {
+        ...session,
+        computer_id: newDevice.computer_id ?? session.computer_id,
+        device_id: newDeviceID,
+        updated_at: at,
+      };
+      await this.upsertSession(moved);
+      upsertedSessions.push(moved);
+    }
+
+    const movedSessionIDs = new Set(upsertedSessions.map((session) => String(session.session_id)));
+    await this.copyTurnRowsForSessions(userID, oldDeviceID, newDeviceID, [...movedSessionIDs], at);
+
+    for (const pref of await this.listSessionPrefsForDevice(userID, oldDeviceID)) {
+      if (!movedSessionIDs.has(String(pref.session_id))) continue;
+      await this.upsertSessionPref({ ...pref, device_id: newDeviceID, updated_at: at });
+    }
+    for (const hint of await this.listSessionOpenHintsForDevice(userID, oldDeviceID)) {
+      if (!movedSessionIDs.has(String(hint.session_id))) continue;
+      await this.upsertSessionOpenHint({ ...hint, device_id: newDeviceID, updated_at: at });
+    }
+    for (const pref of await this.listProjectPrefsForUser(userID)) {
+      if (pref.device_id !== oldDeviceID) continue;
+      const existing = await this.db.prepare(`
+        SELECT * FROM project_prefs WHERE user_id = ? AND device_id = ? AND cwd = ?
+      `).bind(userID, newDeviceID, pref.cwd).first();
+      if (!existing) await this.upsertProjectPref({ ...pref, device_id: newDeviceID, updated_at: at });
+    }
+    for (const binding of await this.listDeviceBindingsForDaemon(userID, oldDeviceID)) {
+      await this.upsertDeviceBinding({ ...binding, daemon_device_id: newDeviceID, updated_at: at });
+    }
+
+    if (movedSessionIDs.size > 0) {
+      const ids = [...movedSessionIDs];
+      for (let i = 0; i < ids.length; i += 50) {
+        const batch = ids.slice(i, i + 50);
+        const placeholders = batch.map(() => "?").join(", ");
+        await this.db.prepare(`
+          UPDATE session_events
+          SET device_id = ?
+          WHERE user_id = ? AND device_id = ? AND session_id IN (${placeholders})
+        `).bind(newDeviceID, userID, oldDeviceID, ...batch).run();
+      }
+    }
+
+    await this.patchDevice(userID, oldDeviceID, {
+      superseded_by_device_id: newDeviceID,
+      status: "offline",
+      updated_at: at,
+    });
+    await this.db.prepare(`DELETE FROM session_turns WHERE user_id = ? AND device_id = ?`).bind(userID, oldDeviceID).run();
+    await this.db.prepare(`DELETE FROM sessions WHERE user_id = ? AND device_id = ?`).bind(userID, oldDeviceID).run();
+    await this.db.prepare(`DELETE FROM session_prefs WHERE user_id = ? AND device_id = ?`).bind(userID, oldDeviceID).run();
+    await this.db.prepare(`DELETE FROM session_open_hints WHERE user_id = ? AND device_id = ?`).bind(userID, oldDeviceID).run();
+    await this.db.prepare(`DELETE FROM session_events WHERE user_id = ? AND device_id = ?`).bind(userID, oldDeviceID).run();
+    await this.db.prepare(`DELETE FROM project_prefs WHERE user_id = ? AND device_id = ?`).bind(userID, oldDeviceID).run();
+    await this.db.prepare(`DELETE FROM device_bindings WHERE user_id = ? AND daemon_device_id = ?`).bind(userID, oldDeviceID).run();
+    return { superseded: true, deleted_sessions: oldSessions, upserted_sessions: upsertedSessions };
+  }
+
+  async copyTurnRowsForSessions(userID, oldDeviceID, newDeviceID, sessionIDs = [], at) {
+    const ids = [...new Set(sessionIDs.map((id) => String(id)).filter(Boolean))];
+    if (!ids.length) return 0;
+    let copied = 0;
+    for (let i = 0; i < ids.length; i += 50) {
+      const batch = ids.slice(i, i + 50);
+      const placeholders = batch.map(() => "?").join(", ");
+      const result = await this.db.prepare(`
+        INSERT INTO session_turns (user_id, device_id, session_id, seq, agent, kind, timestamp, payload, updated_at)
+        SELECT user_id, ?, session_id, seq, agent, kind, timestamp, payload, ?
+        FROM session_turns AS old_turns
+        WHERE old_turns.user_id = ?
+          AND old_turns.device_id = ?
+          AND old_turns.session_id IN (${placeholders})
+          AND NOT EXISTS (
+            SELECT 1
+            FROM session_turns AS new_turns
+            WHERE new_turns.user_id = old_turns.user_id
+              AND new_turns.device_id = ?
+              AND new_turns.session_id = old_turns.session_id
+              AND new_turns.seq = old_turns.seq
+          )
+      `).bind(newDeviceID, at, userID, oldDeviceID, ...batch, newDeviceID).run();
+      copied += Number(result?.meta?.changes ?? 0) || 0;
+    }
+    return copied;
   }
 
   async touchDevice(deviceID, at) {
@@ -976,6 +1202,14 @@ export class SQLNexusStore {
       SELECT * FROM device_bindings
       WHERE user_id = ? AND daemon_device_id = ? AND browser_device_id = ? AND status = 'active'
     `).bind(userID, daemonDeviceID, browserDeviceID).first();
+  }
+
+  async listDeviceBindingsForDaemon(userID, daemonDeviceID) {
+    const result = await this.db.prepare(`
+      SELECT * FROM device_bindings
+      WHERE user_id = ? AND daemon_device_id = ? AND status = 'active'
+    `).bind(userID, daemonDeviceID).all();
+    return result.results ?? [];
   }
 
   async deleteDeviceBinding(userID, daemonDeviceID, browserDeviceID, at) {
@@ -1029,12 +1263,12 @@ export class SQLNexusStore {
       INSERT INTO daemon_device_authorizations (
         device_code, user_code, poll_secret, daemon_device_id, daemon_public_key,
         device_name, hostname, os, app_version, computer_id, computer_public_key,
-        computer_signature, status, user_id, verification_uri,
+        computer_signature, machine_fingerprint, status, user_id, verification_uri,
         verification_uri_complete, poll_interval, expires_at, authorized_at,
         denied_at, consumed_at, claim_payload, claim_browser_device_id,
         claim_requested_at, daemon_confirmed_at, daemon_denied_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(device_code) DO UPDATE SET
         status = excluded.status,
         user_id = excluded.user_id,
@@ -1059,6 +1293,7 @@ export class SQLNexusStore {
       authorization.computer_id ?? null,
       authorization.computer_public_key ?? null,
       authorization.computer_signature ?? null,
+      authorization.machine_fingerprint ?? null,
       authorization.status,
       authorization.user_id ?? null,
       authorization.verification_uri,
@@ -1088,10 +1323,10 @@ export class SQLNexusStore {
       INSERT INTO daemon_setup_grants (
         setup_grant, poll_secret, daemon_device_id, daemon_public_key,
         device_name, hostname, os, app_version, computer_id,
-        computer_public_key, computer_signature, setup_url, status,
+        computer_public_key, computer_signature, machine_fingerprint, setup_url, status,
         user_id, browser_device_id, expires_at, claimed_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(setup_grant) DO UPDATE SET
         status = excluded.status,
         user_id = excluded.user_id,
@@ -1109,6 +1344,7 @@ export class SQLNexusStore {
       grant.computer_id ?? null,
       grant.computer_public_key ?? null,
       grant.computer_signature ?? null,
+      grant.machine_fingerprint ?? null,
       grant.setup_url,
       grant.status,
       grant.user_id ?? null,
@@ -1129,12 +1365,12 @@ export class SQLNexusStore {
     await this.db.prepare(`
       INSERT INTO pairing_grants (
         pairing_grant, daemon_device_id, daemon_public_key, computer_id,
-        computer_public_key, computer_signature, relay_url, short_code,
+        computer_public_key, computer_signature, machine_fingerprint, relay_url, short_code,
         device_name, hostname, os, expires_at, status, user_id,
         browser_device_id, browser_device_name, browser_device_pub,
         confirmation_user, confirmed_at, denied_at, claimed_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(pairing_grant) DO UPDATE SET
         status = excluded.status,
         user_id = excluded.user_id,
@@ -1152,6 +1388,7 @@ export class SQLNexusStore {
       grant.computer_id ?? null,
       grant.computer_public_key ?? null,
       grant.computer_signature ?? null,
+      grant.machine_fingerprint ?? null,
       grant.relay_url,
       grant.short_code,
       grant.device_name ?? "",

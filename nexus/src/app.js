@@ -50,6 +50,7 @@ const defaultGlobalHotTurnPruneIntervalMs = 10 * 60 * 1000;
 const maxScopedHotTurnPruneSessions = 25;
 const defaultSessionEventBatchMs = 200;
 const defaultSessionEventBatchMax = 64;
+const machineFingerprintPattern = /^[a-f0-9]{32,128}$/i;
 const edgeRetentionProfiles = Object.freeze({
   standard: Object.freeze({
     hotTurnsPerSession: 100,
@@ -351,6 +352,7 @@ async function createDeviceAuthorization(request, store, url) {
     computer_id: body.computer_id || "",
     computer_public_key: body.computer_public_key || "",
     computer_signature: body.computer_signature || "",
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     status: "pending",
     verification_uri: `${base}/cli/login`,
     verification_uri_complete: `${base}/cli/login?device_code=${encodeURIComponent(deviceCode)}`,
@@ -578,6 +580,7 @@ async function createSetupGrant(request, store, url) {
     computer_id: body.computer_id || "",
     computer_public_key: body.computer_public_key || "",
     computer_signature: body.computer_signature || "",
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     setup_url: `${base}/devices/connect?daemon_setup=${encodeURIComponent(setupGrant)}`,
     status: "pending",
     expires_at: new Date(now.getTime() + 10 * 60 * 1000).toISOString(),
@@ -681,6 +684,7 @@ async function createPairingGrant(request, store, url) {
     device_id: daemonDeviceID,
     user_id: existing?.user_id ?? null,
     computer_id: body.computer_id || existing?.computer_id || null,
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint) || existing?.machine_fingerprint || null,
     device_type: "daemon",
     device_name: body.device_name || existing?.device_name || "Pockly Daemon",
     public_key: daemonPublicKey,
@@ -700,6 +704,7 @@ async function createPairingGrant(request, store, url) {
     computer_id: body.computer_id || "",
     computer_public_key: body.computer_public_key || "",
     computer_signature: body.computer_signature || "",
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     relay_url: body.relay_url || publicBaseURL(request, url),
     short_code: formatUserCode(),
     device_name: body.device_name || "Pockly Daemon",
@@ -824,6 +829,7 @@ async function confirmPairingGrant(request, store, pairingGrant) {
     os: grant.os,
     computer_id: grant.computer_id,
     computer_public_key: grant.computer_public_key,
+    machine_fingerprint: grant.machine_fingerprint,
   }, now, true);
   const browser = await store.getDevice(grant.browser_device_id);
   if (browser) {
@@ -1049,7 +1055,7 @@ async function createDeviceChallenge(request, store) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   const body = await readJSON(request);
   const device = await store.getDevice(requiredString(body.device_id, "device_id"));
-  if (!device || device.status === "revoked") {
+  if (!device || device.status === "revoked" || device.superseded_by_device_id) {
     return errorResponse("eligible device not found", ErrorCode.NotFound, { status: 404 });
   }
   const now = new Date();
@@ -1073,7 +1079,7 @@ async function verifyDeviceChallenge(request, store) {
     return errorResponse("challenge expired", ErrorCode.Unauthorized, { status: 401 });
   }
   const device = await store.getDevice(requiredString(body.device_id, "device_id"));
-  if (!device || device.status === "revoked" || device.device_id !== challenge.device_id || body.audience !== challenge.audience) {
+  if (!device || device.status === "revoked" || device.superseded_by_device_id || device.device_id !== challenge.device_id || body.audience !== challenge.audience) {
     return errorResponse("challenge mismatch", ErrorCode.Unauthorized, { status: 401 });
   }
   const verified = await verifyDeviceSignature(device, challengeMessage(challenge), requiredString(body.signature, "signature"));
@@ -2261,7 +2267,7 @@ async function listOnlineHosts(request, store, env, telemetryProvider = null) {
   }
   const release = await daemonReleaseSnapshot(env);
   const devices = await store.listDevicesForUser(user.user_id);
-  const daemonDevices = devices.filter((entry) => entry.device_type === "daemon" && entry.status !== "revoked");
+  const daemonDevices = devices.filter((entry) => entry.device_type === "daemon" && entry.status !== "revoked" && !entry.superseded_by_device_id);
   const daemonDeviceIDs = daemonDevices.map((device) => device.device_id);
   const control = daemonDeviceIDs.length > 0 ? createControlHubForUser(env, user.user_id) : null;
   const presenceMap = control
@@ -3865,16 +3871,18 @@ async function upsertDaemonDevice(store, user, body, now) {
     display_name: body.device_name || body.hostname || "Pockly Computer",
     hostname: body.hostname || "",
     os: body.os || "",
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     status: "active",
     current_daemon_device_id: requiredString(body.daemon_device_id, "daemon_device_id"),
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
     last_seen_at: now.toISOString(),
   });
-  return await store.upsertDevice({
+  const daemon = await store.upsertDevice({
     device_id: requiredString(body.daemon_device_id, "daemon_device_id"),
     user_id: user.user_id,
     computer_id: computerID,
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     device_type: "daemon",
     device_name: body.device_name || body.hostname || "Pockly Daemon",
     public_key: requiredString(body.daemon_pubkey, "daemon_pubkey"),
@@ -3887,6 +3895,8 @@ async function upsertDaemonDevice(store, user, body, now) {
     updated_at: now.toISOString(),
     last_seen_at: now.toISOString(),
   });
+  await supersedeDaemonDevicesForMachine(store, user.user_id, daemon, now.toISOString());
+  return daemon;
 }
 
 async function upsertDaemonFromAuthorization(store, user, auth, now, markSeen) {
@@ -3899,6 +3909,7 @@ async function upsertDaemonFromAuthorization(store, user, auth, now, markSeen) {
     app_version: auth.app_version,
     computer_id: auth.computer_id,
     computer_public_key: auth.computer_public_key,
+    machine_fingerprint: auth.machine_fingerprint,
   }, now, markSeen);
 }
 
@@ -3912,6 +3923,7 @@ async function upsertDaemonFromSetupGrant(store, user, grant, now) {
     app_version: grant.app_version,
     computer_id: grant.computer_id,
     computer_public_key: grant.computer_public_key,
+    machine_fingerprint: grant.machine_fingerprint,
   }, now, true);
 }
 
@@ -3924,16 +3936,18 @@ async function upsertDaemonIdentity(store, user, body, now, markSeen) {
     display_name: body.device_name || body.hostname || "Pockly Computer",
     hostname: body.hostname || "",
     os: body.os || "",
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     status: "active",
     current_daemon_device_id: requiredString(body.daemon_device_id, "daemon_device_id"),
     created_at: now.toISOString(),
     updated_at: now.toISOString(),
     last_seen_at: markSeen ? now.toISOString() : undefined,
   });
-  return await store.upsertDevice({
+  const daemon = await store.upsertDevice({
     device_id: requiredString(body.daemon_device_id, "daemon_device_id"),
     user_id: user.user_id,
     computer_id: computerID,
+    machine_fingerprint: safeMachineFingerprint(body.machine_fingerprint),
     device_type: "daemon",
     device_name: body.device_name || body.hostname || "Pockly Daemon",
     public_key: requiredString(body.daemon_pubkey, "daemon_pubkey"),
@@ -3946,6 +3960,53 @@ async function upsertDaemonIdentity(store, user, body, now, markSeen) {
     updated_at: now.toISOString(),
     ...(markSeen ? { last_seen_at: now.toISOString() } : {}),
   });
+  await supersedeDaemonDevicesForMachine(store, user.user_id, daemon, now.toISOString());
+  return daemon;
+}
+
+async function supersedeDaemonDevicesForMachine(store, userID, currentDaemon, at) {
+  const machineFingerprint = currentDaemon?.machine_fingerprint || "";
+  if (!machineFingerprint || typeof store.listDaemonDevicesByMachineFingerprint !== "function") return;
+  const devices = await store.listDaemonDevicesByMachineFingerprint(userID, machineFingerprint);
+  for (const device of devices) {
+    if (device.device_id === currentDaemon.device_id || device.superseded_by_device_id || device.status === "revoked") continue;
+    const result = typeof store.supersedeDaemonDevice === "function"
+      ? await store.supersedeDaemonDevice(userID, device.device_id, currentDaemon.device_id, at)
+      : {
+          superseded: Boolean(await store.patchDevice(userID, device.device_id, {
+            superseded_by_device_id: currentDaemon.device_id,
+            status: "offline",
+            updated_at: at,
+          })),
+          deleted_sessions: [],
+          upserted_sessions: [],
+        };
+    if (!result?.superseded) continue;
+    await appendSessionCatalogChanges(store, [
+      ...(result.deleted_sessions ?? []).map((session) => ({
+        type: "delete",
+        user_id: userID,
+        device_id: device.device_id,
+        session_id: session.session_id,
+        session: null,
+        at,
+      })),
+      ...(result.upserted_sessions ?? []).map((session) => ({
+        type: "upsert",
+        user_id: userID,
+        device_id: currentDaemon.device_id,
+        session_id: session.session_id,
+        session,
+        at,
+      })),
+    ]);
+  }
+}
+
+function safeMachineFingerprint(value) {
+  const fingerprint = String(value || "").trim();
+  if (!fingerprint || !machineFingerprintPattern.test(fingerprint)) return "";
+  return fingerprint.toLowerCase();
 }
 
 async function upsertBrowserDevice(store, user, body, now) {
@@ -4596,6 +4657,7 @@ function publicDevice(device) {
     hostname: device.hostname,
     user_agent: device.user_agent,
     app_version: device.app_version,
+    machine_fingerprint_bound: Boolean(device.machine_fingerprint),
     remote_access_enabled: Boolean(device.remote_access_enabled),
     computer_id: device.computer_id,
     superseded_by_device_id: device.superseded_by_device_id,
