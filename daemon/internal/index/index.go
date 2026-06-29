@@ -7,6 +7,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,6 +23,7 @@ import (
 	"github.com/PocklyApp/Pockly/daemon/internal/agent"
 	"github.com/PocklyApp/Pockly/daemon/internal/agent/claude"
 	"github.com/PocklyApp/Pockly/daemon/internal/agent/codex"
+	_ "modernc.org/sqlite"
 )
 
 // firstMessageStripPatterns mirror the regexes the web's
@@ -51,6 +54,7 @@ type SessionRef struct {
 	Agent string
 	Cwd   string
 	Path  string
+	Title string
 }
 
 // Index maintains a read-optimized in-memory snapshot of local sessions.
@@ -626,6 +630,7 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 	}
 
 	if cfg.CodexHome != "" {
+		codexTitles := readCodexSessionTitles(cfg.CodexHome)
 		codexProjects, err := codex.ListProjects(cfg.CodexHome)
 		if err != nil {
 			return nil, nil, err
@@ -638,6 +643,7 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 			}
 			for _, s := range p.Sessions {
 				session := buildCatalogSession(s.SessionID, s.Path, "")
+				session.Title = codexTitles[s.SessionID]
 				// Codex names rollout files with a dashed wall-clock stamp
 				// ("...T17-06-32") that is not RFC3339-parseable; the web would
 				// render it raw. Prefer the file mtime (like Claude), falling
@@ -650,6 +656,7 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 					Agent: agentCodex,
 					Cwd:   p.Cwd,
 					Path:  s.Path,
+					Title: session.Title,
 				}
 			}
 			sortSessions(project.Sessions)
@@ -680,6 +687,8 @@ func snapshotSignature(projects []agent.Project) string {
 			b.WriteByte('\x00')
 			b.WriteString(session.Timestamp)
 			b.WriteByte('\x00')
+			b.WriteString(session.Title)
+			b.WriteByte('\x00')
 		}
 	}
 	return b.String()
@@ -708,6 +717,82 @@ func normalizeCodexTimestamp(ts string) string {
 		return t.UTC().Format(time.RFC3339)
 	}
 	return ts
+}
+
+func readCodexSessionTitles(codexHome string) map[string]string {
+	titles := readCodexSessionIndexTitles(filepath.Join(codexHome, "session_index.jsonl"))
+	for sid, title := range readCodexStateDBTitles(filepath.Join(codexHome, "state_5.sqlite")) {
+		if strings.TrimSpace(titles[sid]) == "" {
+			titles[sid] = title
+		}
+	}
+	return titles
+}
+
+func readCodexSessionIndexTitles(path string) map[string]string {
+	out := map[string]string{}
+	f, err := os.Open(path)
+	if err != nil {
+		return out
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := bytes.TrimSpace(sc.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			ID         string `json:"id"`
+			ThreadName string `json:"thread_name"`
+		}
+		if err := json.Unmarshal(line, &rec); err != nil {
+			continue
+		}
+		id := strings.TrimSpace(rec.ID)
+		title := cleanCodexThreadTitle(rec.ThreadName)
+		if id != "" && title != "" {
+			out[id] = title
+		}
+	}
+	return out
+}
+
+func readCodexStateDBTitles(path string) map[string]string {
+	out := map[string]string{}
+	if _, err := os.Stat(path); err != nil {
+		return out
+	}
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
+	if err != nil {
+		return out
+	}
+	defer db.Close()
+
+	rows, err := db.Query(`SELECT id, title FROM threads WHERE COALESCE(title, '') <> ''`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, title string
+		if err := rows.Scan(&id, &title); err != nil {
+			continue
+		}
+		id = strings.TrimSpace(id)
+		title = cleanCodexThreadTitle(title)
+		if id != "" && title != "" {
+			out[id] = title
+		}
+	}
+	return out
+}
+
+func cleanCodexThreadTitle(title string) string {
+	return truncateSingleLine(title, 140)
 }
 
 func catalogSessionTitle(agentName, cwd, sessionID, timestamp string) string {
@@ -833,6 +918,7 @@ func (i *Index) watchRoots() []string {
 	}
 	if i.cfg.CodexHome != "" {
 		roots = append(roots,
+			i.cfg.CodexHome,
 			filepath.Join(i.cfg.CodexHome, "sessions"),
 			filepath.Join(i.cfg.CodexHome, "archived_sessions"),
 		)
@@ -869,6 +955,9 @@ func (i *Index) addWatchDirRecursive(w *fsnotify.Watcher, root string) error {
 func shouldRefreshForPath(path string) bool {
 	base := filepath.Base(path)
 	if strings.HasSuffix(base, ".jsonl") {
+		return true
+	}
+	if base == "state_5.sqlite" || base == "session_index.jsonl" {
 		return true
 	}
 	return filepath.Ext(base) == ""

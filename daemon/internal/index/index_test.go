@@ -5,6 +5,7 @@ package index
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,10 @@ func TestRefreshBuildsSnapshot(t *testing.T) {
 {"timestamp":"2026-05-18T10:00:00Z","type":"session_meta","payload":{"id":"`+codexID+`","cwd":"/tmp/codex/project"}}
 {"timestamp":"2026-05-18T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello from codex world"}]}}
 {"timestamp":"2026-05-18T10:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"codex reply"}]}}
+`)
+	mustWriteFile(t, filepath.Join(codexHome, "session_index.jsonl"), `
+{"id":"`+codexID+`","thread_name":"old generated title","updated_at":"2026-05-18T10:00:02Z"}
+{"id":"`+codexID+`","thread_name":"Generated Network Title","updated_at":"2026-05-18T10:00:05Z"}
 `)
 
 	idx := New(Config{
@@ -73,6 +78,9 @@ func TestRefreshBuildsSnapshot(t *testing.T) {
 			if s.SessionID != codexID {
 				t.Fatalf("codex session id = %q", s.SessionID)
 			}
+			if s.Title != "Generated Network Title" {
+				t.Fatalf("codex title = %q, want Codex thread_name", s.Title)
+			}
 			if !strings.Contains(s.Snippet, "project") || !strings.Contains(s.Snippet, "Codex") {
 				t.Fatalf("codex snippet = %q", s.Snippet)
 			}
@@ -92,6 +100,43 @@ func TestRefreshBuildsSnapshot(t *testing.T) {
 	ref, ok = idx.FindSession(codexID)
 	if !ok || ref.Agent != agentCodex || !strings.HasSuffix(ref.Path, codexID+".jsonl") {
 		t.Fatalf("bad codex ref: %+v ok=%v", ref, ok)
+	}
+}
+
+func TestReadCodexSessionTitlesPrefersSessionIndexLatestEntry(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionID := "11111111-2222-3333-4444-555555555555"
+	mustWriteFile(t, filepath.Join(codexHome, "session_index.jsonl"), `
+{"id":"`+sessionID+`","thread_name":"Old Draft Title","updated_at":"2026-06-24T14:33:00Z"}
+{"id":"`+sessionID+`","thread_name":"Final Generated Title","updated_at":"2026-06-24T14:34:00Z"}
+`)
+
+	titles := readCodexSessionTitles(codexHome)
+	if got := titles[sessionID]; got != "Final Generated Title" {
+		t.Fatalf("title = %q, want latest session_index thread_name", got)
+	}
+}
+
+func TestReadCodexSessionTitlesFallsBackToStateDB(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionID := "22222222-2222-2222-2222-222222222222"
+	writeCodexStateDBTitle(t, filepath.Join(codexHome, "state_5.sqlite"), sessionID, "State DB Title")
+
+	titles := readCodexSessionTitles(codexHome)
+	if got := titles[sessionID]; got != "State DB Title" {
+		t.Fatalf("title = %q, want state_5.sqlite title", got)
+	}
+}
+
+func TestReadCodexSessionTitlesSessionIndexBeatsStateDB(t *testing.T) {
+	codexHome := t.TempDir()
+	sessionID := "33333333-3333-3333-3333-333333333333"
+	mustWriteFile(t, filepath.Join(codexHome, "session_index.jsonl"), `{"id":"`+sessionID+`","thread_name":"Session Index Title"}`+"\n")
+	writeCodexStateDBTitle(t, filepath.Join(codexHome, "state_5.sqlite"), sessionID, "State DB Title")
+
+	titles := readCodexSessionTitles(codexHome)
+	if got := titles[sessionID]; got != "Session Index Title" {
+		t.Fatalf("title = %q, want session_index title", got)
 	}
 }
 
@@ -274,6 +319,21 @@ func mustMkdirAll(t *testing.T, path string) {
 func mustWriteFile(t *testing.T, path string, body string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeCodexStateDBTitle(t *testing.T, path, sessionID, title string) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO threads (id, title) VALUES (?, ?)`, sessionID, title); err != nil {
 		t.Fatal(err)
 	}
 }

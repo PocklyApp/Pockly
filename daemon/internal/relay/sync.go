@@ -92,7 +92,7 @@ func BuildCatalogSyncSessions(idx *index.Index, profile runner.Profile) []pair.S
 	sessions := make([]pair.SyncSession, 0, len(entries))
 	for _, entry := range entries {
 		session := entry.session
-		title := firstNonEmpty(session.FirstMessageForTitle, session.FirstMessage, session.Snippet)
+		title := firstNonEmpty(session.Title, session.FirstMessageForTitle, session.FirstMessage, session.Snippet)
 		snippet := firstNonEmpty(session.FirstMessage, session.Snippet, title)
 		sessions = append(sessions, pair.SyncSession{
 			SessionID:         session.SessionID,
@@ -232,14 +232,15 @@ func BuildSingleSessionWindowSyncRequestContext(ctx context.Context, idx *index.
 	if hasOlder || minSeq > 1 {
 		syncState = "partial"
 	}
-	title := firstNonEmpty(firstUserMessageTitle(data.Blocks), safeSessionTitle(ref.Agent, firstNonEmpty(data.Cwd, ref.Cwd), sessionID))
+	title := firstNonEmpty(ref.Title, firstUserMessageTitle(data.Blocks), safeSessionTitle(ref.Agent, firstNonEmpty(data.Cwd, ref.Cwd), sessionID))
+	snippet := firstNonEmpty(firstUserMessageTitle(data.Blocks), title)
 	req.Sessions = append(req.Sessions, pair.SyncSession{
 		SessionID:         sessionID,
 		Agent:             ref.Agent,
 		RunnerAlias:       profile.AliasFor(ref.Agent),
 		Cwd:               safeCwdLabel(firstNonEmpty(data.Cwd, ref.Cwd)),
 		Title:             title,
-		Snippet:           title,
+		Snippet:           snippet,
 		LastSeq:           totalCount,
 		LastTimestamp:     lastBlockTimestamp(data.Blocks, ""),
 		ChannelLastSeenAt: lastBlockTimestamp(data.Blocks, ""),

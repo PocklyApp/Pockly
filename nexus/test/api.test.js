@@ -1434,6 +1434,57 @@ describe("Nexus api", () => {
     assert.equal(session.snippet, "new snippet");
   });
 
+  it("updates catalog-only title and snippet without materializing turns", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const baseSession = {
+      session_id: "sess_catalog_only_title_refresh",
+      agent: "codex",
+      cwd: "/work/codex",
+      title: "Old derived prompt title",
+      snippet: "old first message",
+      last_seq: 0,
+      last_timestamp: "2026-06-06T04:00:00.000Z",
+      turn_count: 1200,
+      sync_state: "catalog_only",
+    };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [baseSession],
+      turns: [],
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+
+    store.resetCounts();
+    const retry = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [{
+        ...baseSession,
+        title: "Codex generated title",
+        snippet: "new first message",
+      }],
+      turns: [],
+    }, daemonAuth);
+    assert.equal(retry.status, 200);
+    const retryBody = await retry.json();
+    assert.equal(retryBody.turn_count, 0);
+    assert.equal(retryBody.session_upsert_count, 1);
+    assert.equal(retryBody.session_fast_path_count, 0);
+    assert.equal(store.counts.upsertTurnRows, 0);
+    assert.equal(store.counts.getSessionTurnStats, 0);
+    assert.equal(store.counts.upsertSessionRows, 1);
+    assert.equal(store.counts.appendSessionCatalogChangeRows, 1);
+    const session = await store.getSession("usr_test", daemon.daemon_device_id, "sess_catalog_only_title_refresh");
+    assert.equal(session.title, "Codex generated title");
+    assert.equal(session.snippet, "new first message");
+    assert.equal(session.sync_state, "catalog_only");
+    assert.equal(Number(session.synced_turn_count ?? 0), 0);
+  });
+
   it("reports history storage usage for inline, blob, and batched payloads", async () => {
     const objectStore = new FakeObjectStore({});
     const env = testEnv();

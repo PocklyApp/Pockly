@@ -213,6 +213,7 @@ func TestBuildCatalogSyncRequestIncludesSupportedAgentSessions(t *testing.T) {
 	codexID := "44444444-4444-4444-4444-444444444444"
 	mustWriteFile(t, filepath.Join(claudeHome, "-claude-project", claudeID+".jsonl"), `{"sessionId":"`+claudeID+`","cwd":"/tmp/claude","timestamp":"2026-05-20T10:00:00Z","type":"user","message":{"role":"user","content":"hi"}}`+"\n")
 	writeCodexRollout(t, codexHome, "2026-05-20T10-00-01", codexID, "/tmp/codex", "hello from codex", "codex reply")
+	writeCodexSessionIndex(t, codexHome, codexID, "Codex Generated Title")
 
 	idx := index.New(index.Config{ClaudeHome: claudeHome, CodexHome: codexHome, RefreshInterval: time.Minute})
 	if err := idx.Refresh(); err != nil {
@@ -236,6 +237,22 @@ func TestBuildCatalogSyncRequestIncludesSupportedAgentSessions(t *testing.T) {
 	if agentsByID[codexID] != "codex" {
 		t.Fatalf("codex session agent = %q, want codex; sessions=%+v", agentsByID[codexID], req.Sessions)
 	}
+	var codexSession = -1
+	for i := range req.Sessions {
+		if req.Sessions[i].SessionID == codexID {
+			codexSession = i
+			break
+		}
+	}
+	if codexSession < 0 {
+		t.Fatalf("missing codex session in %+v", req.Sessions)
+	}
+	if req.Sessions[codexSession].Title != "Codex Generated Title" {
+		t.Fatalf("codex title = %q, want Codex generated title", req.Sessions[codexSession].Title)
+	}
+	if req.Sessions[codexSession].Snippet != "hello from codex" {
+		t.Fatalf("codex snippet = %q, want first user message", req.Sessions[codexSession].Snippet)
+	}
 }
 
 func TestBuildSingleSessionSyncRequestEmitsCodexTurns(t *testing.T) {
@@ -244,6 +261,7 @@ func TestBuildSingleSessionSyncRequestEmitsCodexTurns(t *testing.T) {
 	codexHome := filepath.Join(root, ".codex")
 	codexID := "55555555-5555-5555-5555-555555555555"
 	writeCodexRollout(t, codexHome, "2026-05-21T09-00-00", codexID, "/tmp/codex-sync", "list codex files", "codex found README.md")
+	writeCodexSessionIndex(t, codexHome, codexID, "Codex Sync Title")
 
 	idx := index.New(index.Config{ClaudeHome: claudeHome, CodexHome: codexHome, RefreshInterval: time.Minute})
 	if err := idx.Refresh(); err != nil {
@@ -262,6 +280,12 @@ func TestBuildSingleSessionSyncRequestEmitsCodexTurns(t *testing.T) {
 	}
 	if req.Sessions[0].Cwd != "codex-sync" {
 		t.Fatalf("session cwd = %q, want codex-sync", req.Sessions[0].Cwd)
+	}
+	if req.Sessions[0].Title != "Codex Sync Title" {
+		t.Fatalf("session title = %q, want Codex index title", req.Sessions[0].Title)
+	}
+	if req.Sessions[0].Snippet != "list codex files" {
+		t.Fatalf("session snippet = %q, want first user message", req.Sessions[0].Snippet)
 	}
 	if len(req.Turns) != 2 {
 		t.Fatalf("len(turns) = %d, want 2 codex turns", len(req.Turns))
@@ -661,6 +685,12 @@ func writeCodexRollout(t *testing.T, codexHome, tsDash, sessionID, cwd, userText
 		t.Fatal(err)
 	}
 	return path, catalogTS
+}
+
+func writeCodexSessionIndex(t *testing.T, codexHome, sessionID, title string) {
+	t.Helper()
+	mustMkdirAll(t, codexHome)
+	mustWriteFile(t, filepath.Join(codexHome, "session_index.jsonl"), fmt.Sprintf(`{"id":%q,"thread_name":"old title","updated_at":"2026-05-20T10:00:00Z"}`+"\n"+`{"id":%q,"thread_name":%q,"updated_at":"2026-05-20T10:00:01Z"}`+"\n", sessionID, sessionID, title))
 }
 
 // TestBuildCatalogSyncRequestBoundsBodyToByteBudget is the regression for the

@@ -114,6 +114,9 @@ type Project struct {
 // Session is the listing-shape entry for the project list view.
 type Session struct {
 	SessionID string `json:"session_id"`
+	// Title is the agent-provided display title when the agent keeps one
+	// separately from the first user message (for example Codex thread_name).
+	Title string `json:"title,omitempty"`
 	// Timestamp is best-effort: claude jsonl filenames are pure UUIDs,
 	// but the indexer upgrades it to the latest seen block timestamp.
 	Timestamp string `json:"timestamp,omitempty"`

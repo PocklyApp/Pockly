@@ -1135,18 +1135,8 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   );
   const durableSessionIDs = durableDaemonSyncSessionIDs(sessions, existingBySessionID, openedBackfillSessionIDs);
   const durableTurns = turns.filter((turn) => durableSessionIDs.has(String(turn?.session_id ?? "")));
-  const uploadedTurnStatsBySession = new Map();
-  for (const turn of durableTurns) {
-    const sessionID = String(turn.session_id ?? "");
-    const seq = Number(turn.seq ?? 0) || 0;
-    const stats = uploadedTurnStatsBySession.get(sessionID) || { count: 0, min_seq: 0, max_seq: 0 };
-    stats.count += 1;
-    if (seq > 0) {
-      stats.min_seq = stats.min_seq > 0 ? Math.min(stats.min_seq, seq) : seq;
-      stats.max_seq = Math.max(stats.max_seq, seq);
-    }
-    uploadedTurnStatsBySession.set(sessionID, stats);
-  }
+  const receivedTurnStatsBySession = turnStatsBySession(turns);
+  const uploadedTurnStatsBySession = turnStatsBySession(durableTurns);
   const turnRecords = durableTurns.map((turn) => syncTurnRecord(user, device, turn, now));
   const turnWrite = await upsertChangedTurns(store, turnRecords, env, providers);
   const changedTurns = turnWrite.changedTurns ?? [];
@@ -1194,10 +1184,11 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   for (const session of sessions) {
     const sessionID = String(session.session_id);
     const uploadedTurnStats = uploadedTurnStatsBySession.get(sessionID);
+    const receivedTurnStats = receivedTurnStatsBySession.get(sessionID);
     const changedTurnStats = changedTurnStatsBySession.get(sessionID);
     const existing = existingBySessionID.get(sessionID) ?? null;
     const durableSession = durableSessionIDs.has(sessionID);
-    if (unchangedCatalogSession(device, session, existing, changedTurnStats, durableSession)) {
+    if (unchangedCatalogSession(device, session, existing, changedTurnStats, durableSession, receivedTurnStats)) {
       sessionFastPathCount += 1;
       if (existing) currentSessionRecords.push(existing);
       continue;
@@ -1209,6 +1200,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
       session,
       now,
       uploadedTurnStats,
+      receivedTurnStats,
       changedTurnStats,
       existing,
       durableSession,
@@ -1511,10 +1503,10 @@ function sessionCatalogMatchesExisting(session, existing) {
   return checks.every(([field, normalize]) => normalize(session[field]) === normalize(existing[field]));
 }
 
-function unchangedCatalogSession(device, session, existing, changedTurnStats, durableSession = true) {
+function unchangedCatalogSession(device, session, existing, changedTurnStats, durableSession = true, receivedTurnStats = null) {
   if (!existing) return false;
   if (Number(changedTurnStats?.count ?? 0) > 0) return false;
-  if (!durableSession) return true;
+  if (!durableSession && Number(receivedTurnStats?.count ?? 0) > 0) return true;
   const maxSeq = Number(session.max_seq ?? session.last_seq ?? 0);
   const lastTimestamp = session.last_timestamp || "";
   const windowHash = String(session.window_hash || "");
@@ -4045,7 +4037,7 @@ async function assertDaemonAssignable(store, daemonDeviceID, userID, publicKey) 
   }
 }
 
-async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats, changedTurnStats, existing = null, durableSession = true) {
+async function syncSessionRecord(store, user, device, session, now, uploadedTurnStats, receivedTurnStats, changedTurnStats, existing = null, durableSession = true) {
   const sessionID = requiredString(session.session_id, "session_id");
   const durableTail = Boolean(durableSession);
   const stats = await syncSessionTurnStats(store, user.user_id, device.device_id, String(session.session_id), existing, session, uploadedTurnStats, changedTurnStats);
@@ -4064,18 +4056,18 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
     ? uploadedSyncedMaxSeq
     : Number(existing?.synced_max_seq ?? 0) || 0;
   const syncedWindowHash = syncedWindowHashForSession(session, stats, syncedMinSeq, syncedMaxSeq, existing, durableTail);
-  const preserveExisting = !durableTail && existing;
+  const preserveCatalogMetadata = !durableTail && existing && Number(receivedTurnStats?.count ?? 0) > 0;
   return {
     user_id: user.user_id,
     computer_id: device.computer_id ?? null,
     device_id: device.device_id,
     session_id: sessionID,
-    agent: preserveExisting ? existing.agent : (session.agent || "claude-code"),
-    runner_alias: preserveExisting ? (existing.runner_alias || "") : (session.runner_alias || ""),
-    cwd: preserveExisting ? (existing.cwd || "") : (session.cwd || ""),
-    snippet: preserveExisting ? (existing.snippet || "") : (session.snippet || session.first_message || ""),
-    first_message: preserveExisting ? (existing.first_message || "") : (session.first_message ?? existing?.first_message ?? ""),
-    title: preserveExisting ? (existing.title || "") : (session.title || ""),
+    agent: preserveCatalogMetadata ? existing.agent : (session.agent || existing?.agent || "claude-code"),
+    runner_alias: preserveCatalogMetadata ? (existing.runner_alias || "") : (session.runner_alias ?? existing?.runner_alias ?? ""),
+    cwd: preserveCatalogMetadata ? (existing.cwd || "") : (session.cwd ?? existing?.cwd ?? ""),
+    snippet: preserveCatalogMetadata ? (existing.snippet || "") : (session.snippet ?? session.first_message ?? existing?.snippet ?? ""),
+    first_message: preserveCatalogMetadata ? (existing.first_message || "") : (session.first_message ?? existing?.first_message ?? ""),
+    title: preserveCatalogMetadata ? (existing.title || "") : (session.title ?? existing?.title ?? ""),
     last_seq: durableTail || !existing ? Number(session.last_seq ?? maxSeq) : Number(existing.last_seq ?? 0),
     last_timestamp: durableTail || !existing ? (session.last_timestamp || now) : (existing.last_timestamp || session.last_timestamp || now),
     channel_last_seen_at: durableTail
@@ -4089,7 +4081,7 @@ async function syncSessionRecord(store, user, device, session, now, uploadedTurn
         })
       : (existing?.sync_state || "catalog_only"),
     turn_count: durableTail || !existing ? Number(session.turn_count ?? 0) : Number(existing.turn_count ?? session.turn_count ?? 0),
-    last_sync_error: preserveExisting ? (existing.last_sync_error || "") : "",
+    last_sync_error: durableTail || !existing ? "" : (existing.last_sync_error || ""),
     synced_turn_count: persistedTurnCount,
     actual_turn_count: Number(stats?.count ?? existing?.actual_turn_count ?? persistedTurnCount) || 0,
     synced_min_seq: syncedMinSeq,
