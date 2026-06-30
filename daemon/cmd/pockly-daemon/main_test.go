@@ -471,8 +471,8 @@ func TestShouldSkipWindowUploadUsesLocalSignatureForRepeatedHintedWindow(t *test
 	if !shouldSkipWindowUpload(false, syncHint{}, nil, "sid_hint", req, lastSignature) {
 		t.Fatal("unhinted matching local signature should skip upload")
 	}
-	if !shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", req, lastSignature) {
-		t.Fatal("hinted session with matching local signature should skip repeated upload")
+	if shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", req, lastSignature) {
+		t.Fatal("recently-opened session must not trust local signature alone; web is actively waiting for the hot tail")
 	}
 	metadataOnlyChange := req
 	metadataOnlyChange.Sessions = []pair.SyncSession{req.Sessions[0]}
@@ -483,8 +483,8 @@ func TestShouldSkipWindowUploadUsesLocalSignatureForRepeatedHintedWindow(t *test
 	if historySyncSignature(metadataOnlyChange) != lastSignature {
 		t.Fatal("window signature should ignore catalog-only metadata changes")
 	}
-	if !shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", metadataOnlyChange, lastSignature) {
-		t.Fatal("metadata-only catalog changes must not re-upload an unchanged hot window")
+	if shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", metadataOnlyChange, lastSignature) {
+		t.Fatal("recently-opened metadata-only change still needs server proof before skipping")
 	}
 	if shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, nil, "sid_hint", req, "") {
 		t.Fatal("hinted session without local signature should upload the first window")
@@ -516,6 +516,11 @@ func TestShouldSkipWindowUploadUsesLocalSignatureForRepeatedHintedWindow(t *test
 		"sid_hint": {SyncedMinSeq: 21, SyncedMaxSeq: 59, WindowHash: "sha256:partial-tail"},
 	}, "sid_hint", req, lastSignature) {
 		t.Fatal("known server window that does not cover local max seq must force upload")
+	}
+	if shouldSkipWindowUpload(true, syncHint{Reason: "recently_opened"}, map[string]syncHint{
+		"sid_hint": {SyncedMinSeq: 21, SyncedMaxSeq: 60, WindowHash: "sha256:larger-tail"},
+	}, "sid_hint", req, lastSignature) {
+		t.Fatal("recently-opened session must not let a larger stale server tail suppress a web-requested refresh")
 	}
 }
 
@@ -981,7 +986,7 @@ func TestDaemonRestartKnownWindowProbeAvoidsWindowReupload(t *testing.T) {
 	}
 }
 
-func TestSyncChangedNexusSessionsSkipsRepeatedHintedWindowWhenLocalSignatureMatches(t *testing.T) {
+func TestSyncChangedNexusSessionsUploadsRecentlyOpenedWindowUntilServerProof(t *testing.T) {
 	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
 	idx, sessionID := relayFixtureIndexWithTurns(t, 60)
@@ -1058,11 +1063,11 @@ func TestSyncChangedNexusSessionsSkipsRepeatedHintedWindowWhenLocalSignatureMatc
 		map[string]time.Time{},
 		0,
 	)
-	if result.Sessions != 0 || result.Turns != 0 {
-		t.Fatalf("synced sessions/turns = %d/%d, want 0/0", result.Sessions, result.Turns)
+	if result.Sessions != 1 || result.Turns != len(windowReq.Turns) {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/%d", result.Sessions, result.Turns, len(windowReq.Turns))
 	}
-	if got := syncPosts.Load(); got != 0 {
-		t.Fatalf("sync POST count = %d, want 0", got)
+	if got := syncPosts.Load(); got != 1 {
+		t.Fatalf("sync POST count = %d, want 1", got)
 	}
 }
 

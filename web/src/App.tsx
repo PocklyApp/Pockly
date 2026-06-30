@@ -988,6 +988,26 @@ export function App() {
       if (hydrated.length > 0) {
         mergeSessionTurnsIntoState(selection, hydrated, refreshed, isCompleteTurnsResponse(refreshed));
         setTurnsStatus("");
+      } else if (shouldFetchHotTailAfterIncremental({
+        cachedMaxSeq: lastConfirmedSeq(turnsRef.current),
+        response: refreshed,
+        session: selectedSessionRef.current,
+        limit: SESSION_TURNS_WINDOW_LIMIT,
+      })) {
+        const tail = await getSessionTurns(selection.sessionId, selection.deviceId, {
+          limit: SESSION_TURNS_WINDOW_LIMIT,
+        });
+        const latest = selectedRef.current;
+        if (!latest || latest.sessionId !== selection.sessionId || latest.deviceId !== selection.deviceId) return;
+        const tailTurns = tail.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
+        if (tailTurns.length > 0) {
+          mergeSessionTurnsIntoState(selection, tailTurns, tail, isCompleteTurnsResponse(tail));
+          setTurnsStatus("");
+        } else if (tail.synced_max_seq !== undefined || tail.total_turn_count !== undefined) {
+          setTurnsHydrationState((currentHydration) =>
+            currentHydration ? incrementalTurnsHydration(currentHydration, tail, turnsRef.current) : tail,
+          );
+        }
       } else if (refreshed.synced_max_seq !== undefined || refreshed.total_turn_count !== undefined) {
         setTurnsHydrationState((currentHydration) =>
           currentHydration ? incrementalTurnsHydration(currentHydration, refreshed, turnsRef.current) : refreshed,

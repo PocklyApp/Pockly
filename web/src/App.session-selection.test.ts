@@ -702,6 +702,19 @@ test("cached session reopen fetches hot tail only when incremental reads may mis
     session,
     limit: 100,
   }), true);
+
+  assert.equal(shouldFetchHotTailAfterIncremental({
+    cachedMaxSeq: 120,
+    response: {
+      session_id: "sess_cached",
+      turns: [],
+      after_seq: 120,
+      synced_max_seq: 260,
+      total_turn_count: 260,
+    },
+    session,
+    limit: 100,
+  }), true);
 });
 
 test("inject completion ACK keeps polling until a visible reply lands", () => {

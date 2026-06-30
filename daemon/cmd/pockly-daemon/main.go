@@ -2939,6 +2939,7 @@ func knownWindowMatches(known map[string]syncHint, sessionID string, req pair.Sy
 }
 
 func shouldSkipWindowUpload(hasHint bool, hint syncHint, knownWindows map[string]syncHint, sessionID string, req pair.SyncRequest, lastSignature string) bool {
+	recentlyOpened := hasHint && strings.TrimSpace(hint.Reason) == "recently_opened"
 	if hasHint && hintMatchesWindowHash(hint, req) {
 		return true
 	}
@@ -2948,13 +2949,26 @@ func shouldSkipWindowUpload(hasHint bool, hint syncHint, knownWindows map[string
 			// in-memory lastHistorySync cache. A sparse hot cache can make Nexus
 			// return a larger contiguous tail than the daemon's local hot window;
 			// that still proves the local window is already durable.
-			return hintMatchesWindowHash(serverWindow, req) || knownWindowCoversLocalWindow(serverWindow, req)
+			if hintMatchesWindowHash(serverWindow, req) {
+				return true
+			}
+			// A reader-open hint means the web is actively asking for the latest
+			// tail. Do not let an older/larger server window suppress a newer
+			// local tail with changed payloads; upload trimming below will keep
+			// the request cheap when the server already has a prefix.
+			if !recentlyOpened && knownWindowCoversLocalWindow(serverWindow, req) {
+				return true
+			}
+			return false
 		}
 	}
 	// Hints are demand signals, not permission to re-upload the same durable
 	// hot window forever. If Nexus did not provide contradictory server-window
 	// proof, trust the daemon's local signature after the first upload. A daemon
 	// restart still probes Nexus before reaching this path.
+	if recentlyOpened {
+		return false
+	}
 	return lastSignature != "" && lastSignature == historySyncSignature(req)
 }
 
