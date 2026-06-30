@@ -360,6 +360,7 @@ export const LARGE_SESSION_CATALOG_REFRESH_MS = 120000;
 export const SELECTED_SESSION_TAIL_REFRESH_MS = 5000;
 export const SELECTED_SESSION_OPEN_HINT_REFRESH_MS = 15000;
 export const SELECTED_SESSION_TAIL_OVERLAP_TURNS = 5;
+const SELECTED_SESSION_OPEN_HINT_STORAGE_PREFIX = "pockly.selectedSessionOpenHint.v1.";
 export const SESSION_CATALOG_PAGE_LIMIT = 50;
 export const SESSION_CATALOG_PREFETCH_PX = 240;
 export const LARGE_SESSION_ACTIVE_EVENT_POLL_MS = 3000;
@@ -566,6 +567,7 @@ export function App() {
   const hostsRef = useRef<HostSummary[]>([]);
   const [sessions, setSessions] = useState<SessionListItem[]>([]);
   const [runtimeCapabilities, setRuntimeCapabilities] = useState<NexusRuntimeCapabilities | null>(null);
+  const runtimeCapabilitiesRef = useRef<NexusRuntimeCapabilities | null>(null);
   const [draftConversation, setDraftConversation] = useState<DraftConversation | null>(null);
   const [selected, setSelected] = useState<ReaderSelection | null>(null);
   // 'active' = a live terminal_session matches selectedSession; 'dead' =
@@ -948,6 +950,10 @@ export function App() {
     selectedRef.current = selected;
   }, [selected]);
 
+  useEffect(() => {
+    runtimeCapabilitiesRef.current = runtimeCapabilities;
+  }, [runtimeCapabilities]);
+
   async function refreshSelectedSessionTail(selection: ReaderSelection, options: { refreshHint?: boolean } = {}) {
     if (selectedTailRefreshInFlightRef.current) return;
     selectedTailRefreshInFlightRef.current = true;
@@ -955,12 +961,19 @@ export function App() {
       const now = Date.now();
       const hintKey = `${selection.deviceId}:${selection.sessionId}`;
       const lastHintAt = selectedTailHintAtRef.current.get(hintKey) ?? 0;
-      if (options.refreshHint && isWorkspaceLeaderTab() && now - lastHintAt >= SELECTED_SESSION_OPEN_HINT_REFRESH_MS) {
+      if (
+        shouldRefreshSelectedSessionOpenHint({
+          now,
+          lastHintAt,
+          refreshHint: Boolean(options.refreshHint),
+        }) &&
+        claimSelectedSessionOpenHint(selection, now)
+      ) {
         void markSessionOpened({
           sessionId: selection.sessionId,
           deviceId: selection.deviceId,
           openedAt: new Date().toISOString(),
-          realtime: shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
+          realtime: shouldUseBrowserRealtimeControl(runtimeCapabilitiesRef.current) ? subscriptionRef.current : null,
         }).then(() => {
           selectedTailHintAtRef.current.set(hintKey, now);
         }).catch(() => {
@@ -992,12 +1005,15 @@ export function App() {
   }
 
   useEffect(() => {
-    if (auth.status !== "authenticated" || !isReaderRoute(route) || !selected || selected.sessionId.startsWith("draft_")) return;
-    if (turnsStatus === "loading" || turnsStatus === "syncing") return;
-    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-    if (shouldUseBrowserRealtime(runtimeCapabilities) && !isWorkspaceLeaderTab()) return;
-    let stopped = false;
     const selection = selected;
+    if (!selection) return;
+    if (!shouldPollSelectedSessionTail({
+      authenticated: auth.status === "authenticated",
+      readerRoute: isReaderRoute(route),
+      selected: selection,
+      turnsStatus,
+    })) return;
+    let stopped = false;
     const tick = (refreshHint = true) => {
       if (stopped) return;
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
@@ -1017,12 +1033,9 @@ export function App() {
   }, [
     auth.status,
     route.view,
-    runtimeCapabilities?.browser_realtime,
-    runtimeCapabilities?.browser_realtime_control,
     selected?.deviceId,
     selected?.sessionId,
     turnsStatus,
-    workspaceLeaderTick,
   ]);
 
   useEffect(() => {
@@ -13596,6 +13609,41 @@ export function selectedSessionTailFetchOptions(turns: SessionTurn[]) {
     limit: SESSION_TURNS_WINDOW_LIMIT,
     ...(afterSeq > 0 ? { afterSeq } : {}),
   };
+}
+
+export function shouldPollSelectedSessionTail(input: {
+  authenticated: boolean;
+  readerRoute: boolean;
+  selected?: ReaderSelection | null;
+  turnsStatus?: string;
+}) {
+  if (!input.authenticated || !input.readerRoute || !input.selected) return false;
+  if (input.selected.sessionId.startsWith("draft_")) return false;
+  if (input.turnsStatus === "loading" || input.turnsStatus === "syncing") return false;
+  return true;
+}
+
+export function shouldRefreshSelectedSessionOpenHint(input: {
+  now: number;
+  lastHintAt: number;
+  refreshHint: boolean;
+  intervalMs?: number;
+}) {
+  if (!input.refreshHint) return false;
+  const intervalMs = input.intervalMs ?? SELECTED_SESSION_OPEN_HINT_REFRESH_MS;
+  return input.now - input.lastHintAt >= intervalMs;
+}
+
+function claimSelectedSessionOpenHint(selection: ReaderSelection, now: number) {
+  try {
+    const key = `${SELECTED_SESSION_OPEN_HINT_STORAGE_PREFIX}${selection.deviceId}:${selection.sessionId}`;
+    const last = Number(globalThis.localStorage?.getItem(key) ?? 0) || 0;
+    if (now - last < SELECTED_SESSION_OPEN_HINT_REFRESH_MS) return false;
+    globalThis.localStorage?.setItem(key, String(now));
+    return true;
+  } catch {
+    return true;
+  }
 }
 
 export function shouldFetchHotTailAfterIncremental({

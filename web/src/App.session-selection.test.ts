@@ -35,7 +35,9 @@ import {
   sessionCatalogRefreshIntervalForSession,
   selectedSessionTailFetchOptions,
   shouldLoadMoreSessionCatalogFromScroll,
+  shouldPollSelectedSessionTail,
   shouldPollWorkspacePresence,
+  shouldRefreshSelectedSessionOpenHint,
   shouldRefreshSessionCatalog,
   shouldRunWorkspaceNetworkLeader,
   shouldFallbackToFullSessionCatalog,
@@ -493,6 +495,55 @@ test("selected session tail polling overlaps recent confirmed turns", () => {
     limit: SESSION_TURNS_WINDOW_LIMIT,
     afterSeq: 96,
   });
+});
+
+test("selected session tail polling is owned by the reader route", () => {
+  const selected: ReaderSelection = { sessionId: "sess_visible", deviceId: "dd_test" };
+  assert.equal(shouldPollSelectedSessionTail({
+    authenticated: true,
+    readerRoute: true,
+    selected,
+    turnsStatus: "",
+  }), true);
+  assert.equal(shouldPollSelectedSessionTail({
+    authenticated: true,
+    readerRoute: true,
+    selected: { ...selected, sessionId: "draft_1" },
+    turnsStatus: "",
+  }), false);
+  assert.equal(shouldPollSelectedSessionTail({
+    authenticated: true,
+    readerRoute: true,
+    selected,
+    turnsStatus: "loading",
+  }), false);
+  assert.equal(shouldPollSelectedSessionTail({
+    authenticated: true,
+    readerRoute: false,
+    selected,
+    turnsStatus: "",
+  }), false);
+});
+
+test("selected session open hint refresh is interval-limited", () => {
+  assert.equal(shouldRefreshSelectedSessionOpenHint({
+    now: 20_000,
+    lastHintAt: 10_000,
+    refreshHint: true,
+    intervalMs: SELECTED_SESSION_OPEN_HINT_REFRESH_MS,
+  }), false);
+  assert.equal(shouldRefreshSelectedSessionOpenHint({
+    now: 25_000,
+    lastHintAt: 10_000,
+    refreshHint: true,
+    intervalMs: SELECTED_SESSION_OPEN_HINT_REFRESH_MS,
+  }), true);
+  assert.equal(shouldRefreshSelectedSessionOpenHint({
+    now: 25_000,
+    lastHintAt: 10_000,
+    refreshHint: false,
+    intervalMs: SELECTED_SESSION_OPEN_HINT_REFRESH_MS,
+  }), false);
 });
 
 test("session catalog pagination loads more only near the drawer bottom", () => {
