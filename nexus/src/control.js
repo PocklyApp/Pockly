@@ -981,6 +981,24 @@ export class InMemoryControlHub {
     }
   }
 
+  broadcastSessionCatalogChanged(event, options = {}) {
+    if (!options.skipDistributedSink) this.distributedSink?.onSessionCatalogChanged?.(event);
+    const payload = {
+      type: "SESSION_CATALOG_CHANGED",
+      ...(Array.isArray(event?.session_ids) ? { session_ids: event.session_ids } : {}),
+      ...(Array.isArray(event?.device_ids) ? { device_ids: event.device_ids } : {}),
+      ...(event?.reason ? { reason: event.reason } : {}),
+    };
+    for (const socket of this.browserSockets.values()) {
+      if (socket.userID !== event?.userID) continue;
+      try {
+        socket.ws.send(JSON.stringify(payload));
+      } catch {
+        this.browserSockets.delete(socket.ws);
+      }
+    }
+  }
+
   failStreamsForDaemon(daemonDeviceID, reason) {
     for (const [requestID, stream] of [...this.streams.entries()]) {
       if (stream.daemonDeviceID !== daemonDeviceID) continue;

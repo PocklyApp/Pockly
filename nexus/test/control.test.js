@@ -51,6 +51,39 @@ describe("in-process Nexus control hub", () => {
     browser.cleanup();
   });
 
+  it("broadcasts catalog changes only to the owning user's browser sockets", () => {
+    const hub = new InMemoryControlHub();
+    const ownerBrowser = hub.attachBrowserForTest({
+      userID: "usr_owner",
+      browserDeviceID: "bd_owner",
+      daemonDeviceID: "dd_owner",
+      sessionID: "sess_owner",
+    });
+    const otherBrowser = hub.attachBrowserForTest({
+      userID: "usr_other",
+      browserDeviceID: "bd_other",
+      daemonDeviceID: "dd_owner",
+      sessionID: "sess_owner",
+    });
+
+    hub.broadcastSessionCatalogChanged({
+      userID: "usr_owner",
+      session_ids: ["sess_owner"],
+      device_ids: ["dd_owner"],
+      reason: "daemon_sync",
+    });
+
+    assert.deepEqual(ownerBrowser.messages, [{
+      type: "SESSION_CATALOG_CHANGED",
+      session_ids: ["sess_owner"],
+      device_ids: ["dd_owner"],
+      reason: "daemon_sync",
+    }]);
+    assert.deepEqual(otherBrowser.messages, []);
+    ownerBrowser.cleanup();
+    otherBrowser.cleanup();
+  });
+
   it("handles control request/response through the neutral control endpoint", async () => {
     const hub = new InMemoryControlHub();
     hub.attachDaemonForTest("dd_control", "usr_control", async (envelope, reply) => {

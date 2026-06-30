@@ -1837,6 +1837,12 @@ export type HostStatusUpdate = {
   app_version?: string | undefined;
 };
 
+export type SessionCatalogChangedEvent = {
+  session_ids?: string[] | undefined;
+  device_ids?: string[] | undefined;
+  reason?: string | undefined;
+};
+
 export function subscribeToSession(input: {
   sessionId?: string;
   deviceId?: string;
@@ -1846,6 +1852,7 @@ export function subscribeToSession(input: {
   // Presence pushes for the user's daemons. While the subscription is live
   // these replace most foreground presence polling.
   onHostStatus?: (status: HostStatusUpdate) => void;
+  onSessionCatalogChanged?: (event: SessionCatalogChangedEvent) => void;
 }): SessionSubscription {
   let closed = false;
   let socket: WebSocket | null = null;
@@ -1950,7 +1957,7 @@ export function subscribeToSession(input: {
         // Edge-answered keepalive (and any other non-JSON frame) only counts
         // as liveness; it carries no payload.
         if (raw === REALTIME_KEEPALIVE_PONG || !raw.startsWith("{")) return;
-        let payload: { type?: string; turn?: SessionTurn; message?: string; request_id?: string; command?: string; status?: string; event?: unknown; code?: string; error?: string; terminal_session_id?: string } & Partial<HostStatusUpdate>;
+        let payload: { type?: string; turn?: SessionTurn; message?: string; request_id?: string; command?: string; status?: string; event?: unknown; code?: string; error?: string; terminal_session_id?: string; session_ids?: unknown; device_ids?: unknown; reason?: string } & Partial<HostStatusUpdate>;
         try {
           payload = JSON.parse(raw);
         } catch {
@@ -1975,6 +1982,13 @@ export function subscribeToSession(input: {
                 app_version: payload.app_version,
               });
             }
+            break;
+          case "SESSION_CATALOG_CHANGED":
+            input.onSessionCatalogChanged?.({
+              session_ids: Array.isArray(payload.session_ids) ? payload.session_ids.filter((value): value is string => typeof value === "string" && value !== "") : undefined,
+              device_ids: Array.isArray(payload.device_ids) ? payload.device_ids.filter((value): value is string => typeof value === "string" && value !== "") : undefined,
+              reason: typeof payload.reason === "string" ? payload.reason : undefined,
+            });
             break;
           case "COMMAND_ACK": {
             const requestID = String(payload.request_id || "");

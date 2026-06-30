@@ -86,6 +86,7 @@ import {
   type HostStatusUpdate,
   type HostSummary,
   type NexusRuntimeCapabilities,
+  type SessionCatalogChangedEvent,
   type SessionListItem,
   type SessionPref,
   type ProjectPref,
@@ -712,6 +713,8 @@ export function App() {
   const workspaceMetadataGenerationRef = useRef(0);
   const sessionCatalogSnapshotRef = useRef<SessionCatalogSnapshot | null>(null);
   const sessionCatalogCacheLoadedForRef = useRef("");
+  const sessionCatalogRealtimeRefreshInFlightRef = useRef(false);
+  const sessionCatalogRealtimeRefreshQueuedRef = useRef(false);
   const [sessionCatalogHasMore, setSessionCatalogHasMore] = useState(false);
   const [sessionCatalogLoadingMore, setSessionCatalogLoadingMore] = useState(false);
 
@@ -1149,6 +1152,10 @@ export function App() {
         realtimeLiveRef.current = message.status === "live";
         return;
       }
+      if (message.type === "session_catalog_changed" && !leader.isLeader && isSessionCatalogChangedEvent(message.event)) {
+        void refreshSessionCatalogFromRealtime(message.event);
+        return;
+      }
       if (leader.isLeader) {
         if (message.type === "subscribe_session" && message.tab_id !== leader.tabID) {
           workspaceLeaderSubscriptionsRef.current.set(`${message.tab_id}:${message.device_id}:${message.session_id}`, {
@@ -1237,6 +1244,10 @@ export function App() {
         // Presence pushed over the socket replaces most foreground polling.
         applyRealtimeHostStatus(status);
         workspaceLeaderRef.current?.post({ type: "host_status", host: status });
+      },
+      onSessionCatalogChanged: (event) => {
+        void refreshSessionCatalogFromRealtime(event);
+        workspaceLeaderRef.current?.post({ type: "session_catalog_changed", event });
       },
     });
     subscriptionRef.current = subscription;
@@ -1647,6 +1658,43 @@ export function App() {
       setSessionCatalogSnapshot(userKey, snapshot);
       void saveSessionCatalogCache(userKey, snapshot);
       return full;
+    }
+  }
+
+  async function refreshSessionCatalogFromRealtime(_event?: SessionCatalogChangedEvent) {
+    if (auth.status !== "authenticated" || !workspaceRouteActive) return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    const userKey = auth.email;
+    const current = sessionCatalogSnapshotRef.current;
+    if (!current?.cursor) {
+      // Realtime catalog hints are a cheap delta trigger, not a bootstrap path.
+      // If this tab has no catalog cursor yet, the existing workspace load or
+      // 60s fallback refresh will establish one without forcing a full list here.
+      return;
+    }
+    if (sessionCatalogRealtimeRefreshInFlightRef.current) {
+      sessionCatalogRealtimeRefreshQueuedRef.current = true;
+      return;
+    }
+    sessionCatalogRealtimeRefreshInFlightRef.current = true;
+    try {
+      const delta = await listSessionsDelta({ since: current.cursor, limit: SESSION_CATALOG_PAGE_LIMIT });
+      const merged = mergeSessionCatalogDelta(sessionCatalogSnapshotRef.current ?? current, delta);
+      setSessionCatalogSnapshot(userKey, merged);
+      applyListedSessions(merged.sessions);
+      void saveSessionCatalogCache(userKey, merged);
+    } catch (error) {
+      if (error instanceof AuthExpiredError) {
+        handleWorkspaceAuthExpired(error);
+      }
+      // Transient realtime catalog refresh failures keep the last visible
+      // catalog. The normal 60s catalog refresh remains the fallback.
+    } finally {
+      sessionCatalogRealtimeRefreshInFlightRef.current = false;
+      if (sessionCatalogRealtimeRefreshQueuedRef.current) {
+        sessionCatalogRealtimeRefreshQueuedRef.current = false;
+        window.setTimeout(() => void refreshSessionCatalogFromRealtime(_event), 0);
+      }
     }
   }
 
@@ -13948,6 +13996,18 @@ export function shouldPollWorkspacePresence({
 
 function isHostStatusUpdate(value: unknown): value is HostStatusUpdate {
   return Boolean(value && typeof value === "object" && typeof (value as { device_id?: unknown }).device_id === "string");
+}
+
+function isSessionCatalogChangedEvent(value: unknown): value is SessionCatalogChangedEvent {
+  if (!value || typeof value !== "object") return false;
+  const event = value as { session_ids?: unknown; device_ids?: unknown; reason?: unknown };
+  return (
+    event.session_ids === undefined || Array.isArray(event.session_ids)
+  ) && (
+    event.device_ids === undefined || Array.isArray(event.device_ids)
+  ) && (
+    event.reason === undefined || typeof event.reason === "string"
+  );
 }
 
 function isSessionTurn(value: unknown): value is SessionTurn {

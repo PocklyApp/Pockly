@@ -2260,15 +2260,35 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 	var lastLoggedAt time.Time
 	lastLoggedSessions := -1 // sentinel: first sync always logs
 	lastCatalogSyncSignature := ""
+	lastCatalogDisplayMetadataSignature := ""
 	lastHistorySync := map[string]string{}
 	hintCache := &syncHintCache{}
 	catalogMinInterval := catalogSyncMinInterval()
+	catalogMetadataMinInterval := catalogMetadataSyncMinInterval()
 	windowMinInterval := windowSyncMinInterval()
 	var lastCatalogPushAt time.Time
+	var lastCatalogMetadataPushAt time.Time
 	lastCatalogMembership := ""
 	lastWindowPushAt := map[string]time.Time{}
 	lastWindowMeta := map[string]string{}
 	lastKnownWindowProbeAt := map[string]time.Time{}
+	var catalogMetadataRetryTimer *time.Timer
+	var catalogMetadataRetryC <-chan time.Time
+	stopCatalogMetadataRetry := func() {
+		if catalogMetadataRetryTimer != nil {
+			catalogMetadataRetryTimer.Stop()
+			catalogMetadataRetryTimer = nil
+			catalogMetadataRetryC = nil
+		}
+	}
+	scheduleCatalogMetadataRetry := func(delay time.Duration) {
+		if delay <= 0 {
+			return
+		}
+		stopCatalogMetadataRetry()
+		catalogMetadataRetryTimer = time.NewTimer(delay)
+		catalogMetadataRetryC = catalogMetadataRetryTimer.C
+	}
 	runSync := func() {
 		if !idx.FirstScanComplete() {
 			return
@@ -2300,6 +2320,7 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		// turns, not the catalog.
 		req.FullReconcile = req.CatalogComplete
 		signature := catalogSyncSignature(req)
+		displayMetadataSignature := catalogDisplayMetadataSignature(req)
 		membership := catalogMembershipSignature(req.Sessions)
 		now := time.Now()
 		historyCandidates := historySyncCatalogSessions(idx, profile, req)
@@ -2309,8 +2330,11 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		req.KnownWindowSessionIDs = &knownWindowSessionIDs
 		var syncMetrics map[string]int64
 		knownWindows := map[string]syncHint{}
-		if (signature == "" || signature != lastCatalogSyncSignature) &&
-			shouldPushCatalog(now, lastCatalogPushAt, catalogMinInterval, membership != lastCatalogMembership) {
+		catalogChanged := signature == "" || signature != lastCatalogSyncSignature
+		membershipChanged := membership != lastCatalogMembership
+		displayMetadataChanged := displayMetadataSignature != lastCatalogDisplayMetadataSignature
+		shouldPushCatalogNow := shouldPushCatalogChange(catalogChanged, membershipChanged, displayMetadataChanged, now, lastCatalogPushAt, lastCatalogMetadataPushAt, catalogMinInterval, catalogMetadataMinInterval)
+		if shouldPushCatalogNow {
 			res, err := client.SyncHistory(id, req)
 			if err != nil {
 				log.Printf("Nexus sync push: %v", err)
@@ -2318,8 +2342,13 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 				return
 			}
 			lastCatalogSyncSignature = signature
+			lastCatalogDisplayMetadataSignature = displayMetadataSignature
 			lastCatalogMembership = membership
 			lastCatalogPushAt = now
+			if displayMetadataChanged {
+				lastCatalogMetadataPushAt = now
+			}
+			stopCatalogMetadataRetry()
 			// Dedup the success line. The heartbeat ticker fires constantly;
 			// logging every tick buries real signal. Only log when something
 			// changed (new turns pushed or session count differs from the
@@ -2340,6 +2369,8 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 			}
 			syncMetrics = syncTelemetryMetrics(res)
 			knownWindows = knownWindowHintsFromSyncResponse(res)
+		} else if retryDelay := catalogMetadataRetryDelay(catalogChanged, membershipChanged, displayMetadataChanged, now, lastCatalogMetadataPushAt, catalogMetadataMinInterval); retryDelay > 0 {
+			scheduleCatalogMetadataRetry(retryDelay)
 		} else if shouldProbeKnownWindows(knownWindowSessionIDs, hints, lastHistorySync, lastKnownWindowProbeAt, now, windowMinInterval) {
 			knownWindows = probeKnownWindows(ctx, client, id, knownWindowSessionIDs)
 			for _, sessionID := range knownWindowSessionIDs {
@@ -2373,11 +2404,16 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
+	defer stopCatalogMetadataRetry()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-idx.Changes():
+			runSync()
+		case <-catalogMetadataRetryC:
+			catalogMetadataRetryTimer = nil
+			catalogMetadataRetryC = nil
 			runSync()
 		case <-ticker.C:
 			runSync()
@@ -2643,6 +2679,30 @@ func shouldPushCatalog(now, lastPush time.Time, minInterval time.Duration, membe
 	return now.Sub(lastPush) >= minInterval
 }
 
+func shouldPushCatalogChange(catalogChanged, membershipChanged, displayMetadataChanged bool, now, lastCatalogPush, lastMetadataPush time.Time, catalogMinInterval, metadataMinInterval time.Duration) bool {
+	if !catalogChanged {
+		return false
+	}
+	if membershipChanged {
+		return true
+	}
+	if displayMetadataChanged && shouldPushCatalog(now, lastMetadataPush, metadataMinInterval, false) {
+		return true
+	}
+	return shouldPushCatalog(now, lastCatalogPush, catalogMinInterval, false)
+}
+
+func catalogMetadataRetryDelay(catalogChanged, membershipChanged, displayMetadataChanged bool, now, lastMetadataPush time.Time, metadataMinInterval time.Duration) time.Duration {
+	if !catalogChanged || membershipChanged || !displayMetadataChanged || metadataMinInterval <= 0 || lastMetadataPush.IsZero() {
+		return 0
+	}
+	delay := metadataMinInterval - now.Sub(lastMetadataPush)
+	if delay <= 0 {
+		return 0
+	}
+	return delay
+}
+
 // shouldPushWindow rate-limits per-session window builds and pushes. A fresh
 // Nexus hint (the user just opened the session) bypasses the floor so the
 // backfill lands immediately; live-reader updates flow through the control
@@ -2665,6 +2725,10 @@ func catalogMembershipSignature(sessions []pair.SyncSession) string {
 
 func catalogSyncMinInterval() time.Duration {
 	return envDuration("POCKLY_CATALOG_SYNC_MIN_INTERVAL", 60*time.Second, 0, 24*time.Hour)
+}
+
+func catalogMetadataSyncMinInterval() time.Duration {
+	return envDuration("POCKLY_CATALOG_METADATA_SYNC_MIN_INTERVAL", 2*time.Second, 0, time.Hour)
 }
 
 func windowSyncMinInterval() time.Duration {
@@ -3261,6 +3325,25 @@ func catalogSyncSignature(req pair.SyncRequest) string {
 			session.SyncState,
 		)
 	}
+	return strings.Join(parts, "\x00")
+}
+
+func catalogDisplayMetadataSignature(req pair.SyncRequest) string {
+	if len(req.Sessions) == 0 {
+		return ""
+	}
+	parts := []string{
+		strconv.Itoa(len(req.Sessions)),
+	}
+	sessionParts := make([]string, 0, len(req.Sessions))
+	for _, session := range req.Sessions {
+		sessionParts = append(sessionParts, strings.Join([]string{
+			session.SessionID,
+			nexusSessionSyncSignature(session),
+		}, "\x01"))
+	}
+	sort.Strings(sessionParts)
+	parts = append(parts, sessionParts...)
 	return strings.Join(parts, "\x00")
 }
 

@@ -13,6 +13,7 @@ export type WorkspaceTabLeaderMessage =
   | { type: "host_status"; host: unknown }
   | { type: "turn"; turn: unknown }
   | { type: "session_status"; status: string; detail?: string }
+  | { type: "session_catalog_changed"; event: unknown }
   | { type: "subscribe_session"; tab_id: string; session_id: string; device_id: string; after_seq: number }
   | { type: "unsubscribe_session"; tab_id: string; session_id: string; device_id: string };
 

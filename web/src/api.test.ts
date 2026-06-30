@@ -605,6 +605,47 @@ test("realtime ACK-only commands resolve and do not leak into later messages", a
   }
 });
 
+test("realtime catalog change messages invoke the catalog callback", async () => {
+  const globals = globalThis as unknown as {
+    window: Record<string, unknown> | undefined;
+    WebSocket: typeof WebSocket | undefined;
+  };
+  const originalWindow = globals.window;
+  const originalWebSocket = globals.WebSocket;
+  const sockets: FakeWebSocket[] = [];
+  const events: unknown[] = [];
+  globals.window = {
+    ...(globalThis as typeof globalThis),
+    location: { origin: "https://pockly.test" },
+  };
+  globals.WebSocket = fakeWebSocketClass(sockets) as unknown as typeof WebSocket;
+  try {
+    const subscription = subscribeToSession({
+      onTurn: () => {},
+      onStatus: () => {},
+      onSessionCatalogChanged: (event) => events.push(event),
+    });
+    await tick();
+    const socket = sockets[0];
+    assert.ok(socket);
+    socket.emitMessage(JSON.stringify({
+      type: "SESSION_CATALOG_CHANGED",
+      session_ids: ["sess_one", "", 123],
+      device_ids: ["dd_one", null],
+      reason: "daemon_sync",
+    }));
+    assert.deepEqual(events, [{
+      session_ids: ["sess_one"],
+      device_ids: ["dd_one"],
+      reason: "daemon_sync",
+    }]);
+    subscription.close();
+  } finally {
+    globals.window = originalWindow;
+    globals.WebSocket = originalWebSocket;
+  }
+});
+
 test("terminal realtime subscription sends a single command subscription", async () => {
   const globals = globalThis as unknown as {
     window: Record<string, unknown> | undefined;

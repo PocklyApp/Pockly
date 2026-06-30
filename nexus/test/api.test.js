@@ -1436,7 +1436,7 @@ describe("Nexus api", () => {
 
   it("updates catalog-only title and snippet without materializing turns", async () => {
     const store = new CountingNexusStore();
-    const env = testEnv({ store });
+    const env = testEnv({ store, extra: { BROWSER_REALTIME_ENABLED: "1" } });
     const cookie = await loginCookie(env);
     const daemon = await loginDaemon(env, cookie);
     const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
@@ -1458,6 +1458,12 @@ describe("Nexus api", () => {
       turns: [],
     }, daemonAuth);
     assert.equal(first.status, 200);
+    const browser = env.POCKLY_CONTROL_HUB.attachBrowserForTest({
+      userID: "usr_test",
+      browserDeviceID: "db_catalog_test",
+      daemonDeviceID: daemon.daemon_device_id,
+      sessionID: baseSession.session_id,
+    });
 
     store.resetCounts();
     const retry = await call(env, "POST", "/api/daemon/sync", {
@@ -1483,6 +1489,13 @@ describe("Nexus api", () => {
     assert.equal(session.snippet, "new first message");
     assert.equal(session.sync_state, "catalog_only");
     assert.equal(Number(session.synced_turn_count ?? 0), 0);
+    assert.deepEqual(browser.messages.filter((message) => message.type === "SESSION_CATALOG_CHANGED"), [{
+      type: "SESSION_CATALOG_CHANGED",
+      session_ids: ["sess_catalog_only_title_refresh"],
+      device_ids: [daemon.daemon_device_id],
+      reason: "daemon_sync",
+    }]);
+    browser.cleanup();
   });
 
   it("reports history storage usage for inline, blob, and batched payloads", async () => {

@@ -100,6 +100,40 @@ describe("Node production Redis control hub", () => {
     }
   });
 
+  it("fans out session catalog change events to browser sockets on other nodes", async () => {
+    const bus = new FakeRedisBus();
+    const hubA = await createStartedHub(bus, "node_a");
+    const hubB = await createStartedHub(bus, "node_b");
+    try {
+      const browser = hubA.attachBrowserForTest({
+        userID: "usr_remote",
+        browserDeviceID: "bd_remote",
+        daemonDeviceID: "dd_remote",
+        sessionID: "sess_remote",
+      });
+
+      hubB.broadcastSessionCatalogChanged({
+        userID: "usr_remote",
+        session_ids: ["sess_remote"],
+        device_ids: ["dd_remote"],
+        reason: "daemon_sync",
+      });
+
+      await eventually(() => {
+        assert.deepEqual(browser.messages.filter((message) => message.type === "SESSION_CATALOG_CHANGED"), [{
+          type: "SESSION_CATALOG_CHANGED",
+          session_ids: ["sess_remote"],
+          device_ids: ["dd_remote"],
+          reason: "daemon_sync",
+        }]);
+      });
+      browser.cleanup();
+    } finally {
+      await hubA.close();
+      await hubB.close();
+    }
+  });
+
   it("replicates terminal session state and terminal events across nodes", async () => {
     const bus = new FakeRedisBus();
     const hubA = await createStartedHub(bus, "node_a");

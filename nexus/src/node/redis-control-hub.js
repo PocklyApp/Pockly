@@ -71,6 +71,9 @@ export class RedisControlHub {
         onHostStatus: (status) => {
           void this.handleLocalHostStatus(status);
         },
+        onSessionCatalogChanged: (event) => {
+          void this.publishEvent("session_catalog_changed", { event });
+        },
         onTerminalSession: (session) => {
           void this.publishEvent("terminal_session", { session });
         },
@@ -165,6 +168,10 @@ export class RedisControlHub {
 
   attachBrowserForTest(input) {
     return this.localHub.attachBrowserForTest(input);
+  }
+
+  broadcastSessionCatalogChanged(event, options = {}) {
+    return this.localHub.broadcastSessionCatalogChanged(event, options);
   }
 
   async requestResponse(daemonDeviceID, envelope, responseType, requestID, timeoutMs = defaultRequestTimeoutMs) {
@@ -405,6 +412,9 @@ export class RedisControlHub {
         return;
       case "host_status":
         if (message.status) this.localHub.broadcastHostStatus(message.status, { skipDistributedSink: true });
+        return;
+      case "session_catalog_changed":
+        if (message.event) this.localHub.broadcastSessionCatalogChanged(message.event, { skipDistributedSink: true });
         return;
       case "terminal_session":
         return await this.applyRemoteTerminalSession(message.session);

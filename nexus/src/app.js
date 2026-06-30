@@ -1172,7 +1172,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
         session_id: session.session_id,
         session: null,
         at: now,
-      })));
+      })), env);
     }
   }
   timings.mark("reconcile");
@@ -1224,7 +1224,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
         session_id: session.session_id,
         session,
         at: now,
-      })));
+      })), env);
     }
   }
   await deleteSessionOpenHintsBestEffort(store, user.user_id, device.device_id, openedBackfillSessionIDs);
@@ -1235,6 +1235,7 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     prunedTurnSessions,
     new Set(changedSessionRecords.map((session) => String(session.session_id))),
     now,
+    env,
   );
   timings.mark("upsert_sessions");
   const currentSessionsForWindows = repairedPrunedSessions.length
@@ -1382,7 +1383,7 @@ async function loadKnownWindowSessions(store, userID, deviceID, requestedSession
   return out;
 }
 
-async function appendSessionCatalogChanges(store, changes) {
+async function appendSessionCatalogChanges(store, changes, env = null) {
   const rows = coalescedCatalogChanges(changes).map((change) => ({
     user_id: change.user_id,
     device_id: change.device_id,
@@ -1391,12 +1392,15 @@ async function appendSessionCatalogChanges(store, changes) {
     session_row: change.session ? publicCatalogChangeSessionRow(change.session) : null,
     created_at: change.at,
   }));
+  if (rows.length === 0) return;
   if (typeof store.appendSessionCatalogChanges === "function") {
     await store.appendSessionCatalogChanges(rows);
+    await notifySessionCatalogChanged(env, rows);
     return;
   }
   if (typeof store.appendSessionCatalogChange !== "function") return;
   for (const row of rows) await store.appendSessionCatalogChange(row);
+  await notifySessionCatalogChanged(env, rows);
 }
 
 function coalescedCatalogChanges(changes = []) {
@@ -1406,6 +1410,34 @@ function coalescedCatalogChanges(changes = []) {
     bySession.set(key, change);
   }
   return [...bySession.values()];
+}
+
+async function notifySessionCatalogChanged(env, rows) {
+  if (!env || !browserRealtimeEnabled(env) || !rows?.length) return;
+  const byUser = new Map();
+  for (const row of rows) {
+    const userID = String(row.user_id || "");
+    if (!userID) continue;
+    const entry = byUser.get(userID) ?? { userID, sessionIDs: new Set(), deviceIDs: new Set() };
+    if (row.session_id) entry.sessionIDs.add(String(row.session_id));
+    if (row.device_id) entry.deviceIDs.add(String(row.device_id));
+    byUser.set(userID, entry);
+  }
+  for (const entry of byUser.values()) {
+    try {
+      const control = createControlHubForUser(env, entry.userID);
+      if (typeof control?.broadcastSessionCatalogChanged !== "function") continue;
+      control.broadcastSessionCatalogChanged({
+        userID: entry.userID,
+        session_ids: [...entry.sessionIDs],
+        device_ids: [...entry.deviceIDs],
+        reason: "daemon_sync",
+      });
+    } catch {
+      // Realtime catalog hints are best-effort; /api/sessions/delta remains
+      // the authoritative recovery path.
+    }
+  }
 }
 
 function publicCatalogChangeSessionRow(session) {
@@ -3066,7 +3098,7 @@ async function sessionDelete(request, store, env, providers, sessionID, url) {
       session_id: sessionID,
       session: null,
       at: new Date().toISOString(),
-    }]);
+    }], env);
     await deleteHistoryBlobsBestEffort(providers, historyBlobKeys);
     return jsonResponse({ status: "ok", deleted: result.deleted || [] });
   } catch (error) {
@@ -3956,7 +3988,7 @@ async function upsertDaemonIdentity(store, user, body, now, markSeen) {
   return daemon;
 }
 
-async function supersedeDaemonDevicesForMachine(store, userID, currentDaemon, at) {
+async function supersedeDaemonDevicesForMachine(store, userID, currentDaemon, at, env = null) {
   const machineFingerprint = currentDaemon?.machine_fingerprint || "";
   if (!machineFingerprint || typeof store.listDaemonDevicesByMachineFingerprint !== "function") return;
   const devices = await store.listDaemonDevicesByMachineFingerprint(userID, machineFingerprint);
@@ -3991,7 +4023,7 @@ async function supersedeDaemonDevicesForMachine(store, userID, currentDaemon, at
         session,
         at,
       })),
-    ]);
+    ], env);
   }
 }
 
@@ -4264,7 +4296,7 @@ async function sessionWithTurnStats(store, userID, deviceID, sessionID, options 
   return next;
 }
 
-async function repairPrunedTurnSessions(store, user, device, prunedSessions = [], alreadyUpdatedSessionIDs = new Set(), now = new Date().toISOString()) {
+async function repairPrunedTurnSessions(store, user, device, prunedSessions = [], alreadyUpdatedSessionIDs = new Set(), now = new Date().toISOString(), env = null) {
   const out = [];
   const seen = new Set();
   for (const pruned of prunedSessions) {
@@ -4312,7 +4344,7 @@ async function repairPrunedTurnSessions(store, user, device, prunedSessions = []
     session_id: session.session_id,
     session,
     at: now,
-  })));
+  })), env);
   return out;
 }
 

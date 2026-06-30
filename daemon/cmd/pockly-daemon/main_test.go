@@ -1443,6 +1443,9 @@ func TestCatalogSyncSignatureIgnoresHelloButTracksCatalogChanges(t *testing.T) {
 	if catalogSyncSignature(req) == catalogSyncSignature(changedTitle) {
 		t.Fatal("catalog signature must change when session title changes")
 	}
+	if catalogDisplayMetadataSignature(req) == catalogDisplayMetadataSignature(changedTitle) {
+		t.Fatal("display metadata signature must change when session title changes")
+	}
 }
 
 func TestCatalogSyncFullReconcileRequiresCompleteCatalog(t *testing.T) {
@@ -1661,6 +1664,19 @@ func TestCatalogSyncSignatureIgnoresVolatileTurnFields(t *testing.T) {
 	changedTitle.Sessions[0].Title = "Renamed"
 	if got, want := catalogSyncSignature(changedTitle), catalogSyncSignature(base); got == want {
 		t.Fatalf("catalogSyncSignature did not change for title update: %q", got)
+	}
+	if got, want := catalogDisplayMetadataSignature(changedTitle), catalogDisplayMetadataSignature(base); got == want {
+		t.Fatalf("catalogDisplayMetadataSignature did not change for title update: %q", got)
+	}
+
+	changedSyncState := base
+	changedSyncState.Sessions = append([]pair.SyncSession(nil), base.Sessions...)
+	changedSyncState.Sessions[0].SyncState = "window_synced"
+	if got, want := catalogSyncSignature(changedSyncState), catalogSyncSignature(base); got == want {
+		t.Fatalf("catalogSyncSignature did not change for sync_state update: %q", got)
+	}
+	if got, want := catalogDisplayMetadataSignature(changedSyncState), catalogDisplayMetadataSignature(base); got != want {
+		t.Fatalf("display metadata signature changed for sync_state update\n got: %q\nwant: %q", got, want)
 	}
 }
 
@@ -2303,6 +2319,50 @@ func TestShouldPushCatalogFloors(t *testing.T) {
 	}
 }
 
+func TestShouldPushCatalogChangeAllowsMetadataFloorOnlyForDisplayChanges(t *testing.T) {
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	lastCatalog := now.Add(-10 * time.Second)
+	lastMetadata := now.Add(-3 * time.Second)
+	if !shouldPushCatalogChange(true, false, true, now, lastCatalog, lastMetadata, time.Minute, 2*time.Second) {
+		t.Fatal("display metadata change past metadata floor must bypass catalog floor")
+	}
+	if shouldPushCatalogChange(true, false, true, now, lastCatalog, now.Add(-time.Second), time.Minute, 2*time.Second) {
+		t.Fatal("display metadata change inside metadata floor must be debounced")
+	}
+	if shouldPushCatalogChange(true, false, false, now, lastCatalog, lastMetadata, time.Minute, 2*time.Second) {
+		t.Fatal("non-display catalog change inside catalog floor must be throttled")
+	}
+	if !shouldPushCatalogChange(true, false, false, now, now.Add(-2*time.Minute), lastMetadata, time.Minute, 2*time.Second) {
+		t.Fatal("non-display catalog change past catalog floor must push")
+	}
+	if shouldPushCatalogChange(false, true, true, now, lastCatalog, lastMetadata, time.Minute, 2*time.Second) {
+		t.Fatal("unchanged catalog must never push")
+	}
+	if !shouldPushCatalogChange(true, true, false, now, lastCatalog, lastMetadata, time.Minute, 2*time.Second) {
+		t.Fatal("membership change must bypass all floors")
+	}
+}
+
+func TestCatalogMetadataRetryDelayOnlyWhenMetadataDebounced(t *testing.T) {
+	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
+	lastMetadata := now.Add(-500 * time.Millisecond)
+	if got, want := catalogMetadataRetryDelay(true, false, true, now, lastMetadata, 2*time.Second), 1500*time.Millisecond; got != want {
+		t.Fatalf("metadata retry delay = %v, want %v", got, want)
+	}
+	if got := catalogMetadataRetryDelay(true, false, true, now, now.Add(-3*time.Second), 2*time.Second); got != 0 {
+		t.Fatalf("metadata retry delay past floor = %v, want 0", got)
+	}
+	if got := catalogMetadataRetryDelay(false, false, true, now, lastMetadata, 2*time.Second); got != 0 {
+		t.Fatalf("metadata retry delay for unchanged catalog = %v, want 0", got)
+	}
+	if got := catalogMetadataRetryDelay(true, true, true, now, lastMetadata, 2*time.Second); got != 0 {
+		t.Fatalf("metadata retry delay for membership change = %v, want 0", got)
+	}
+	if got := catalogMetadataRetryDelay(true, false, false, now, lastMetadata, 2*time.Second); got != 0 {
+		t.Fatalf("metadata retry delay for non-display change = %v, want 0", got)
+	}
+}
+
 func TestShouldPushWindowFloors(t *testing.T) {
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	if !shouldPushWindow(now, time.Time{}, 15*time.Second, false) {
@@ -2327,5 +2387,34 @@ func TestCatalogMembershipSignatureIsOrderInsensitive(t *testing.T) {
 	}
 	if left == catalogMembershipSignature([]pair.SyncSession{{SessionID: "a"}}) {
 		t.Fatal("membership signature must change when a session is added/removed")
+	}
+}
+
+func TestCatalogDisplayMetadataSignatureIsOrderInsensitive(t *testing.T) {
+	left := pair.SyncRequest{FullReconcile: true, Sessions: []pair.SyncSession{
+		{SessionID: "b", Agent: "codex", Cwd: "/repo", Title: "B"},
+		{SessionID: "a", Agent: "codex", Cwd: "/repo", Title: "A"},
+	}}
+	right := pair.SyncRequest{FullReconcile: true, Sessions: []pair.SyncSession{
+		{SessionID: "a", Agent: "codex", Cwd: "/repo", Title: "A"},
+		{SessionID: "b", Agent: "codex", Cwd: "/repo", Title: "B"},
+	}}
+	if got, want := catalogDisplayMetadataSignature(left), catalogDisplayMetadataSignature(right); got != want {
+		t.Fatalf("display metadata signature must be order-insensitive\n got: %q\nwant: %q", got, want)
+	}
+	right.Sessions[1].Title = "B renamed"
+	if got, want := catalogDisplayMetadataSignature(left), catalogDisplayMetadataSignature(right); got == want {
+		t.Fatalf("display metadata signature must change when a title changes: %q", got)
+	}
+}
+
+func TestCatalogDisplayMetadataSignatureIgnoresFullReconcile(t *testing.T) {
+	left := pair.SyncRequest{FullReconcile: true, Sessions: []pair.SyncSession{
+		{SessionID: "a", Agent: "codex", Cwd: "/repo", Title: "A"},
+	}}
+	right := left
+	right.FullReconcile = false
+	if got, want := catalogDisplayMetadataSignature(left), catalogDisplayMetadataSignature(right); got != want {
+		t.Fatalf("display metadata signature must ignore full reconcile\n got: %q\nwant: %q", got, want)
 	}
 }
