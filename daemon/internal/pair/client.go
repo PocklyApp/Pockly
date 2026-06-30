@@ -168,9 +168,10 @@ type SyncTurn struct {
 }
 
 type SyncRequest struct {
-	Hello    HelloMessage  `json:"hello"`
-	Sessions []SyncSession `json:"sessions"`
-	Turns    []SyncTurn    `json:"turns,omitempty"`
+	Hello           HelloMessage  `json:"hello"`
+	Sessions        []SyncSession `json:"sessions"`
+	DeletedSessions []string      `json:"deleted_sessions,omitempty"`
+	Turns           []SyncTurn    `json:"turns,omitempty"`
 	// KnownWindowSessionIDs asks Nexus to return server-known hot-window hashes
 	// only for sessions the daemon is about to consider uploading. The daemon
 	// sends an explicit empty list when there are no candidates, so Nexus can

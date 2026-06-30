@@ -56,6 +56,27 @@ test("session catalog delta merges upserts, tombstones, and keeps recency order"
   assert.equal(merged.cursor, "sc_2");
 });
 
+test("session catalog delta tombstone hides a Codex session archived in the native app", () => {
+  const current = {
+    cursor: "sc_before_archive",
+    updated_at: 1,
+    sessions: [
+      session("codex_visible", { agent: "codex", device_id: "dd_codex", last_timestamp: "2026-06-13T00:02:00.000Z" }),
+      session("codex_archived", { agent: "codex", device_id: "dd_codex", last_timestamp: "2026-06-13T00:01:00.000Z" }),
+    ],
+  };
+
+  const merged = mergeSessionCatalogDelta(current, {
+    upserts: [],
+    deletes: [{ device_id: "dd_codex", session_id: "codex_archived" }],
+    next_cursor: "sc_after_archive",
+    has_more: false,
+  });
+
+  assert.deepEqual(merged.sessions.map((item) => item.session_id), ["codex_visible"]);
+  assert.equal(merged.cursor, "sc_after_archive");
+});
+
 test("session catalog reset delta replaces stale cached sessions", () => {
   const merged = mergeSessionCatalogDelta({
     cursor: "sc_old",

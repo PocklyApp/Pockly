@@ -4402,6 +4402,92 @@ describe("Nexus api", () => {
     assert.deepEqual((await listed.json()).sessions.map((session) => session.session_id), ["keep"]);
   });
 
+  it("full reconcile emits delta tombstones for Codex sessions removed after native archive", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [
+        { session_id: "codex_visible", agent: "codex", cwd: "/a", title: "Visible", last_seq: 1, last_timestamp: "2026-06-06T01:00:01Z" },
+        { session_id: "codex_archived", agent: "codex", cwd: "/a", title: "Archived", last_seq: 1, last_timestamp: "2026-06-06T01:00:02Z" },
+      ],
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+
+    const initialDelta = await call(env, "GET", "/api/sessions/delta?limit=50", null, browserAuth);
+    assert.equal(initialDelta.status, 200);
+    const initialBody = await initialDelta.json();
+    assert.deepEqual(initialBody.upserts.map((session) => session.session_id), ["codex_archived", "codex_visible"]);
+
+    const reconcile = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [
+        { session_id: "codex_visible", agent: "codex", cwd: "/a", title: "Visible", last_seq: 2, last_timestamp: "2026-06-06T01:00:03Z" },
+      ],
+    }, daemonAuth);
+    assert.equal(reconcile.status, 200);
+
+    const delta = await call(env, "GET", `/api/sessions/delta?since=${encodeURIComponent(initialBody.next_cursor)}&limit=50`, null, browserAuth);
+    assert.equal(delta.status, 200);
+    const deltaBody = await delta.json();
+    assert.deepEqual(deltaBody.deletes, [{ device_id: daemon.daemon_device_id, session_id: "codex_archived" }]);
+    assert.deepEqual(deltaBody.upserts.map((session) => session.session_id), ["codex_visible"]);
+  });
+
+  it("explicit deleted_sessions tombstones archived Codex sessions even when catalog is capped", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+    const daemon = await loginDaemon(env, cookie);
+    const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
+    const browserAuth = { authorization: `Bearer ${browser.device_access_token}` };
+
+    const first = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: true,
+      sessions: [
+        { session_id: "codex_visible", agent: "codex", cwd: "/a", title: "Visible", last_seq: 1, last_timestamp: "2026-06-06T01:00:01Z" },
+        { session_id: "codex_archived", agent: "codex", cwd: "/a", title: "Archived", last_seq: 1, last_timestamp: "2026-06-06T01:00:02Z" },
+        { session_id: "codex_old_outside_cap", agent: "codex", cwd: "/a", title: "Old", last_seq: 1, last_timestamp: "2026-06-06T01:00:00Z" },
+      ],
+    }, daemonAuth);
+    assert.equal(first.status, 200);
+
+    const initialDelta = await call(env, "GET", "/api/sessions/delta?limit=50", null, browserAuth);
+    assert.equal(initialDelta.status, 200);
+    const initialBody = await initialDelta.json();
+
+    const capped = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id },
+      full_reconcile: false,
+      deleted_sessions: ["codex_archived"],
+      sessions: [
+        { session_id: "codex_visible", agent: "codex", cwd: "/a", title: "Visible", last_seq: 2, last_timestamp: "2026-06-06T01:00:03Z" },
+      ],
+    }, daemonAuth);
+    assert.equal(capped.status, 200);
+    const cappedBody = await capped.json();
+    assert.equal(cappedBody.session_delete_count, 1);
+
+    const delta = await call(env, "GET", `/api/sessions/delta?since=${encodeURIComponent(initialBody.next_cursor)}&limit=50`, null, browserAuth);
+    assert.equal(delta.status, 200);
+    const deltaBody = await delta.json();
+    assert.deepEqual(deltaBody.deletes, [{ device_id: daemon.daemon_device_id, session_id: "codex_archived" }]);
+
+    const listed = await call(env, "GET", "/api/sessions", null, browserAuth);
+    assert.equal(listed.status, 200);
+    assert.deepEqual((await listed.json()).sessions.map((session) => session.session_id), ["codex_visible", "codex_old_outside_cap"]);
+  });
+
   it("serves push config, stores push subscriptions and feedback, and reports unconfigured voice STT", async () => {
     const env = testEnv();
     env.WEB_PUSH_ENABLED = "1";

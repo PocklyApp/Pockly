@@ -357,6 +357,9 @@ const REALTIME_HIDDEN_IDLE_CLOSE_AFTER_MS = 10 * 60_000;
 export const PRESENCE_REFRESH_REALTIME_MS = 60000;
 export const SESSION_CATALOG_REFRESH_MS = 60000;
 export const LARGE_SESSION_CATALOG_REFRESH_MS = 120000;
+export const SELECTED_SESSION_TAIL_REFRESH_MS = 5000;
+export const SELECTED_SESSION_OPEN_HINT_REFRESH_MS = 15000;
+export const SELECTED_SESSION_TAIL_OVERLAP_TURNS = 5;
 export const SESSION_CATALOG_PAGE_LIMIT = 50;
 export const SESSION_CATALOG_PREFETCH_PX = 240;
 export const LARGE_SESSION_ACTIVE_EVENT_POLL_MS = 3000;
@@ -706,6 +709,8 @@ export function App() {
   // a background session's stream leaks into whatever conversation is on screen.
   const selectedRef = useRef<ReaderSelection | null>(null);
   const emptySessionSyncRef = useRef("");
+  const selectedTailRefreshInFlightRef = useRef(false);
+  const selectedTailHintAtRef = useRef<Map<string, number>>(new Map());
   const loadingEarlierRef = useRef(false);
   const pendingDraftRef = useRef<DraftConversation | null>(null);
   const lastPresenceTelemetryAtRef = useRef(0);
@@ -942,6 +947,83 @@ export function App() {
   useEffect(() => {
     selectedRef.current = selected;
   }, [selected]);
+
+  async function refreshSelectedSessionTail(selection: ReaderSelection, options: { refreshHint?: boolean } = {}) {
+    if (selectedTailRefreshInFlightRef.current) return;
+    selectedTailRefreshInFlightRef.current = true;
+    try {
+      const now = Date.now();
+      const hintKey = `${selection.deviceId}:${selection.sessionId}`;
+      const lastHintAt = selectedTailHintAtRef.current.get(hintKey) ?? 0;
+      if (options.refreshHint && isWorkspaceLeaderTab() && now - lastHintAt >= SELECTED_SESSION_OPEN_HINT_REFRESH_MS) {
+        void markSessionOpened({
+          sessionId: selection.sessionId,
+          deviceId: selection.deviceId,
+          openedAt: new Date().toISOString(),
+          realtime: shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
+        }).then(() => {
+          selectedTailHintAtRef.current.set(hintKey, now);
+        }).catch(() => {
+          // The hint only prioritizes daemon-side window sync. Tail polling
+          // still works with the latest durable rows already in Nexus.
+        });
+      }
+      const refreshed = await getSessionTurns(selection.sessionId, selection.deviceId, selectedSessionTailFetchOptions(turnsRef.current));
+      const current = selectedRef.current;
+      if (!current || current.sessionId !== selection.sessionId || current.deviceId !== selection.deviceId) return;
+      const hydrated = refreshed.turns.map((turn) => ({ ...turn, device_id: selection.deviceId }));
+      if (hydrated.length > 0) {
+        mergeSessionTurnsIntoState(selection, hydrated, refreshed, isCompleteTurnsResponse(refreshed));
+        setTurnsStatus("");
+      } else if (refreshed.synced_max_seq !== undefined || refreshed.total_turn_count !== undefined) {
+        setTurnsHydrationState((currentHydration) =>
+          currentHydration ? incrementalTurnsHydration(currentHydration, refreshed, turnsRef.current) : refreshed,
+        );
+      }
+    } catch (error) {
+      if (error instanceof AuthExpiredError) {
+        handleWorkspaceAuthExpired(error);
+      }
+      // Transient misses keep the current transcript stable; the next tick
+      // and realtime stream remain the fallback.
+    } finally {
+      selectedTailRefreshInFlightRef.current = false;
+    }
+  }
+
+  useEffect(() => {
+    if (auth.status !== "authenticated" || !isReaderRoute(route) || !selected || selected.sessionId.startsWith("draft_")) return;
+    if (turnsStatus === "loading" || turnsStatus === "syncing") return;
+    if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+    if (shouldUseBrowserRealtime(runtimeCapabilities) && !isWorkspaceLeaderTab()) return;
+    let stopped = false;
+    const selection = selected;
+    const tick = (refreshHint = true) => {
+      if (stopped) return;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      void refreshSelectedSessionTail(selection, { refreshHint });
+    };
+    tick(false);
+    const timer = window.setInterval(() => tick(true), SELECTED_SESSION_TAIL_REFRESH_MS);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") tick(true);
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [
+    auth.status,
+    route.view,
+    runtimeCapabilities?.browser_realtime,
+    runtimeCapabilities?.browser_realtime_control,
+    selected?.deviceId,
+    selected?.sessionId,
+    turnsStatus,
+    workspaceLeaderTick,
+  ]);
 
   useEffect(() => {
     if (auth.status !== "authenticated" || !isReaderRoute(route) || !selected || !selectedSession) return;
@@ -13502,6 +13584,17 @@ export function sessionTurnsFetchOptionsForCachedOpen(turns: SessionTurn[]) {
   return {
     limit: SESSION_TURNS_WINDOW_LIMIT,
     ...(cachedMaxSeq > 0 ? { afterSeq: cachedMaxSeq } : {}),
+  };
+}
+
+export function selectedSessionTailFetchOptions(turns: SessionTurn[]) {
+  const confirmedMaxSeq = lastConfirmedSeq(turns);
+  const afterSeq = confirmedMaxSeq > SELECTED_SESSION_TAIL_OVERLAP_TURNS
+    ? confirmedMaxSeq - SELECTED_SESSION_TAIL_OVERLAP_TURNS
+    : 0;
+  return {
+    limit: SESSION_TURNS_WINDOW_LIMIT,
+    ...(afterSeq > 0 ? { afterSeq } : {}),
   };
 }
 

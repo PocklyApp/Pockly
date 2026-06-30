@@ -29,7 +29,11 @@ import {
   SESSION_CATALOG_PAGE_LIMIT,
   SESSION_CATALOG_PREFETCH_PX,
   SESSION_CATALOG_REFRESH_MS,
+  SELECTED_SESSION_OPEN_HINT_REFRESH_MS,
+  SELECTED_SESSION_TAIL_OVERLAP_TURNS,
+  SELECTED_SESSION_TAIL_REFRESH_MS,
   sessionCatalogRefreshIntervalForSession,
+  selectedSessionTailFetchOptions,
   shouldLoadMoreSessionCatalogFromScroll,
   shouldPollWorkspacePresence,
   shouldRefreshSessionCatalog,
@@ -431,6 +435,9 @@ test("presence polling refreshes session catalog only on interval or forced resu
   assert.equal(PRESENCE_REFRESH_FOREGROUND_MS, 15_000);
   assert.equal(PRESENCE_REFRESH_BACKGROUND_MS, 60_000);
   assert.equal(SESSION_CATALOG_REFRESH_MS, 60_000);
+  assert.equal(SELECTED_SESSION_TAIL_REFRESH_MS, 5_000);
+  assert.equal(SELECTED_SESSION_OPEN_HINT_REFRESH_MS, 15_000);
+  assert.equal(SELECTED_SESSION_TAIL_OVERLAP_TURNS, 5);
   assert.equal(SESSION_CATALOG_PAGE_LIMIT, 50);
   assert.equal(shouldRefreshSessionCatalog({
     now: 5_000,
@@ -457,6 +464,35 @@ test("presence polling refreshes session catalog only on interval or forced resu
     force: true,
     intervalMs: 60_000,
   }), true);
+});
+
+test("selected session tail polling overlaps recent confirmed turns", () => {
+  assert.deepEqual(selectedSessionTailFetchOptions([]), {
+    limit: SESSION_TURNS_WINDOW_LIMIT,
+  });
+  assert.deepEqual(selectedSessionTailFetchOptions([
+    {
+      device_id: "dd_test",
+      session_id: "sess_tail",
+      seq: 101,
+      agent: "codex",
+      kind: "assistant_text",
+      timestamp: "2026-06-13T00:00:00.000Z",
+      payload: { text: "partial" },
+    },
+    {
+      device_id: "dd_test",
+      session_id: "sess_tail",
+      seq: 900_000_001,
+      agent: "codex",
+      kind: "assistant_text",
+      timestamp: "2026-06-13T00:00:01.000Z",
+      payload: { text: "live ghost" },
+    },
+  ]), {
+    limit: SESSION_TURNS_WINDOW_LIMIT,
+    afterSeq: 96,
+  });
 });
 
 test("session catalog pagination loads more only near the drawer bottom", () => {

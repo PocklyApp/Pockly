@@ -1044,7 +1044,14 @@ func runServe(args []string) (err error) {
 					}
 				}
 				pushedHints := newPushedHintStore()
-				go startNexusSyncLoop(ctx, pair.NewClient(baseURL), id, idx, *syncInterval, profile, pushedHints)
+				syncWake := make(chan struct{}, 1)
+				wakeSync := func() {
+					select {
+					case syncWake <- struct{}{}:
+					default:
+					}
+				}
+				go startNexusSyncLoop(ctx, pair.NewClient(baseURL), id, idx, *syncInterval, profile, pushedHints, syncWake)
 				// updateHandler bridges incoming control-WS update_request
 				// messages from Nexus to the local PerformUpdate
 				// function. We define it here so main has cmd-package
@@ -1161,6 +1168,7 @@ func runServe(args []string) (err error) {
 								HasOlderTurns:   hint.HasOlderTurns,
 								WindowHash:      hint.WindowHash,
 							}, time.Now())
+							wakeSync()
 						},
 						SessionDelete: agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						Reveal:        agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
@@ -2255,7 +2263,7 @@ func terminalQRMode() string {
 	}
 }
 
-func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, syncInterval time.Duration, profile runner.Profile, pushedHints *pushedHintStore) {
+func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Identity, idx *index.Index, syncInterval time.Duration, profile runner.Profile, pushedHints *pushedHintStore, wake <-chan struct{}) {
 	var lastSyncSuccessTelemetry time.Time
 	var lastLoggedAt time.Time
 	lastLoggedSessions := -1 // sentinel: first sync always logs
@@ -2321,7 +2329,7 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		req.FullReconcile = req.CatalogComplete
 		signature := catalogSyncSignature(req)
 		displayMetadataSignature := catalogDisplayMetadataSignature(req)
-		membership := catalogMembershipSignature(req.Sessions)
+		membership := catalogMembershipSignature(req)
 		now := time.Now()
 		historyCandidates := historySyncCatalogSessions(idx, profile, req)
 		policy := defaultNexusSyncPolicy()
@@ -2410,6 +2418,8 @@ func startNexusSyncLoop(ctx context.Context, client *pair.Client, id device.Iden
 		case <-ctx.Done():
 			return
 		case <-idx.Changes():
+			runSync()
+		case <-wake:
 			runSync()
 		case <-catalogMetadataRetryC:
 			catalogMetadataRetryTimer = nil
@@ -2601,7 +2611,12 @@ func (s *pushedHintStore) UpdateAfterSync(sessionID string, meta pair.SyncSessio
 		return
 	}
 	if entry.hint.Reason == "recently_opened" {
-		delete(s.entries, sessionID)
+		entry.hint = mergeSyncHintAfterWindow(entry.hint, meta)
+		if syncHintBackfillComplete(entry.hint) {
+			entry.hint.NextBeforeSeq = 0
+			entry.hint.HasOlderTurns = false
+		}
+		s.entries[sessionID] = entry
 		return
 	}
 	if !syncWindowIsLatestTail(meta) {
@@ -2714,10 +2729,13 @@ func shouldPushWindow(now, lastPush time.Time, minInterval time.Duration, freshl
 	return now.Sub(lastPush) >= minInterval
 }
 
-func catalogMembershipSignature(sessions []pair.SyncSession) string {
-	ids := make([]string, 0, len(sessions))
-	for _, session := range sessions {
-		ids = append(ids, session.SessionID)
+func catalogMembershipSignature(req pair.SyncRequest) string {
+	ids := make([]string, 0, len(req.Sessions)+len(req.DeletedSessions))
+	for _, session := range req.Sessions {
+		ids = append(ids, "live:"+session.SessionID)
+	}
+	for _, sessionID := range req.DeletedSessions {
+		ids = append(ids, "delete:"+sessionID)
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, "\x00")
@@ -2765,7 +2783,8 @@ func syncChangedNexusSessions(ctx context.Context, client *pair.Client, id devic
 			limit = maxInt(limit, policy.PriorityTurnLimit, hint.PreferredMin)
 		}
 		metaSignature := historyCandidateMetaSignature(session, limit, beforeSeq)
-		if !freshlyHinted && lastHistorySync[session.SessionID] != "" && lastWindowMeta[session.SessionID] == metaSignature {
+		prioritySession := hasHint || sessionActiveWithin(session, now, activeSessionWindow)
+		if !freshlyHinted && !prioritySession && lastHistorySync[session.SessionID] != "" && lastWindowMeta[session.SessionID] == metaSignature {
 			lastWindowPushAt[session.SessionID] = now
 			continue
 		}
@@ -3311,12 +3330,20 @@ func nexusSessionSyncSignature(session pair.SyncSession) string {
 }
 
 func catalogSyncSignature(req pair.SyncRequest) string {
+	deleted := append([]string(nil), req.DeletedSessions...)
+	sort.Strings(deleted)
+	for idx, sessionID := range deleted {
+		deleted[idx] = "delete:" + sessionID
+	}
 	if len(req.Sessions) == 0 {
-		return fmt.Sprintf("full=%t", req.FullReconcile)
+		return strings.Join(append([]string{fmt.Sprintf("full=%t", req.FullReconcile)}, deleted...), "\x00")
 	}
 	parts := []string{
 		fmt.Sprintf("full=%t", req.FullReconcile),
 		strconv.Itoa(len(req.Sessions)),
+	}
+	for _, sessionID := range deleted {
+		parts = append(parts, sessionID)
 	}
 	for _, session := range req.Sessions {
 		parts = append(parts,

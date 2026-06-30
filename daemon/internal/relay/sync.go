@@ -123,9 +123,23 @@ func BuildCatalogSyncRequest(idx *index.Index, daemonDeviceID string, profile ru
 	// Emit most-recent-first, accumulating an estimate of the marshaled
 	// body size. Stop before crossing catalogSyncMaxBytes so the POST stays
 	// under nginx's body limit. Sessions past the cap are the oldest, so
-	// dropping them costs the least.
+	// dropping them costs the least. Explicit tombstones are emitted first so
+	// archived/deleted sessions can disappear from Nexus even when the visible
+	// catalog is capped and cannot full-reconcile.
 	sessions := BuildCatalogSyncSessions(idx, profile)
 	approxBytes := catalogSyncBaseOverheadBytes
+	for _, deleted := range idx.DeletedSessions() {
+		if strings.TrimSpace(deleted.SessionID) == "" {
+			continue
+		}
+		unitBytes := approxJSONLen(deleted.SessionID)
+		if approxBytes+unitBytes > catalogSyncMaxBytes {
+			req.CatalogComplete = false
+			break
+		}
+		approxBytes += unitBytes
+		req.DeletedSessions = append(req.DeletedSessions, deleted.SessionID)
+	}
 	totalEligible := len(sessions)
 	emitted := 0
 	for _, ss := range sessions {

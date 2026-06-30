@@ -1105,6 +1105,9 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
   const turns = Array.isArray(body.turns) ? body.turns : [];
   const sessionIDs = sessions.map((session) => String(session?.session_id || "").trim()).filter(Boolean);
+  const explicitDeletedSessionIDs = [...new Set((Array.isArray(body.deleted_sessions) ? body.deleted_sessions : [])
+    .map((sessionID) => String(sessionID || "").trim())
+    .filter(Boolean))];
   let existingSessionsForBody = null;
   let existingSessionsForDevice = null;
   const getExistingSessionsForDevice = async () => {
@@ -1145,25 +1148,59 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   timings.mark("upsert_turns");
   let deletedSessionCount = 0;
   let deletedSessions = [];
+  if (explicitDeletedSessionIDs.length > 0) {
+    const existingDeletedSessions = typeof store.listDeviceSessionSyncSnapshotsByIDs === "function"
+      ? await store.listDeviceSessionSyncSnapshotsByIDs(user.user_id, device.device_id, explicitDeletedSessionIDs)
+      : (await getExistingSessionsForDevice()).filter((session) => explicitDeletedSessionIDs.includes(String(session.session_id)));
+    const deletedHistoryBlobKeys = await collectMissingSessionHistoryBlobKeys(
+      store,
+      providers,
+      user.user_id,
+      device.device_id,
+      [],
+      existingDeletedSessions,
+    );
+    for (const sessionID of explicitDeletedSessionIDs) {
+      if (typeof store.deleteSessionData === "function") {
+        await store.deleteSessionData(user.user_id, device.device_id, sessionID);
+      }
+    }
+    deletedSessions = missingDeviceSessions(existingDeletedSessions, []);
+    deletedSessionCount += deletedSessions.length;
+    if (deletedSessions.length > 0) {
+      await deleteHistoryBlobsBestEffort(providers, deletedHistoryBlobKeys);
+      await appendSessionCatalogChanges(store, deletedSessions.map((session) => ({
+        type: "delete",
+        user_id: user.user_id,
+        device_id: device.device_id,
+        session_id: session.session_id,
+        session: null,
+        at: now,
+      })), env);
+    }
+  }
   if (body.full_reconcile) {
     const keepSessionIDs = sessions.map((session) => String(session.session_id));
     const currentExistingSessions = await getExistingSessionsForDevice();
+    const currentExistingAfterExplicitDeletes = explicitDeletedSessionIDs.length > 0
+      ? currentExistingSessions.filter((session) => !explicitDeletedSessionIDs.includes(String(session.session_id)))
+      : currentExistingSessions;
     const deletedHistoryBlobKeys = await collectMissingSessionHistoryBlobKeys(
       store,
       providers,
       user.user_id,
       device.device_id,
       keepSessionIDs,
-      currentExistingSessions,
+      currentExistingAfterExplicitDeletes,
     );
     if (typeof store.deleteMissingDeviceSessionsFromExisting === "function") {
-      deletedSessions = missingDeviceSessions(currentExistingSessions, keepSessionIDs);
-      deletedSessionCount = Number(await store.deleteMissingDeviceSessionsFromExisting(user.user_id, device.device_id, keepSessionIDs, currentExistingSessions) ?? 0) || 0;
+      deletedSessions = missingDeviceSessions(currentExistingAfterExplicitDeletes, keepSessionIDs);
+      deletedSessionCount += Number(await store.deleteMissingDeviceSessionsFromExisting(user.user_id, device.device_id, keepSessionIDs, currentExistingAfterExplicitDeletes) ?? 0) || 0;
     } else {
-      deletedSessions = missingDeviceSessions(currentExistingSessions, keepSessionIDs);
-      deletedSessionCount = Number(await store.deleteMissingDeviceSessions(user.user_id, device.device_id, keepSessionIDs) ?? 0) || 0;
+      deletedSessions = missingDeviceSessions(currentExistingAfterExplicitDeletes, keepSessionIDs);
+      deletedSessionCount += Number(await store.deleteMissingDeviceSessions(user.user_id, device.device_id, keepSessionIDs) ?? 0) || 0;
     }
-    if (deletedSessionCount > 0) {
+    if (deletedSessions.length > 0) {
       await deleteHistoryBlobsBestEffort(providers, deletedHistoryBlobKeys);
       await appendSessionCatalogChanges(store, deletedSessions.map((session) => ({
         type: "delete",

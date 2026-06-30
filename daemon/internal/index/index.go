@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,6 +71,7 @@ type Index struct {
 	mu        sync.RWMutex
 	projects  []agent.Project
 	sessions  map[string]SessionRef
+	deleted   []DeletedSession
 	lastScan  time.Time
 	lastErr   error
 	snapshot  string
@@ -96,6 +98,13 @@ type Index struct {
 	// complete index (FindSession) gate on this instead of racing the scan.
 	firstScanOnce sync.Once
 	firstScanDone chan struct{}
+}
+
+// DeletedSession is a daemon-local tombstone for a session that still exists in
+// Nexus but should disappear from the remote catalog.
+type DeletedSession struct {
+	SessionID string
+	Agent     string
 }
 
 // Status is a read-only snapshot of the indexer's health. It is exposed
@@ -278,17 +287,18 @@ func (i *Index) FirstScanComplete() bool {
 }
 
 func (i *Index) refreshLocked() error {
-	projects, sessions, err := buildSnapshot(i.cfg)
+	projects, sessions, deleted, err := buildSnapshot(i.cfg)
 	if err == nil {
 		i.populateFirstMessages(projects, sessions)
 	}
-	snapshot := snapshotSignature(projects)
+	snapshot := snapshotSignature(projects, deleted)
 
 	i.mu.Lock()
 	changed := false
 	if err == nil {
 		i.projects = projects
 		i.sessions = sessions
+		i.deleted = deleted
 		i.lastScan = time.Now()
 		changed = i.snapshot != snapshot
 		i.snapshot = snapshot
@@ -580,6 +590,16 @@ func (i *Index) FindSession(sessionID string) (SessionRef, bool) {
 	return ref, ok
 }
 
+// DeletedSessions returns explicit local tombstones observed during the latest
+// scan. It is intentionally separate from Projects(): capped catalog syncs are
+// not authoritative full lists, but explicit tombstones can still be sent.
+func (i *Index) DeletedSessions() []DeletedSession {
+	i.waitFirstScan()
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return append([]DeletedSession(nil), i.deleted...)
+}
+
 // Changes emits when a Refresh observes a different session snapshot.
 func (i *Index) Changes() <-chan struct{} {
 	return i.changes
@@ -597,14 +617,15 @@ func (i *Index) notifyChanged() {
 // The catalog snapshot contains session metadata and title/snippet fields used
 // by Nexus and the web sidebar. Full turn content is synced by the per-session
 // history path.
-func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
+func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, []DeletedSession, error) {
 	var projects []agent.Project
 	sessions := map[string]SessionRef{}
+	var deleted []DeletedSession
 
 	if cfg.ClaudeHome != "" {
 		claudeProjects, err := claude.ListProjects(cfg.ClaudeHome)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		for _, p := range claudeProjects {
 			project := agent.Project{
@@ -630,11 +651,13 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 	}
 
 	if cfg.CodexHome != "" {
-		codexTitles := readCodexSessionTitles(cfg.CodexHome)
+		codexMetadata := readCodexSessionMetadata(cfg.CodexHome)
+		deleted = codexDeletedSessions(codexMetadata)
 		codexProjects, err := codex.ListProjects(cfg.CodexHome)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
+		archivedCodexSessionIDs := map[string]struct{}{}
 		for _, p := range codexProjects {
 			project := agent.Project{
 				Agent:    agentCodex,
@@ -642,8 +665,15 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 				Sessions: make([]agent.Session, 0, len(p.Sessions)),
 			}
 			for _, s := range p.Sessions {
+				meta := codexMetadata[s.SessionID]
+				if s.Archived || meta.Archived {
+					if strings.TrimSpace(s.SessionID) != "" {
+						archivedCodexSessionIDs[s.SessionID] = struct{}{}
+					}
+					continue
+				}
 				session := buildCatalogSession(s.SessionID, s.Path, "")
-				session.Title = codexTitles[s.SessionID]
+				session.Title = meta.Title
 				// Codex names rollout files with a dashed wall-clock stamp
 				// ("...T17-06-32") that is not RFC3339-parseable; the web would
 				// render it raw. Prefer the file mtime (like Claude), falling
@@ -664,6 +694,7 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 				projects = append(projects, project)
 			}
 		}
+		deleted = mergeDeletedSessions(deleted, archivedCodexSessionIDs, agentCodex)
 	}
 
 	sort.Slice(projects, func(i, j int) bool {
@@ -672,11 +703,19 @@ func buildSnapshot(cfg Config) ([]agent.Project, map[string]SessionRef, error) {
 		}
 		return projects[i].Cwd < projects[j].Cwd
 	})
-	return projects, sessions, nil
+	return projects, sessions, deleted, nil
 }
 
-func snapshotSignature(projects []agent.Project) string {
+func snapshotSignature(projects []agent.Project, deleted []DeletedSession) string {
 	var b strings.Builder
+	for _, session := range deleted {
+		b.WriteString("deleted")
+		b.WriteByte('\x00')
+		b.WriteString(session.Agent)
+		b.WriteByte('\x00')
+		b.WriteString(session.SessionID)
+		b.WriteByte('\x00')
+	}
 	for _, project := range projects {
 		b.WriteString(project.Agent)
 		b.WriteByte('\x00')
@@ -688,6 +727,14 @@ func snapshotSignature(projects []agent.Project) string {
 			b.WriteString(session.Timestamp)
 			b.WriteByte('\x00')
 			b.WriteString(session.Title)
+			b.WriteByte('\x00')
+			b.WriteString(session.FirstMessage)
+			b.WriteByte('\x00')
+			b.WriteString(session.FirstMessageForTitle)
+			b.WriteByte('\x00')
+			b.WriteString(session.Snippet)
+			b.WriteByte('\x00')
+			b.WriteString(strconv.Itoa(session.TurnCount))
 			b.WriteByte('\x00')
 		}
 	}
@@ -719,14 +766,78 @@ func normalizeCodexTimestamp(ts string) string {
 	return ts
 }
 
-func readCodexSessionTitles(codexHome string) map[string]string {
+type codexSessionMetadata struct {
+	Title    string
+	Archived bool
+}
+
+func readCodexSessionMetadata(codexHome string) map[string]codexSessionMetadata {
+	out := readCodexStateDBMetadata(filepath.Join(codexHome, "state_5.sqlite"))
 	titles := readCodexSessionIndexTitles(filepath.Join(codexHome, "session_index.jsonl"))
-	for sid, title := range readCodexStateDBTitles(filepath.Join(codexHome, "state_5.sqlite")) {
-		if strings.TrimSpace(titles[sid]) == "" {
-			titles[sid] = title
+	for sid, title := range titles {
+		meta := out[sid]
+		meta.Title = title
+		out[sid] = meta
+	}
+	return out
+}
+
+func codexDeletedSessions(metadata map[string]codexSessionMetadata) []DeletedSession {
+	out := make([]DeletedSession, 0)
+	for sid, meta := range metadata {
+		if strings.TrimSpace(sid) == "" || !meta.Archived {
+			continue
+		}
+		out = append(out, DeletedSession{SessionID: sid, Agent: agentCodex})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Agent == out[j].Agent {
+			return out[i].SessionID < out[j].SessionID
+		}
+		return out[i].Agent < out[j].Agent
+	})
+	return out
+}
+
+func mergeDeletedSessions(existing []DeletedSession, sessionIDs map[string]struct{}, agentName string) []DeletedSession {
+	seen := map[string]DeletedSession{}
+	for _, deleted := range existing {
+		sessionID := strings.TrimSpace(deleted.SessionID)
+		if sessionID == "" {
+			continue
+		}
+		key := deleted.Agent + "\x00" + sessionID
+		seen[key] = DeletedSession{SessionID: sessionID, Agent: deleted.Agent}
+	}
+	for sessionID := range sessionIDs {
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			continue
+		}
+		key := agentName + "\x00" + sessionID
+		seen[key] = DeletedSession{SessionID: sessionID, Agent: agentName}
+	}
+	out := make([]DeletedSession, 0, len(seen))
+	for _, deleted := range seen {
+		out = append(out, deleted)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Agent == out[j].Agent {
+			return out[i].SessionID < out[j].SessionID
+		}
+		return out[i].Agent < out[j].Agent
+	})
+	return out
+}
+
+func readCodexSessionTitles(codexHome string) map[string]string {
+	out := map[string]string{}
+	for sid, meta := range readCodexSessionMetadata(codexHome) {
+		if meta.Title != "" {
+			out[sid] = meta.Title
 		}
 	}
-	return titles
+	return out
 }
 
 func readCodexSessionIndexTitles(path string) map[string]string {
@@ -760,32 +871,48 @@ func readCodexSessionIndexTitles(path string) map[string]string {
 	return out
 }
 
-func readCodexStateDBTitles(path string) map[string]string {
-	out := map[string]string{}
+func readCodexStateDBMetadata(path string) map[string]codexSessionMetadata {
+	out := map[string]codexSessionMetadata{}
 	if _, err := os.Stat(path); err != nil {
 		return out
 	}
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&immutable=1")
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro")
 	if err != nil {
 		return out
 	}
 	defer db.Close()
 
-	rows, err := db.Query(`SELECT id, title FROM threads WHERE COALESCE(title, '') <> ''`)
+	rows, err := db.Query(`SELECT id, COALESCE(title, ''), COALESCE(archived, 0) FROM threads`)
+	if err != nil {
+		rows, err = db.Query(`SELECT id, COALESCE(title, '') FROM threads`)
+	}
 	if err != nil {
 		return out
 	}
 	defer rows.Close()
 
+	columns, err := rows.Columns()
+	if err != nil {
+		return out
+	}
+	withArchived := len(columns) == 3
 	for rows.Next() {
 		var id, title string
-		if err := rows.Scan(&id, &title); err != nil {
+		var archived int64
+		if withArchived {
+			if err := rows.Scan(&id, &title, &archived); err != nil {
+				continue
+			}
+		} else if err := rows.Scan(&id, &title); err != nil {
 			continue
 		}
 		id = strings.TrimSpace(id)
 		title = cleanCodexThreadTitle(title)
-		if id != "" && title != "" {
-			out[id] = title
+		if id != "" {
+			out[id] = codexSessionMetadata{
+				Title:    title,
+				Archived: archived != 0,
+			}
 		}
 	}
 	return out
@@ -957,7 +1084,7 @@ func shouldRefreshForPath(path string) bool {
 	if strings.HasSuffix(base, ".jsonl") {
 		return true
 	}
-	if base == "state_5.sqlite" || base == "session_index.jsonl" {
+	if base == "state_5.sqlite" || base == "state_5.sqlite-wal" || base == "state_5.sqlite-shm" || base == "state_5.sqlite-journal" || base == "session_index.jsonl" {
 		return true
 	}
 	return filepath.Ext(base) == ""

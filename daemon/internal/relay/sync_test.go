@@ -5,6 +5,7 @@ package relay
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -806,5 +807,81 @@ func TestBuildCatalogSyncRequestBoundsBodyToByteBudget(t *testing.T) {
 	}
 	if kept[oldCodexID] {
 		t.Fatalf("old codex session was kept while the catalog cap dropped newer sessions")
+	}
+}
+
+func TestBuildCatalogSyncRequestKeepsCodexArchiveTombstonesWhenCapped(t *testing.T) {
+	root := t.TempDir()
+	claudeHome := filepath.Join(root, ".claude", "projects")
+	codexHome := filepath.Join(root, ".codex")
+	projectDir := filepath.Join(claudeHome, "-tmp-alpha")
+	mustMkdirAll(t, projectDir)
+
+	bigMessage := strings.Repeat("the quick brown fox jumps ", 10)
+	for i := 0; i < 3000; i++ {
+		sid := fmt.Sprintf("%08d-2222-2222-2222-222222222222", i)
+		tsTime := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Minute)
+		line := fmt.Sprintf(`{"sessionId":%q,"cwd":"/tmp/alpha","timestamp":%q,"type":"user","message":{"role":"user","content":%q}}`+"\n",
+			sid, tsTime.Format(time.RFC3339Nano), bigMessage)
+		path := filepath.Join(projectDir, sid+".jsonl")
+		mustWriteFile(t, path, line)
+		if err := os.Chtimes(path, tsTime, tsTime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	archivedCodexID := "cccccccc-cccc-cccc-cccc-cccccccccccc"
+	_, _ = writeCodexRollout(t, codexHome, "2025-12-31T23-59-59", archivedCodexID, "/tmp/codex-old", "archived prompt", "")
+	writeCodexStateDBMetadata(t, filepath.Join(codexHome, "state_5.sqlite"), []codexStateDBRow{
+		{id: archivedCodexID, title: "Archived", archived: true},
+	})
+
+	idx := index.New(index.Config{ClaudeHome: claudeHome, CodexHome: codexHome, RefreshInterval: time.Minute})
+	if err := idx.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := BuildCatalogSyncRequest(idx, "dd_test", claudeProfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.CatalogComplete {
+		t.Fatal("fixture should cap catalog")
+	}
+	if !reflect.DeepEqual(req.DeletedSessions, []string{archivedCodexID}) {
+		t.Fatalf("deleted_sessions = %#v, want archived codex tombstone", req.DeletedSessions)
+	}
+	body, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) > catalogSyncMaxBytes {
+		t.Fatalf("catalog sync body = %d bytes, exceeds budget %d", len(body), catalogSyncMaxBytes)
+	}
+}
+
+type codexStateDBRow struct {
+	id       string
+	title    string
+	archived bool
+}
+
+func writeCodexStateDBMetadata(t *testing.T, path string, rows []codexStateDBRow) {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, archived INTEGER NOT NULL DEFAULT 0, archived_at INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		archived := 0
+		if row.archived {
+			archived = 1
+		}
+		if _, err := db.Exec(`INSERT INTO threads (id, title, archived) VALUES (?, ?, ?)`, row.id, row.title, archived); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

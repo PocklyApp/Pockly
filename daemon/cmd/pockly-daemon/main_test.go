@@ -1163,15 +1163,16 @@ func TestSyncChangedNexusSessionsUploadsFirstHintedWindowWithoutLocalSignature(t
 	}
 }
 
-func TestSyncChangedNexusSessionsSkipsWindowBuildWhenCandidateMetadataUnchanged(t *testing.T) {
+func TestSyncChangedNexusSessionsSkipsWindowBuildWhenBackgroundCandidateMetadataUnchanged(t *testing.T) {
 	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_PROACTIVE_HISTORY_SYNC", "1")
 	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
 	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "metadata skip")
 	if err != nil {
 		t.Fatal(err)
 	}
 	idx := index.New(index.Config{})
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := time.Now().Add(-2 * activeSessionWindow).UTC().Format(time.RFC3339)
 	candidate := pair.SyncSession{
 		SessionID:         "sess_meta_skip",
 		Agent:             "claude-code",
@@ -1207,6 +1208,104 @@ func TestSyncChangedNexusSessionsSkipsWindowBuildWhenCandidateMetadataUnchanged(
 	}
 	if lastWindowPushAt[candidate.SessionID].IsZero() {
 		t.Fatal("metadata skip should update the window floor without building the session window")
+	}
+}
+
+func TestSyncChangedNexusSessionsUploadsActiveWindowWhenCandidateMetadataUnchanged(t *testing.T) {
+	t.Setenv("POCKLY_ALLOW_PLAINTEXT_KEY", "1")
+	t.Setenv("POCKLY_SYNC_HINTS_POLL_INTERVAL", "0")
+	idx, sessionID := relayFixtureIndexWithTurns(t, 62)
+	initialReq, err := relay.BuildSingleSessionWindowSyncRequestContext(
+		context.Background(),
+		idx,
+		"dd_active_metadata",
+		sessionID,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		relay.SessionWindow{Limit: 20},
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := device.LoadOrCreate(filepath.Join(t.TempDir(), "device.json"), "active metadata")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	activeAt := time.Now().UTC().Format(time.RFC3339)
+	candidate := pair.SyncSession{
+		SessionID:         sessionID,
+		Agent:             "claude-code",
+		RunnerAlias:       "claude",
+		Cwd:               initialReq.Sessions[0].Cwd,
+		LastTimestamp:     activeAt,
+		ChannelLastSeenAt: activeAt,
+		TurnCount:         60,
+	}
+	lastHistorySync := map[string]string{sessionID: "stale-window"}
+	lastWindowMeta := map[string]string{
+		sessionID: historyCandidateMetaSignature(candidate, defaultInitialTurnLimit, 0),
+	}
+
+	var uploadedSeqs []int
+	var syncPosts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/device-challenge":
+			_ = json.NewEncoder(w).Encode(pair.ChallengeResponse{
+				ChallengeID: "challenge_active_metadata",
+				DeviceID:    identity.DeviceID,
+				Audience:    "daemon-ws",
+				Nonce:       "nonce",
+				ExpiresAt:   time.Now().Add(time.Minute),
+			})
+		case "/api/device-challenge/verify":
+			_ = json.NewEncoder(w).Encode(pair.VerifyChallengeResponse{
+				Verified:          true,
+				DeviceAccessToken: "test-token",
+			})
+		case "/api/daemon/sync":
+			syncPosts.Add(1)
+			var req pair.SyncRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode sync request: %v", err)
+				http.Error(w, "bad request", http.StatusBadRequest)
+				return
+			}
+			for _, turn := range req.Turns {
+				uploadedSeqs = append(uploadedSeqs, turn.Seq)
+			}
+			_ = json.NewEncoder(w).Encode(pair.SyncResponse{OK: true, SessionCount: 1, TurnCount: len(req.Turns)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result := syncChangedNexusSessions(
+		context.Background(),
+		pair.NewClient(srv.URL),
+		identity,
+		idx,
+		[]pair.SyncSession{candidate},
+		lastHistorySync,
+		lastWindowMeta,
+		runner.Profile{ClaudeAlias: runner.AliasClaude},
+		nil,
+		newPushedHintStore(),
+		nil,
+		map[string]time.Time{},
+		0,
+	)
+	if result.Sessions != 1 || result.Turns != 20 {
+		t.Fatalf("synced sessions/turns = %d/%d, want 1/20", result.Sessions, result.Turns)
+	}
+	if got := syncPosts.Load(); got != 1 {
+		t.Fatalf("sync POST count = %d, want 1", got)
+	}
+	if len(uploadedSeqs) != 20 || uploadedSeqs[0] != 43 || uploadedSeqs[len(uploadedSeqs)-1] != 62 {
+		t.Fatalf("uploaded seqs = %v, want tail 43..62", uploadedSeqs)
 	}
 }
 
@@ -1445,6 +1544,11 @@ func TestCatalogSyncSignatureIgnoresHelloButTracksCatalogChanges(t *testing.T) {
 	}
 	if catalogDisplayMetadataSignature(req) == catalogDisplayMetadataSignature(changedTitle) {
 		t.Fatal("display metadata signature must change when session title changes")
+	}
+	changedDeleted := req
+	changedDeleted.DeletedSessions = []string{"sid_archived"}
+	if catalogSyncSignature(req) == catalogSyncSignature(changedDeleted) {
+		t.Fatal("catalog signature must change when explicit deleted_sessions changes")
 	}
 }
 
@@ -2236,7 +2340,7 @@ func TestPushedHintStoreEvictsOldestAtCapacity(t *testing.T) {
 	}
 }
 
-func TestPushedHintStoreConsumesRecentlyOpenedAfterOneWindow(t *testing.T) {
+func TestPushedHintStoreKeepsRecentlyOpenedFreshAfterOneWindow(t *testing.T) {
 	store := newPushedHintStore()
 	now := time.Date(2026, 6, 11, 10, 0, 0, 0, time.UTC)
 	store.Add("sess-large", syncHint{
@@ -2263,8 +2367,15 @@ func TestPushedHintStoreConsumesRecentlyOpenedAfterOneWindow(t *testing.T) {
 		HasOlder:  true,
 	}, now.Add(time.Second))
 
-	if hints := store.Snapshot(now.Add(time.Second)); len(hints) != 0 {
-		t.Fatalf("recently opened hint should be consumed after one window, got %+v", hints)
+	updated := store.Snapshot(now.Add(time.Second))["sess-large"]
+	if updated.Reason != "recently_opened" {
+		t.Fatalf("recently opened hint should stay while the reader is fresh, got %+v", updated)
+	}
+	if !store.PushedWithin("sess-large", now.Add(time.Minute), pushedHintFreshFor) {
+		t.Fatal("recently opened hint should keep bypassing the window floor inside the fresh window")
+	}
+	if store.PushedWithin("sess-large", now.Add(10*time.Minute), pushedHintFreshFor) {
+		t.Fatal("recently opened hint must stop bypassing the window floor after the fresh window")
 	}
 }
 
@@ -2380,13 +2491,19 @@ func TestShouldPushWindowFloors(t *testing.T) {
 }
 
 func TestCatalogMembershipSignatureIsOrderInsensitive(t *testing.T) {
-	left := catalogMembershipSignature([]pair.SyncSession{{SessionID: "b"}, {SessionID: "a"}})
-	right := catalogMembershipSignature([]pair.SyncSession{{SessionID: "a"}, {SessionID: "b"}})
+	left := catalogMembershipSignature(pair.SyncRequest{Sessions: []pair.SyncSession{{SessionID: "b"}, {SessionID: "a"}}})
+	right := catalogMembershipSignature(pair.SyncRequest{Sessions: []pair.SyncSession{{SessionID: "a"}, {SessionID: "b"}}})
 	if left != right {
 		t.Fatalf("membership signature must be order-insensitive: %q vs %q", left, right)
 	}
-	if left == catalogMembershipSignature([]pair.SyncSession{{SessionID: "a"}}) {
+	if left == catalogMembershipSignature(pair.SyncRequest{Sessions: []pair.SyncSession{{SessionID: "a"}}}) {
 		t.Fatal("membership signature must change when a session is added/removed")
+	}
+	if left == catalogMembershipSignature(pair.SyncRequest{
+		Sessions:        []pair.SyncSession{{SessionID: "a"}, {SessionID: "b"}},
+		DeletedSessions: []string{"archived"},
+	}) {
+		t.Fatal("membership signature must change when explicit tombstones are present")
 	}
 }
 
