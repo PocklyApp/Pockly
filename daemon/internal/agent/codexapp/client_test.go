@@ -119,6 +119,46 @@ func TestRequestTimeoutCoversBlockedWrite(t *testing.T) {
 	close(writer.release)
 }
 
+func TestReadLoopHandlesLargeJSONLines(t *testing.T) {
+	r, w := io.Pipe()
+	notifications := make(chan Notification, 1)
+	c := &Client{
+		cfg: Config{OnNotification: func(n Notification) {
+			notifications <- n
+		}},
+		pending: map[string]chan rpcResponse{},
+		done:    make(chan struct{}),
+	}
+	go c.readLoop(r)
+	large := strings.Repeat("x", 17*1024*1024)
+	go func() {
+		_, _ = w.Write([]byte(`{"method":"item/agentMessage/delta","params":{"itemId":"i","delta":"` + large + `"}}` + "\n"))
+		_ = w.Close()
+	}()
+	select {
+	case n := <-notifications:
+		if n.Method != "item/agentMessage/delta" {
+			t.Fatalf("method = %q", n.Method)
+		}
+		if !strings.Contains(string(n.Params), large[:1024]) {
+			t.Fatalf("large params were not delivered")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for large notification")
+	}
+}
+
+func TestReadLineLimitedRejectsOversizedLine(t *testing.T) {
+	reader := bufio.NewReaderSize(strings.NewReader(strings.Repeat("x", 32)), 8)
+	line, err := readLineLimited(reader, 16)
+	if err == nil {
+		t.Fatal("expected oversized line error")
+	}
+	if len(line) <= 16 {
+		t.Fatalf("line len = %d, want over limit", len(line))
+	}
+}
+
 func TestNotifyOmitsNilParams(t *testing.T) {
 	r, w := io.Pipe()
 	defer r.Close()

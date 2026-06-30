@@ -141,7 +141,8 @@ func (i *Index) Start(ctx context.Context) {
 	}
 	defer watcher.Close()
 
-	if err := i.addWatchRoots(watcher); err != nil {
+	watchedDirs := map[string]struct{}{}
+	if err := i.addWatchRoots(watcher, watchedDirs); err != nil {
 		log.Printf("pockly-daemon index: add watch roots: %v", err)
 	}
 
@@ -186,7 +187,7 @@ func (i *Index) Start(ctx context.Context) {
 
 		case <-debounceC:
 			_ = i.Refresh()
-			if err := i.addWatchRoots(watcher); err != nil {
+			if err := i.addWatchRoots(watcher, watchedDirs); err != nil {
 				log.Printf("pockly-daemon index: refresh watch roots: %v", err)
 			}
 			debounceC = nil
@@ -200,9 +201,12 @@ func (i *Index) Start(ctx context.Context) {
 			if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 {
 				continue
 			}
+			if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+				removeWatchedDir(watchedDirs, event.Name)
+			}
 			if event.Op&fsnotify.Create != 0 {
 				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-					_ = i.addWatchDirRecursive(watcher, event.Name)
+					_ = i.addWatchDirRecursive(watcher, watchedDirs, event.Name)
 				}
 			}
 			if shouldRefreshForPath(event.Name) {
@@ -219,7 +223,7 @@ func (i *Index) Start(ctx context.Context) {
 
 		case <-tickerC(ticker):
 			_ = i.Refresh()
-			if err := i.addWatchRoots(watcher); err != nil {
+			if err := i.addWatchRoots(watcher, watchedDirs); err != nil {
 				log.Printf("pockly-daemon index: periodic watch root refresh: %v", err)
 			}
 		}
@@ -1026,34 +1030,45 @@ func (i *Index) runPollingOnly(ctx context.Context) {
 	}
 }
 
-func (i *Index) addWatchRoots(w *fsnotify.Watcher) error {
+type watchRoot struct {
+	path      string
+	recursive bool
+}
+
+func (i *Index) addWatchRoots(w *fsnotify.Watcher, watched map[string]struct{}) error {
 	for _, root := range i.watchRoots() {
-		if root == "" {
+		if root.path == "" {
 			continue
 		}
-		if err := i.addWatchDirRecursive(w, root); err != nil && !os.IsNotExist(err) {
+		var err error
+		if root.recursive {
+			err = i.addWatchDirRecursive(w, watched, root.path)
+		} else {
+			err = addWatchDir(w, watched, root.path)
+		}
+		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
 	return nil
 }
 
-func (i *Index) watchRoots() []string {
-	roots := make([]string, 0, 3)
+func (i *Index) watchRoots() []watchRoot {
+	roots := make([]watchRoot, 0, 4)
 	if i.cfg.ClaudeHome != "" {
-		roots = append(roots, i.cfg.ClaudeHome)
+		roots = append(roots, watchRoot{path: i.cfg.ClaudeHome, recursive: true})
 	}
 	if i.cfg.CodexHome != "" {
 		roots = append(roots,
-			i.cfg.CodexHome,
-			filepath.Join(i.cfg.CodexHome, "sessions"),
-			filepath.Join(i.cfg.CodexHome, "archived_sessions"),
+			watchRoot{path: i.cfg.CodexHome, recursive: false},
+			watchRoot{path: filepath.Join(i.cfg.CodexHome, "sessions"), recursive: true},
+			watchRoot{path: filepath.Join(i.cfg.CodexHome, "archived_sessions"), recursive: true},
 		)
 	}
 	return roots
 }
 
-func (i *Index) addWatchDirRecursive(w *fsnotify.Watcher, root string) error {
+func (i *Index) addWatchDirRecursive(w *fsnotify.Watcher, watched map[string]struct{}, root string) error {
 	info, err := os.Stat(root)
 	if err != nil {
 		return err
@@ -1068,15 +1083,75 @@ func (i *Index) addWatchDirRecursive(w *fsnotify.Watcher, root string) error {
 		if !d.IsDir() {
 			return nil
 		}
-		if addErr := w.Add(path); addErr != nil {
-			// Duplicates or transient races should not break the indexer.
-			if strings.Contains(addErr.Error(), "already exists") {
-				return nil
-			}
-			return addErr
+		if !i.shouldWatchRecursiveDir(path) {
+			return filepath.SkipDir
 		}
-		return nil
+		return addWatchDir(w, watched, path)
 	})
+}
+
+func (i *Index) shouldWatchRecursiveDir(path string) bool {
+	if i.cfg.ClaudeHome != "" && pathWithin(i.cfg.ClaudeHome, path) {
+		return true
+	}
+	if i.cfg.CodexHome == "" {
+		return false
+	}
+	return pathWithin(filepath.Join(i.cfg.CodexHome, "sessions"), path) ||
+		pathWithin(filepath.Join(i.cfg.CodexHome, "archived_sessions"), path)
+}
+
+func addWatchDir(w *fsnotify.Watcher, watched map[string]struct{}, path string) error {
+	path = cleanWatchPath(path)
+	if path == "" {
+		return nil
+	}
+	if _, ok := watched[path]; ok {
+		return nil
+	}
+	if err := w.Add(path); err != nil {
+		// Duplicates or transient races should not break the indexer.
+		if !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+	watched[path] = struct{}{}
+	return nil
+}
+
+func removeWatchedDir(watched map[string]struct{}, path string) {
+	path = cleanWatchPath(path)
+	if path == "" {
+		return
+	}
+	for watchedPath := range watched {
+		if watchedPath == path || pathWithin(path, watchedPath) {
+			delete(watched, watchedPath)
+		}
+	}
+}
+
+func pathWithin(root, path string) bool {
+	root = cleanWatchPath(root)
+	path = cleanWatchPath(path)
+	if root == "" || path == "" {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
+}
+
+func cleanWatchPath(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(path)
 }
 
 func shouldRefreshForPath(path string) bool {

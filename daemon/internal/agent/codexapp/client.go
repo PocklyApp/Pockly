@@ -9,6 +9,7 @@ package codexapp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,8 @@ import (
 )
 
 type ExecFunc func(ctx context.Context, name string, args ...string) *exec.Cmd
+
+const maxJSONRPCLineBytes = 128 * 1024 * 1024
 
 type Config struct {
 	BinaryPath string
@@ -347,19 +350,51 @@ func (c *Client) write(msg map[string]any) error {
 }
 
 func (c *Client) readLoop(r io.Reader) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+	reader := bufio.NewReaderSize(r, 256*1024)
+	for {
+		line, err := readLineLimited(reader, maxJSONRPCLineBytes)
+		if len(line) > 0 {
+			line = bytes.TrimSpace(line)
+		}
+		if len(line) > 0 {
+			c.handleLine(line)
+		}
+		if err == nil {
 			continue
 		}
-		c.handleLine(line)
-	}
-	if err := scanner.Err(); err != nil {
-		c.logf("codex app-server stdout scan error: %v", err)
+		if !isExpectedPipeClose(err) {
+			c.logf("codex app-server stdout read error: %v", err)
+		}
+		break
 	}
 	c.closePending("codex app-server stdout closed")
+}
+
+func readLineLimited(reader *bufio.Reader, maxBytes int) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(part) > 0 {
+			line = append(line, part...)
+			if len(line) > maxBytes {
+				return line, fmt.Errorf("line exceeds %d bytes", maxBytes)
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil || len(part) == 0 || part[len(part)-1] == '\n' {
+			return line, err
+		}
+	}
+}
+
+func isExpectedPipeClose(err error) bool {
+	return err == nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, os.ErrClosed) ||
+		strings.Contains(err.Error(), "file already closed") ||
+		strings.Contains(err.Error(), "use of closed file")
 }
 
 func (c *Client) handleLine(line []byte) {

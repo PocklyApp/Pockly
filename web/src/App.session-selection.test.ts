@@ -704,8 +704,8 @@ test("cached session reopen fetches hot tail only when incremental reads may mis
   }), true);
 });
 
-test("successful inject stream does not start a duplicate turn-refresh poll", () => {
-  assert.equal(shouldScheduleInjectRefreshAfterStream("completed"), false);
+test("inject completion ACK keeps polling until a visible reply lands", () => {
+  assert.equal(shouldScheduleInjectRefreshAfterStream("reply_visible"), false);
   assert.equal(shouldScheduleInjectRefreshAfterStream("failed"), false);
   assert.equal(shouldScheduleInjectRefreshAfterStream("cancelled"), false);
   assert.equal(shouldScheduleInjectRefreshAfterStream("idle"), true);

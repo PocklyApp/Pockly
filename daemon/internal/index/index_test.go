@@ -338,6 +338,66 @@ func TestStart_WatcherPicksUpNewSessionWithoutPolling(t *testing.T) {
 	t.Fatalf("session %s never appeared via watcher", sessionID)
 }
 
+func TestWatchRootsDoNotRecursivelyWatchEntireCodexHome(t *testing.T) {
+	codexHome := filepath.Join(t.TempDir(), ".codex")
+	idx := New(Config{CodexHome: codexHome})
+
+	roots := idx.watchRoots()
+	if len(roots) != 3 {
+		t.Fatalf("watch roots = %+v, want codex home plus two session roots", roots)
+	}
+	for _, root := range roots {
+		switch root.path {
+		case codexHome:
+			if root.recursive {
+				t.Fatalf("codex home root must be non-recursive: %+v", root)
+			}
+		case filepath.Join(codexHome, "sessions"), filepath.Join(codexHome, "archived_sessions"):
+			if !root.recursive {
+				t.Fatalf("session roots must be recursive: %+v", root)
+			}
+		default:
+			t.Fatalf("unexpected watch root: %+v", root)
+		}
+	}
+
+	if idx.shouldWatchRecursiveDir(filepath.Join(codexHome, "sessions", "2026", "06")) != true {
+		t.Fatal("codex sessions subtree should be recursively watched")
+	}
+	if idx.shouldWatchRecursiveDir(filepath.Join(codexHome, "archived_sessions")) != true {
+		t.Fatal("codex archived_sessions subtree should be recursively watched")
+	}
+	if idx.shouldWatchRecursiveDir(filepath.Join(codexHome, "skills", "pockly")) {
+		t.Fatal("codex skills subtree must not be recursively watched")
+	}
+	if idx.shouldWatchRecursiveDir(filepath.Join(codexHome, "plugins", "cache")) {
+		t.Fatal("codex plugins subtree must not be recursively watched")
+	}
+}
+
+func TestRemoveWatchedDirDropsNestedEntries(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "root")
+	child := filepath.Join(root, "child")
+	other := filepath.Join(t.TempDir(), "other")
+	watched := map[string]struct{}{
+		cleanWatchPath(root):  {},
+		cleanWatchPath(child): {},
+		cleanWatchPath(other): {},
+	}
+
+	removeWatchedDir(watched, root)
+
+	if _, ok := watched[cleanWatchPath(root)]; ok {
+		t.Fatal("root watcher was not removed")
+	}
+	if _, ok := watched[cleanWatchPath(child)]; ok {
+		t.Fatal("nested watcher was not removed")
+	}
+	if _, ok := watched[cleanWatchPath(other)]; !ok {
+		t.Fatal("unrelated watcher was removed")
+	}
+}
+
 func TestRefreshEmitsChangesOnlyWhenSnapshotChanges(t *testing.T) {
 	claudeHome := filepath.Join(t.TempDir(), ".claude", "projects")
 	projectDir := filepath.Join(claudeHome, "-tmp-claude-project")

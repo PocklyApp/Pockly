@@ -200,7 +200,7 @@ type AgentKind = "claude-code" | "codex";
 type PushStatus = "checking" | "unsupported" | "blocked" | "not_enabled" | "enabled";
 type VoiceStatus = "idle" | "recording" | "transcribing";
 type MicStatusKind = "idle" | "checking" | "ready" | "blocked";
-type InjectPhase = "idle" | "started" | "streaming" | "completed" | "failed" | "cancelled";
+type InjectPhase = "idle" | "started" | "streaming" | "reply_visible" | "failed" | "cancelled";
 
 const BOOTSTRAP_LOADING_STATUS = "__pockly_workspace_bootstrap_loading__";
 
@@ -4045,7 +4045,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
 	              promotedSessionId = event.session_id;
 	              reachedDurableAgentEvent = true;
 	            }
-	            if (event.type === "stream_event" || event.type === "inject_completed") {
+            if (event.type === "stream_event") {
 	              reachedDurableAgentEvent = true;
 	            }
 	            handleInjectEvent(event, "draft-session");
@@ -4113,7 +4113,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           realtime: files.length === 0 && shouldUseBrowserRealtimeControl(runtimeCapabilities) ? subscriptionRef.current : null,
 		          signal: ctrl.signal,
 	          onEvent: (event) => {
-	            if (event.type === "stream_event" || event.type === "inject_completed") {
+	            if (event.type === "stream_event") {
 	              reachedDurableAgentEvent = true;
 	            }
 	            handleInjectEvent(event, "session");
@@ -4131,9 +4131,8 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           restoreFailedSend();
           setActiveInjectID("");
         } else if (!shouldScheduleInjectRefreshAfterStream(injectPhaseRef.current.phase)) {
-          // inject_completed already triggered the authoritative turn backfill.
-          // Starting scheduleInjectRefresh here would double-poll the same
-          // session for normal successful turns.
+          // A visible assistant/tool event already settled the in-flight UI and
+          // triggered its own authoritative backfill; don't double-poll.
           setActiveInjectID("");
         } else {
           setInjectStatus(tx("errors.backgroundCompletedSyncing"));
@@ -4387,7 +4386,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         break;
       case "stream_event": {
         injectPhaseRef.current = { requestId: event.request_id, phase: "streaming" };
-        let visibleAssistantReply = false;
+        let visibleAgentProgress = false;
         if (event.turn) {
           const turn = event.turn;
           let hydratedTurn: SessionTurn | null = null;
@@ -4409,11 +4408,13 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
           }
           if (hydratedTurn) {
             setTurns((current) => appendStreamingTurn(current, hydratedTurn));
-            visibleAssistantReply = hydratedTurn.kind === "assistant_text" && Boolean(hydratedTurn.payload?.text?.trim());
+            visibleAgentProgress = isVisibleAgentProgressTurn(hydratedTurn);
           }
         }
-        if (visibleAssistantReply) {
+        if (visibleAgentProgress) {
+          injectPhaseRef.current = { requestId: event.request_id, phase: "reply_visible" };
           finishLiveAgentRun("Live reply ready.");
+          if (selectedRef.current) void backfillTurnsAfterInject(selectedRef.current);
           break;
         }
         setInjectStatus(tx("errors.backgroundReplying"));
@@ -4423,7 +4424,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         if (
           injectPhaseRef.current.requestId === event.request_id &&
           (injectPhaseRef.current.phase === "streaming" ||
-            injectPhaseRef.current.phase === "completed" ||
+            injectPhaseRef.current.phase === "reply_visible" ||
             injectPhaseRef.current.phase === "failed" ||
             injectPhaseRef.current.phase === "cancelled")
         ) {
@@ -4432,16 +4433,14 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         setInjectStatus(event.message ?? tx("errors.waitingLocalApproval"));
         break;
       case "inject_completed":
-        injectPhaseRef.current = { requestId: event.request_id, phase: "completed" };
         if (target === "draft-session") {
           setInjectStatus(tx("errors.backgroundCompletedSyncing"));
           break;
         }
-        finishLiveAgentRun("Live reply ready.");
-        // Self-heal: pull the authoritative turns from the server so a reply
-        // the live stream dropped (e.g. codex's final answer over a flaky link)
-        // appears without a manual page reload.
-        if (selectedRef.current) void backfillTurnsAfterInject(selectedRef.current);
+        // Daemon-side inject_completed is only an acceptance ACK. The agent may
+        // still be thinking, or it may fail later; keep the request in-flight so
+        // the post-stream refresh loop proves a visible turn landed.
+        setInjectStatus(tx("errors.backgroundCompletedSyncing"));
         break;
       case "inject_cancelled":
         injectPhaseRef.current = { requestId: event.request_id, phase: "cancelled" };
@@ -13670,6 +13669,10 @@ export function shouldFetchHotTailAfterIncremental({
 
 export function isAgentResponseTurnAfter(turn: SessionTurn, baselineSeq: number) {
   if (turn.seq <= baselineSeq || turn.seq >= 900_000_000) return false;
+  return isVisibleAgentProgressTurn(turn);
+}
+
+export function isVisibleAgentProgressTurn(turn: SessionTurn) {
   if (turn.kind === "user_message" || turn.kind === "thinking") return false;
   if (turn.kind === "assistant_text") return Boolean(turn.payload?.text?.trim());
   return true;
@@ -13749,7 +13752,7 @@ export function shouldRestoreFailedSendOnControlError(phase: InjectPhase, reache
 }
 
 export function shouldScheduleInjectRefreshAfterStream(phase: InjectPhase) {
-  return phase !== "completed" && phase !== "failed" && phase !== "cancelled";
+  return phase !== "reply_visible" && phase !== "failed" && phase !== "cancelled";
 }
 
 function hasSession(sessions: SessionListItem[], selection: ReaderSelection) {

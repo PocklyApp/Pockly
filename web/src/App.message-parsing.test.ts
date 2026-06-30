@@ -28,6 +28,7 @@ import {
   visibleConversationTurns,
   canControlSession,
   isAgentResponseTurnAfter,
+  isVisibleAgentProgressTurn,
   isRenderableConversationTurn,
   reconcileHydratedTurns,
   appendStreamingTurn,
@@ -90,7 +91,17 @@ test("send failure restoration treats inject_started as not durable", () => {
   assert.equal(shouldRestoreFailedSendOnControlError("cancelled", true), true);
   assert.equal(shouldRestoreFailedSendOnControlError("started", true), false);
   assert.equal(shouldRestoreFailedSendOnControlError("streaming", true), false);
-  assert.equal(shouldRestoreFailedSendOnControlError("completed", true), false);
+  assert.equal(shouldRestoreFailedSendOnControlError("reply_visible", true), false);
+});
+
+test("visible agent progress includes tools and permissions, but not thinking", () => {
+  assert.equal(isVisibleAgentProgressTurn(turn(1, "user_message", { text: "prompt" })), false);
+  assert.equal(isVisibleAgentProgressTurn(turn(2, "thinking", { text: "working" })), false);
+  assert.equal(isVisibleAgentProgressTurn(turn(3, "assistant_text", { text: "" })), false);
+  assert.equal(isVisibleAgentProgressTurn(turn(4, "assistant_text", { text: "done" })), true);
+  assert.equal(isVisibleAgentProgressTurn(turn(5, "tool_call", { tool: "Bash" })), true);
+  assert.equal(isVisibleAgentProgressTurn(turn(6, "tool_result", { result: "ok" })), true);
+  assert.equal(isVisibleAgentProgressTurn(turn(7, "attachment", { attachment_type: "permission_request" })), true);
 });
 
 test("deriveSessionTitle does not leak the local-command-caveat envelope", () => {

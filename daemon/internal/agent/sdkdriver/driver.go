@@ -20,6 +20,7 @@ package sdkdriver
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -45,6 +46,8 @@ type Agent string
 const (
 	AgentClaude Agent = "claude-code"
 	AgentCodex  Agent = "codex"
+
+	maxStreamJSONLineBytes = 128 * 1024 * 1024
 )
 
 // ExecFunc is the seam exec.CommandContext satisfies. Tests substitute a
@@ -565,24 +568,28 @@ func (d *Driver) pumpStdout() {
 	if stdout == nil {
 		return
 	}
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	reader := bufio.NewReaderSize(stdout, 256*1024)
 	lines := 0
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
+	for {
+		line, err := readLineLimited(reader, maxStreamJSONLineBytes)
+		if len(line) > 0 {
+			line = bytes.TrimSpace(line)
+		}
+		if len(line) > 0 {
+			lines++
+			copied := make([]byte, len(line))
+			copy(copied, line)
+			d.handleStreamLine(copied)
+		}
+		if err == nil {
 			continue
 		}
-		lines++
-		copied := make([]byte, len(line))
-		copy(copied, line)
-		d.handleStreamLine(copied)
+		if !errors.Is(err, io.EOF) {
+			d.cfg.Logger("sdkdriver: pumpStdout read error sid=%s lines=%d: %v", d.cfg.SessionID, lines, err)
+		}
+		break
 	}
-	if err := scanner.Err(); err != nil {
-		d.cfg.Logger("sdkdriver: pumpStdout scan error sid=%s lines=%d: %v", d.cfg.SessionID, lines, err)
-	} else {
-		d.cfg.Logger("sdkdriver: pumpStdout EOF sid=%s lines=%d", d.cfg.SessionID, lines)
-	}
+	d.cfg.Logger("sdkdriver: pumpStdout EOF sid=%s lines=%d", d.cfg.SessionID, lines)
 }
 
 // handleStreamLine parses one stream-json record. Stream-json records
@@ -628,14 +635,42 @@ func (d *Driver) drainStderr() {
 	if stderr == nil {
 		return
 	}
-	scanner := bufio.NewScanner(stderr)
-	scanner.Buffer(make([]byte, 0, 4*1024), 1*1024*1024)
+	reader := bufio.NewReaderSize(stderr, 16*1024)
 	lines := 0
-	for scanner.Scan() {
-		lines++
-		d.cfg.Logger("sdkdriver[%s]: stderr: %s", d.cfg.SessionID, scanner.Text())
+	for {
+		line, err := readLineLimited(reader, maxStreamJSONLineBytes)
+		if len(line) > 0 {
+			lines++
+			d.cfg.Logger("sdkdriver[%s]: stderr: %s", d.cfg.SessionID, string(bytes.TrimSpace(line)))
+		}
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, io.EOF) {
+			d.cfg.Logger("sdkdriver: drainStderr read error sid=%s lines=%d: %v", d.cfg.SessionID, lines, err)
+		}
+		break
 	}
 	d.cfg.Logger("sdkdriver: drainStderr EOF sid=%s lines=%d", d.cfg.SessionID, lines)
+}
+
+func readLineLimited(reader *bufio.Reader, maxBytes int) ([]byte, error) {
+	var line []byte
+	for {
+		part, err := reader.ReadSlice('\n')
+		if len(part) > 0 {
+			line = append(line, part...)
+			if len(line) > maxBytes {
+				return line, fmt.Errorf("line exceeds %d bytes", maxBytes)
+			}
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if err != nil || len(part) == 0 || part[len(part)-1] == '\n' {
+			return line, err
+		}
+	}
 }
 
 // wait blocks until the subprocess exits, then signals Manager via
