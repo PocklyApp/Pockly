@@ -3560,6 +3560,21 @@ func (r sdkSessionResolver) PathForSession(sid string) string {
 	return ref.Path
 }
 
+func (r sdkSessionResolver) SessionInfoForSDK(sid string) (sdkdriver.SessionInfo, bool) {
+	if r.index == nil {
+		return sdkdriver.SessionInfo{}, false
+	}
+	ref, ok := r.index.FindSession(sid)
+	if !ok {
+		return sdkdriver.SessionInfo{}, false
+	}
+	return sdkdriver.SessionInfo{
+		Agent: ref.Agent,
+		Cwd:   ref.Cwd,
+		Path:  ref.Path,
+	}, true
+}
+
 // sdkTerminalEventForwarder pipes SDK driver terminal events into the
 // daemon's existing externalTerminalEvents channel (the same one the
 // PTY wrapper feeds via the HTTP TerminalEventSink). Nexus

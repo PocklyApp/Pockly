@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1405,6 +1406,8 @@ type stubSessionResolver struct {
 	calls []string
 	cwd   string
 	path  string
+	info  SessionInfo
+	ok    bool
 }
 
 func (s *stubSessionResolver) CwdForSession(sid string) string {
@@ -1414,6 +1417,17 @@ func (s *stubSessionResolver) CwdForSession(sid string) string {
 
 func (s *stubSessionResolver) PathForSession(sid string) string {
 	return s.path
+}
+
+func (s *stubSessionResolver) SessionInfoForSDK(sid string) (SessionInfo, bool) {
+	s.calls = append(s.calls, sid)
+	if s.ok {
+		return s.info, true
+	}
+	if s.cwd == "" && s.path == "" {
+		return SessionInfo{}, false
+	}
+	return SessionInfo{Cwd: s.cwd, Path: s.path}, true
 }
 
 // TestManagerFallsBackToSessionResolverWhenCwdEmpty covers the
@@ -1468,6 +1482,138 @@ func TestManagerRejectsWhenCwdCannotBeResolved(t *testing.T) {
 	}
 	if got := len(rec.Snapshot()); got != 0 {
 		t.Fatalf("driver should not spawn without cwd, got %d calls", got)
+	}
+}
+
+func TestManagerRejectsCodexResumeWhenSessionNotLive(t *testing.T) {
+	rec := &recordingExec{}
+	termMgr := terminal.NewManager()
+	fake := &fakeCodexAppRuntime{threadID: "codex-thread"}
+	m := NewManager(ManagerConfig{
+		Terminal:        termMgr,
+		Exec:            rec.Capture,
+		BinaryResolve:   fakeResolve,
+		CodexAppFactory: fake.factory,
+		Sessions:        &stubSessionResolver{},
+	})
+
+	_, err := m.EnsureDriver(context.Background(), "archived-codex", t.TempDir(), AgentCodex)
+	if !errors.Is(err, ErrSessionNotLive) {
+		t.Fatalf("expected ErrSessionNotLive, got %v", err)
+	}
+	if fake.cfg.BinaryPath != "" {
+		t.Fatal("codex app-server must not start for an archived/missing session")
+	}
+	if got := len(rec.Snapshot()); got != 0 {
+		t.Fatalf("driver should not spawn for archived codex session, got %d calls", got)
+	}
+}
+
+func TestManagerStopsStaleCodexExternalWhenSessionArchived(t *testing.T) {
+	rec := &recordingExec{}
+	termMgr := terminal.NewManager()
+	fake := &fakeCodexAppRuntime{threadID: "codex-thread"}
+	m := NewManager(ManagerConfig{
+		Terminal:        termMgr,
+		Exec:            rec.Capture,
+		BinaryResolve:   fakeResolve,
+		CodexAppFactory: fake.factory,
+		Sessions: &stubSessionResolver{
+			ok: true,
+			info: SessionInfo{
+				Agent: string(AgentCodex),
+				Cwd:   t.TempDir(),
+				Path:  "/tmp/live-rollout.jsonl",
+			},
+		},
+	})
+
+	ext, err := m.EnsureDriver(context.Background(), "codex-stale", "", AgentCodex)
+	if err != nil {
+		t.Fatalf("EnsureDriver live: %v", err)
+	}
+	if status, _ := ext.Status(); status == terminal.SessionExited {
+		t.Fatal("expected live external before archive")
+	}
+	m.sessions = &stubSessionResolver{}
+
+	_, err = m.EnsureDriver(context.Background(), "codex-stale", "", AgentCodex)
+	if !errors.Is(err, ErrSessionNotLive) {
+		t.Fatalf("expected ErrSessionNotLive after archive, got %v", err)
+	}
+	if lookup := termMgr.LookupExternalForInject("codex-stale"); lookup.Ext != nil {
+		t.Fatalf("stale codex external still resolves after archive: %+v", lookup)
+	}
+}
+
+func TestManagerCodexResumeRequiresCodexIndexRow(t *testing.T) {
+	rec := &recordingExec{}
+	termMgr := terminal.NewManager()
+	fake := &fakeCodexAppRuntime{threadID: "codex-thread"}
+	m := NewManager(ManagerConfig{
+		Terminal:        termMgr,
+		Exec:            rec.Capture,
+		BinaryResolve:   fakeResolve,
+		CodexAppFactory: fake.factory,
+		Sessions: &stubSessionResolver{
+			ok: true,
+			info: SessionInfo{
+				Agent: string(AgentClaude),
+				Cwd:   t.TempDir(),
+				Path:  "/tmp/claude.jsonl",
+			},
+		},
+	})
+
+	_, err := m.EnsureDriver(context.Background(), "wrong-agent", "", AgentCodex)
+	if !errors.Is(err, ErrSessionNotLive) {
+		t.Fatalf("expected ErrSessionNotLive for non-codex row, got %v", err)
+	}
+	if fake.cfg.BinaryPath != "" {
+		t.Fatal("codex app-server must not start for a non-codex session row")
+	}
+}
+
+func TestManagerCodexResumeUsesLiveIndexPath(t *testing.T) {
+	rec := &recordingExec{}
+	termMgr := terminal.NewManager()
+	fake := &fakeCodexAppRuntime{threadID: "codex-thread-live"}
+	cwd := t.TempDir()
+	rolloutPath := filepath.Join(cwd, "rollout-live.jsonl")
+	m := NewManager(ManagerConfig{
+		Terminal:        termMgr,
+		Exec:            rec.Capture,
+		BinaryResolve:   fakeResolve,
+		CodexAppFactory: fake.factory,
+		Sessions: &stubSessionResolver{
+			ok: true,
+			info: SessionInfo{
+				Agent: string(AgentCodex),
+				Cwd:   cwd,
+				Path:  rolloutPath,
+			},
+		},
+	})
+
+	ext, err := m.EnsureDriver(context.Background(), "codex-live", "", AgentCodex)
+	if err != nil {
+		t.Fatalf("EnsureDriver: %v", err)
+	}
+	if err := ext.SendRaw("resume hello\r"); err != nil {
+		t.Fatalf("SendRaw: %v", err)
+	}
+	if !pollUntil(50*time.Millisecond, 1500*time.Millisecond, func() bool {
+		_, resumes, turns := fake.snapshot()
+		return len(resumes) == 1 && len(turns) == 1
+	}) {
+		t.Fatalf("timed out waiting for resume turn; starts/resumes/turns=%#v", fake)
+	}
+	_, resumes, turns := fake.snapshot()
+	if got := resumes[0].Path; got != rolloutPath {
+		t.Fatalf("resume path = %q, want %q", got, rolloutPath)
+	}
+	if got := turns[0].ThreadID; got != "codex-live" {
+		t.Fatalf("turn thread id = %q, want requested session id", got)
 	}
 }
 

@@ -549,6 +549,7 @@ type StartTaskAgentOptions struct {
 type runner struct {
 	mu                  sync.Mutex
 	active              map[string]context.CancelFunc
+	activeInjects       map[string]activeInject
 	terminal            *liveterminal.Manager
 	terminalEvents      chan TerminalEvent
 	sdkDriver           SDKDriverEnsurer
@@ -564,11 +565,19 @@ type runner struct {
 	agentSettings AgentSettingsHandler
 }
 
+type activeInject struct {
+	RequestID         string
+	SessionID         string
+	TerminalSessionID string
+	ExpiresAt         time.Time
+}
+
 const (
 	terminalBatchFlushInterval = 200 * time.Millisecond
 	terminalBatchMaxBytes      = 16 * 1024
 	terminalBatchRingMaxBytes  = 1024 * 1024
 	terminalBatchRingMaxAge    = 5 * time.Minute
+	activeInjectMirrorTTL      = 10 * time.Minute
 )
 
 type codexProcessTerminal struct {
@@ -584,6 +593,7 @@ func Run(ctx context.Context, cfg Client) error {
 	}
 	r := &runner{
 		active:              map[string]context.CancelFunc{},
+		activeInjects:       map[string]activeInject{},
 		terminal:            terminalManager,
 		terminalEvents:      make(chan TerminalEvent, 1024),
 		sdkDriver:           cfg.SDKDriver,
@@ -801,6 +811,9 @@ func runOnce(ctx context.Context, cfg Client, r *runner) error {
 		_ = writeEnvelope(envelope{Type: "SYNC_SESSION_EVENT", SyncEvent: &evt})
 	}
 	rawSendTerminal := func(evt TerminalEvent) {
+		if mirrored, ok := r.mirrorTerminalEventToInject(evt); ok {
+			send(mirrored)
+		}
 		// Surface write failures as local logs plus optional diagnostics so
 		// operators can distinguish stream gaps from agent output gaps.
 		if err := writeEnvelope(envelope{Type: "TERMINAL_EVENT", TerminalEvent: &evt}); err != nil {
@@ -1140,6 +1153,7 @@ func (r *runner) handle(parent context.Context, cfg Client, req InjectRequest, s
 	}
 	ctx, cancel := context.WithCancel(parent)
 	r.active[req.RequestID] = cancel
+	r.activeInjects[req.RequestID] = activeInject{RequestID: req.RequestID, SessionID: req.SessionID, ExpiresAt: time.Now().Add(activeInjectMirrorTTL)}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -1151,6 +1165,7 @@ func (r *runner) handle(parent context.Context, cfg Client, req InjectRequest, s
 	send(InjectEvent{RequestID: req.RequestID, Type: "inject_started", SessionID: req.SessionID})
 
 	if err := r.routeInject(ctx, req, send); err != nil {
+		r.clearActiveInject(req.RequestID)
 		send(InjectEvent{RequestID: req.RequestID, Type: "inject_failed", Error: err.Error()})
 		telemetry.Send(context.Background(), cfg.RelayURL, cfg.Identity, telemetry.Event{Name: "inject_failed", Command: "serve", Status: "error", ErrorCode: err.Error()})
 		return
@@ -1235,6 +1250,7 @@ func (r *runner) routeResume(ctx context.Context, req InjectRequest) error {
 			if err != nil {
 				return mapSDKError(err)
 			}
+			r.bindActiveInjectTerminal(req.RequestID, req.SessionID, sdkExternalTerminalID(r.terminal, ext))
 			if err := sendToSDKExternal(ext, req.Text, req.Agent); err != nil {
 				return fmt.Errorf("sdk_send_failed: %v", err)
 			}
@@ -1253,6 +1269,7 @@ func (r *runner) routeResume(ctx context.Context, req InjectRequest) error {
 	if err != nil {
 		return mapSDKError(err)
 	}
+	r.bindActiveInjectTerminal(req.RequestID, req.SessionID, sdkExternalTerminalID(r.terminal, ext))
 	if err := sendToSDKExternal(ext, req.Text, req.Agent); err != nil {
 		return fmt.Errorf("sdk_send_failed: %v", err)
 	}
@@ -1371,6 +1388,7 @@ func (r *runner) routeStartTask(ctx context.Context, req InjectRequest, send fun
 			return mapSDKError(err)
 		}
 		log.Printf("start_task: sdk driver ready sid=%s agent=%s input_subscribers=%d", sid, req.Agent, ext.InputSubscriberCount())
+		r.bindActiveInjectTerminal(req.RequestID, sid, sdkExternalTerminalID(r.terminal, ext))
 		events, unsubscribe := ext.Subscribe(256)
 		defer unsubscribe()
 		if sendErr := sendToSDKExternal(ext, req.Text, req.Agent); sendErr != nil {
@@ -1738,6 +1756,8 @@ func mapSDKError(err error) error {
 		return fmt.Errorf("sdk_unsupported_agent")
 	case strings.Contains(msg, "codex_app_server_unavailable"):
 		return fmt.Errorf("codex_app_server_unavailable")
+	case strings.Contains(msg, "session is not live"):
+		return fmt.Errorf("session_not_attached")
 	case strings.Contains(msg, "resolve") || strings.Contains(msg, "executable file not found") || strings.Contains(msg, "not found in PATH"):
 		return fmt.Errorf("binary_missing")
 	default:
@@ -1915,6 +1935,102 @@ func (r *runner) forwardTerminalEvent(evt TerminalEvent) {
 	select {
 	case r.terminalEvents <- evt:
 	default:
+	}
+}
+
+func (r *runner) bindActiveInjectTerminal(requestID, sessionID, terminalSessionID string) {
+	if strings.TrimSpace(requestID) == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.activeInjects == nil {
+		r.activeInjects = map[string]activeInject{}
+	}
+	r.pruneExpiredActiveInjectsLocked(time.Now())
+	current := r.activeInjects[requestID]
+	current.RequestID = requestID
+	if current.ExpiresAt.IsZero() {
+		current.ExpiresAt = time.Now().Add(activeInjectMirrorTTL)
+	}
+	if strings.TrimSpace(sessionID) != "" {
+		current.SessionID = sessionID
+	}
+	if strings.TrimSpace(terminalSessionID) != "" {
+		current.TerminalSessionID = terminalSessionID
+	}
+	r.activeInjects[requestID] = current
+}
+
+func sdkExternalTerminalID(manager *liveterminal.Manager, ext *liveterminal.ExternalSession) string {
+	if manager == nil || ext == nil {
+		return ""
+	}
+	for _, summary := range manager.List() {
+		candidate, ok := manager.GetExternal(summary.ID)
+		if ok && candidate == ext {
+			return summary.ID
+		}
+	}
+	return ""
+}
+
+func (r *runner) mirrorTerminalEventToInject(evt TerminalEvent) (InjectEvent, bool) {
+	if evt.Kind != string(liveterminal.EventAgentError) && evt.Kind != string(liveterminal.EventPromptReady) {
+		return InjectEvent{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pruneExpiredActiveInjectsLocked(time.Now())
+	for _, active := range r.activeInjects {
+		if active.RequestID == "" {
+			continue
+		}
+		if active.TerminalSessionID != "" && evt.TerminalSessionID != "" && active.TerminalSessionID == evt.TerminalSessionID {
+			delete(r.activeInjects, active.RequestID)
+			return injectEventFromTerminal(active, evt), true
+		}
+		if active.SessionID != "" && evt.SessionID != "" && active.SessionID == evt.SessionID {
+			delete(r.activeInjects, active.RequestID)
+			return injectEventFromTerminal(active, evt), true
+		}
+	}
+	return InjectEvent{}, false
+}
+
+func (r *runner) clearActiveInject(requestID string) {
+	if strings.TrimSpace(requestID) == "" {
+		return
+	}
+	r.mu.Lock()
+	delete(r.activeInjects, requestID)
+	r.mu.Unlock()
+}
+
+func (r *runner) pruneExpiredActiveInjectsLocked(now time.Time) {
+	for requestID, active := range r.activeInjects {
+		if !active.ExpiresAt.IsZero() && now.After(active.ExpiresAt) {
+			delete(r.activeInjects, requestID)
+		}
+	}
+}
+
+func injectEventFromTerminal(active activeInject, evt TerminalEvent) InjectEvent {
+	sessionID := firstNonEmpty(evt.SessionID, active.SessionID)
+	if evt.Kind == string(liveterminal.EventAgentError) {
+		msg := firstNonEmpty(strings.TrimSpace(evt.Error), strings.TrimSpace(evt.Payload), "agent turn failed")
+		return InjectEvent{
+			RequestID: active.RequestID,
+			Type:      "inject_failed",
+			SessionID: sessionID,
+			Error:     msg,
+		}
+	}
+	return InjectEvent{
+		RequestID: active.RequestID,
+		Type:      "inject_ready",
+		SessionID: sessionID,
+		Message:   "agent prompt ready",
 	}
 }
 

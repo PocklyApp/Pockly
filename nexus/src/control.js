@@ -1103,7 +1103,7 @@ export class InMemoryControlHub {
       return;
     }
     const type = String(payload.type || payload.status || "");
-    if (type !== "inject_completed" && type !== "inject_failed" && type !== "agent_error") return;
+    if (type !== "inject_ready" && type !== "inject_failed" && type !== "agent_error") return;
     const sessionID = payload.session_id || payload.turn?.session_id || "";
     const deviceID = payload.device_id || payload.turn?.device_id || "";
     const failed = type === "inject_failed" || type === "agent_error";
@@ -1164,6 +1164,13 @@ function isTransientTurnEvent(payload) {
   if (type === "inject_failed" || type === "inject_cancelled" || type === "failed") return false;
   if (status === "failed" || status === "cancelled") return false;
   return true;
+}
+
+function isInjectStreamTerminalEvent(event) {
+  const type = String(event?.type || "");
+  if (type === "inject_failed" || type === "inject_cancelled" || type === "agent_error") return true;
+  if (type === "inject_ready") return true;
+  return Boolean(event?.turn && event.turn.kind === "assistant_text");
 }
 
 export function handleControlHubRequest(hub, request) {
@@ -1450,7 +1457,7 @@ export function injectStreamOptions(sessionID) {
     initialEvent: undefined,
     timeoutEvent: (requestID) => ({ request_id: requestID, type: "inject_failed", session_id: sessionID, error: "inject stream timed out" }),
     errorEvent: (requestID, error) => ({ request_id: requestID, type: "inject_failed", session_id: sessionID, error }),
-    closeWhen: (event) => ["inject_completed", "inject_failed", "inject_cancelled"].includes(event.type),
+    closeWhen: isInjectStreamTerminalEvent,
   };
 }
 

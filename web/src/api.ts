@@ -200,7 +200,7 @@ export type WSState = "connecting" | "live" | "reconnecting" | "disconnected" | 
 
 export type InjectEvent = {
   request_id: string;
-  type: "inject_started" | "stream_event" | "session_created" | "approval_required" | "inject_completed" | "inject_failed" | "inject_cancelled";
+  type: "inject_started" | "stream_event" | "session_created" | "approval_required" | "inject_completed" | "inject_ready" | "inject_failed" | "inject_cancelled";
   status?: string;
   streaming?: boolean;
   turn?: SessionTurn;
@@ -2479,13 +2479,14 @@ function isRealtimeCommandFinalEvent(event: unknown) {
   if (!isRecord(event)) return false;
   const type = String(event.type || event.stage || "");
   const status = String(event.status || "");
-  return ["inject_completed", "inject_failed", "inject_cancelled", "completed", "failed"].includes(type) ||
+  if (type === "stream_event" && isRecord(event.turn) && event.turn.kind === "assistant_text") return true;
+  return ["inject_ready", "inject_failed", "inject_cancelled", "completed", "failed"].includes(type) ||
     ["completed", "failed", "cancelled"].includes(status);
 }
 
 function isTerminalControlEvent(event: InjectEvent | SyncSessionEvent) {
   const inject = event as InjectEvent;
-  if (inject.type === "inject_completed" || inject.type === "inject_failed" || inject.type === "inject_cancelled") return true;
+  if (inject.type === "inject_ready" || inject.type === "inject_failed" || inject.type === "inject_cancelled") return true;
   const sync = event as SyncSessionEvent;
   return sync.status === "completed" || sync.status === "failed" || sync.stage === "completed" || sync.stage === "failed";
 }

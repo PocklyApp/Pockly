@@ -172,6 +172,44 @@ func TestTerminalSubscriptionGatesTextDeltasOnly(t *testing.T) {
 	}
 }
 
+func TestMirrorSDKAgentErrorToActiveInjectFailure(t *testing.T) {
+	r := &runner{activeInjects: map[string]activeInject{}}
+	r.bindActiveInjectTerminal("req_timeout", "sess_timeout", "ts_timeout")
+
+	got, ok := r.mirrorTerminalEventToInject(TerminalEvent{
+		TerminalSessionID: "ts_timeout",
+		SessionID:         "sess_timeout",
+		Kind:              string(liveterminal.EventAgentError),
+		Error:             "codex_turn_timeout",
+	})
+	if !ok {
+		t.Fatal("expected SDK agent_error to mirror into an inject event")
+	}
+	if got.RequestID != "req_timeout" || got.Type != "inject_failed" || got.SessionID != "sess_timeout" || got.Error != "codex_turn_timeout" {
+		t.Fatalf("mirrored event = %+v", got)
+	}
+	if _, ok := r.activeInjects["req_timeout"]; ok {
+		t.Fatal("active inject should be cleared after terminal mirror")
+	}
+}
+
+func TestMirrorSDKPromptReadyToActiveInjectReady(t *testing.T) {
+	r := &runner{activeInjects: map[string]activeInject{}}
+	r.bindActiveInjectTerminal("req_ready", "sess_ready", "ts_ready")
+
+	got, ok := r.mirrorTerminalEventToInject(TerminalEvent{
+		TerminalSessionID: "ts_ready",
+		SessionID:         "sess_ready",
+		Kind:              string(liveterminal.EventPromptReady),
+	})
+	if !ok {
+		t.Fatal("expected SDK prompt_ready to mirror into an inject event")
+	}
+	if got.RequestID != "req_ready" || got.Type != "inject_ready" || got.SessionID != "sess_ready" {
+		t.Fatalf("mirrored event = %+v", got)
+	}
+}
+
 func TestTerminalBatcherRetainsUnsubscribedOutputLocally(t *testing.T) {
 	var sent []TerminalEvent
 	r := &runner{}
@@ -880,6 +918,7 @@ func TestRouteInjectMapsSDKErrors(t *testing.T) {
 		{"unsupported agent", errors.New("sdkdriver: unsupported agent: hermes"), "sdk_unsupported_agent"},
 		{"binary missing", errors.New("resolve claude: claude not found in PATH or common locations"), "binary_missing"},
 		{"codex app server unavailable", errors.New("codex_app_server_unavailable: please upgrade Codex CLI to >= 0.130.0"), "codex_app_server_unavailable"},
+		{"codex archived", errors.New("sdkdriver: session is not live: archived-codex"), "session_not_attached"},
 		{"generic spawn fail", errors.New("start driver: exec context cancelled"), "sdk_spawn_failed: start driver: exec context cancelled"},
 	}
 	for _, tt := range cases {

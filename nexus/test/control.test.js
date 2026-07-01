@@ -198,6 +198,60 @@ describe("in-process Nexus control hub", () => {
     browser.cleanup();
   });
 
+  it("keeps realtime inject streams open after daemon acceptance ack", async () => {
+    const hub = new InMemoryControlHub({
+      browserCommandHandler: async ({ message }) => ({
+        mode: "stream",
+        daemonDeviceID: "dd_control",
+        daemonRequestID: message.request_id,
+        sessionID: "sess_control",
+        closeWhen: (event) => event.type === "inject_failed",
+        ack: { status: "accepted", session_id: "sess_control", device_id: "dd_control" },
+        envelope: {
+          type: "INJECT_REQUEST",
+          request: {
+            request_id: message.request_id,
+            daemon_device_id: "dd_control",
+            session_id: "sess_control",
+            text: message.payload.text,
+          },
+        },
+      }),
+    });
+    hub.attachDaemonForTest("dd_control", "usr_control", async (envelope, reply) => {
+      reply({
+        type: "INJECT_EVENT",
+        event: { request_id: envelope.request.request_id, type: "inject_completed", session_id: "sess_control" },
+      });
+      reply({
+        type: "INJECT_EVENT",
+        event: { request_id: envelope.request.request_id, type: "inject_failed", session_id: "sess_control", error: "codex_turn_timeout" },
+      });
+    });
+    const browser = hub.attachBrowserForTest({
+      userID: "usr_control",
+      browserDeviceID: "bd_control",
+      daemonDeviceID: "dd_control",
+      sessionID: "sess_control",
+    });
+    browser.messages.length = 0;
+
+    hub.handleBrowserSocketMessage(browser.socket, JSON.stringify({
+      type: "COMMAND",
+      request_id: "bcmd_ack_then_fail",
+      command: "inject_session",
+      daemon_device_id: "dd_control",
+      session_id: "sess_control",
+      payload: { text: "hello" },
+    }));
+
+    await eventually(() => {
+      assert.deepEqual(browser.messages.map((message) => message.event?.type).filter(Boolean), ["inject_completed", "inject_failed"]);
+    });
+    assert.equal(browser.messages.at(-1).event.error, "codex_turn_timeout");
+    browser.cleanup();
+  });
+
   it("returns browser realtime daemon_offline without a separate presence precheck", async () => {
     const hub = new InMemoryControlHub({
       browserCommandHandler: async (input) => ({
@@ -459,7 +513,7 @@ describe("in-process Nexus control hub", () => {
       type: "INJECT_EVENT",
       event: {
         request_id: "inj_done",
-        type: "inject_completed",
+        type: "inject_ready",
         session_id: "sess_notify",
         device_id: "dd_notify",
       },

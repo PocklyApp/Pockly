@@ -4372,7 +4372,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
   }
 
   function handleInjectEvent(event: InjectEvent, target: "session" | "draft-session") {
-    const terminalEvent = event.type === "inject_completed" || event.type === "inject_failed" || event.type === "inject_cancelled";
+    const terminalEvent = event.type === "inject_completed" || event.type === "inject_ready" || event.type === "inject_failed" || event.type === "inject_cancelled";
     if (event.request_id && !terminalEvent) {
       setActiveInjectID(event.request_id);
       if (injectPhaseRef.current.requestId !== event.request_id) {
@@ -4461,6 +4461,9 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
         // still be thinking, or it may fail later; keep the request in-flight so
         // the post-stream refresh loop proves a visible turn landed.
         setInjectStatus(tx("errors.backgroundCompletedSyncing"));
+        break;
+      case "inject_ready":
+        finishLiveAgentRun(event.message ?? "Live reply ready.");
         break;
       case "inject_cancelled":
         injectPhaseRef.current = { requestId: event.request_id, phase: "cancelled" };

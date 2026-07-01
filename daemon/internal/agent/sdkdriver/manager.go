@@ -105,6 +105,19 @@ type SessionResolver interface {
 	PathForSession(sid string) string
 }
 
+// SessionInfo is the resolver's authoritative live-session row. Codex resume
+// needs this stricter shape because app-server resume-by-path can otherwise
+// keep appending to a rollout Codex has already archived/hidden.
+type SessionInfo struct {
+	Agent string
+	Cwd   string
+	Path  string
+}
+
+type SessionInfoResolver interface {
+	SessionInfoForSDK(sid string) (SessionInfo, bool)
+}
+
 type Manager struct {
 	terminal              *terminal.Manager
 	exec                  ExecFunc
@@ -197,6 +210,7 @@ type ManagerConfig struct {
 var (
 	ErrUnsupportedAgent = errors.New("sdkdriver: unsupported agent")
 	ErrMissingCwd       = errors.New("sdkdriver: session cwd unavailable")
+	ErrSessionNotLive   = errors.New("sdkdriver: session is not live")
 )
 
 // ErrBusy is preserved as an exported sentinel so external matchers
@@ -438,6 +452,26 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	}
 
 	m.mu.Lock()
+	var sessionInfo SessionInfo
+	if !newSession && agent == AgentCodex {
+		var hasSessionInfo bool
+		if m.sessions != nil {
+			sessionInfo, hasSessionInfo = m.sessionInfoForSDK(sid)
+		}
+		if !hasSessionInfo || sessionInfo.Agent != string(AgentCodex) || strings.TrimSpace(sessionInfo.Path) == "" {
+			if e, ok := m.drivers[sid]; ok {
+				delete(m.drivers, sid)
+				if e.driver != nil {
+					_ = e.driver.Stop()
+				}
+				if e.terminalSessionID != "" {
+					_ = m.terminal.Stop(e.terminalSessionID)
+				}
+			}
+			m.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrSessionNotLive, sid)
+		}
+	}
 	// Existing entry path: same sid already has an ExternalSession.
 	// Reuse it across turns so web SSE bridges (which key on
 	// terminal_session_id and require session_status="live") stay
@@ -480,7 +514,10 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	// for sid. control.routeStartTask validates + absolutizes the cwd
 	// before calling us; we trust it here.
 	if !newSession {
-		if resolved := m.resolveCwd(cwd, sid); resolved != "" {
+		if agent == AgentCodex && strings.TrimSpace(sessionInfo.Cwd) != "" {
+			resolved := strings.TrimSpace(sessionInfo.Cwd)
+			cwd = resolved
+		} else if resolved := m.resolveCwd(cwd, sid); resolved != "" {
 			cwd = resolved
 		}
 	}
@@ -554,7 +591,9 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 	// can resume by path (loading the thread from disk) instead of by threadId
 	// alone, which a freshly-spawned app-server rejects with "thread not found".
 	resumePath := ""
-	if !newSession && m.sessions != nil {
+	if !newSession && sessionInfo.Path != "" {
+		resumePath = sessionInfo.Path
+	} else if !newSession && m.sessions != nil {
 		resumePath = m.sessions.PathForSession(sid)
 	}
 	driver := New(Config{
@@ -702,6 +741,21 @@ func (m *Manager) resolveCwd(hint, sid string) string {
 		}
 	}
 	return ""
+}
+
+func (m *Manager) sessionInfoForSDK(sid string) (SessionInfo, bool) {
+	if m.sessions == nil {
+		return SessionInfo{}, false
+	}
+	if resolver, ok := m.sessions.(SessionInfoResolver); ok {
+		return resolver.SessionInfoForSDK(sid)
+	}
+	cwd := m.sessions.CwdForSession(sid)
+	path := m.sessions.PathForSession(sid)
+	if strings.TrimSpace(cwd) == "" && strings.TrimSpace(path) == "" {
+		return SessionInfo{}, false
+	}
+	return SessionInfo{Cwd: cwd, Path: path}, true
 }
 
 // Stop terminates the driver bound to sid (if any). The driver's

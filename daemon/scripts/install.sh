@@ -183,6 +183,38 @@ if [ -n "${wrapper_binary}" ]; then
   echo "pockly install: installed ${wrapper_target} (inactive until enable-remote-control)"
 fi
 
+repair_path_shadow() {
+  target="$1"
+  target_real="$(cd "$(dirname "${target}")" && pwd -P)/$(basename "${target}")"
+  IFS_SAVE="${IFS}"
+  IFS=:
+  for dir in ${PATH}; do
+    [ -n "${dir}" ] || dir="."
+    candidate="${dir}/${BIN}"
+    if [ ! -e "${candidate}" ] && [ ! -L "${candidate}" ]; then
+      continue
+    fi
+    if [ "${candidate}" -ef "${target}" ]; then
+      break
+    fi
+    candidate_real="$(cd "$(dirname "${candidate}")" 2>/dev/null && pwd -P)/$(basename "${candidate}")" || continue
+    if [ "${candidate_real}" = "${target_real}" ]; then
+      break
+    fi
+    if [ -w "$(dirname "${candidate}")" ]; then
+      backup="${candidate}.old.$(date +%Y%m%d%H%M%S)"
+      mv "${candidate}" "${backup}"
+      ln -s "${target}" "${candidate}"
+      echo "pockly install: redirected earlier PATH entry ${candidate} -> ${target} (backup: ${backup})"
+    else
+      echo "pockly install: warning: ${candidate} appears before ${target} on PATH and is not writable" >&2
+    fi
+  done
+  IFS="${IFS_SAVE}"
+}
+
+repair_path_shadow "${target}"
+
 case ":${PATH}:" in
   *":${INSTALL_DIR}:"*) ;;
   *) echo "pockly install: add ${INSTALL_DIR} to PATH if ${BIN} is not found" ;;

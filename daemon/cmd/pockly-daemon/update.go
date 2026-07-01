@@ -140,6 +140,9 @@ func runUpdate(args []string) error {
 	if err := installFromExtract(extractDir, installDir); err != nil {
 		return fmt.Errorf("install: %w", err)
 	}
+	if err := repairPathShadowing(filepath.Join(installDir, "pockly-daemon")); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+	}
 	fmt.Printf("installed pockly-daemon %s into %s\n", platformAsset.Version, installDir)
 
 	if *noRestart {
@@ -255,6 +258,9 @@ func PerformUpdate(opts PerformUpdateOptions) (PerformUpdateResult, error) {
 	}
 	if err := installFromExtract(extractDir, installDir); err != nil {
 		return res, fmt.Errorf("install: %w", err)
+	}
+	if err := repairPathShadowing(filepath.Join(installDir, "pockly-daemon")); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 	}
 	res.InstalledPath = installDir
 
@@ -572,6 +578,77 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		return err
 	}
 	return out.Close()
+}
+
+func repairPathShadowing(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return nil
+	}
+	targetReal, err := normalizeExecutablePath(target)
+	if err != nil {
+		return nil
+	}
+	var warnings []string
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if strings.TrimSpace(dir) == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, "pockly-daemon")
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			continue
+		}
+		candidateReal, err := normalizeExecutablePath(candidate)
+		if err == nil && candidateReal == targetReal {
+			break
+		}
+		if !pathIsWritable(filepath.Dir(candidate)) {
+			warnings = append(warnings, fmt.Sprintf("%s appears before %s on PATH and is not writable", candidate, target))
+			continue
+		}
+		backup := fmt.Sprintf("%s.old.%s", candidate, time.Now().UTC().Format("20060102150405"))
+		if err := os.Rename(candidate, backup); err != nil {
+			warnings = append(warnings, fmt.Sprintf("could not move shadowing %s: %v", candidate, err))
+			continue
+		}
+		if err := os.Symlink(target, candidate); err != nil {
+			_ = os.Rename(backup, candidate)
+			warnings = append(warnings, fmt.Sprintf("could not link %s to %s: %v", candidate, target, err))
+			continue
+		}
+		_ = info
+		fmt.Fprintf(os.Stderr, "redirected earlier PATH entry %s -> %s (backup: %s)\n", candidate, target, backup)
+	}
+	if len(warnings) > 0 {
+		return errors.New(strings.Join(warnings, "; "))
+	}
+	return nil
+}
+
+func normalizeExecutablePath(path string) (string, error) {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		path = resolved
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
+}
+
+func pathIsWritable(dir string) bool {
+	if dir == "" {
+		dir = "."
+	}
+	name := filepath.Join(dir, fmt.Sprintf(".pockly-write-test-%d", time.Now().UnixNano()))
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
 }
 
 // reloadCommand returns the platform-specific shell command the user
