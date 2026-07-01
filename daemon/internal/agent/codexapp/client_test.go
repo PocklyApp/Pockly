@@ -295,6 +295,47 @@ func TestStartAutoFallsBackToStdioWhenDaemonStartFails(t *testing.T) {
 	}
 }
 
+func TestStartAutoReportsMissingProxySocket(t *testing.T) {
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath:       "codex",
+		Transport:        TransportAuto,
+		AllowDaemonStart: false,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy":             "missing_socket",
+			"app-server --listen stdio://": "ok",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceProxyFailedFallbackStdio || c.FallbackReason != FallbackReasonProxySocketMissing {
+		t.Fatalf("source=%q fallback=%q", c.Source, c.FallbackReason)
+	}
+}
+
+func TestStartAutoReportsMissingStandaloneInstall(t *testing.T) {
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath:       "codex",
+		Transport:        TransportAuto,
+		AllowDaemonStart: true,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy":             "missing_socket",
+			"app-server daemon start":      "missing_standalone",
+			"app-server --listen stdio://": "ok",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceDaemonStartFailedFallbackStdio || c.FallbackReason != FallbackReasonStandaloneMissing {
+		t.Fatalf("source=%q fallback=%q", c.Source, c.FallbackReason)
+	}
+}
+
 func TestStartProxyModeDoesNotFallback(t *testing.T) {
 	oldProbe := transportProbeTimeout
 	transportProbeTimeout = 30 * time.Millisecond
@@ -401,6 +442,10 @@ func helperShellScript(mode string) string {
 		return "exit 2"
 	case "fail_exit":
 		return "exit 3"
+	case "missing_socket":
+		return "printf '%s\\n' 'Error: failed to connect to socket at /Users/test/.codex/app-server-control/app-server-control.sock' >&2; printf '%s\\n' 'Caused by: No such file or directory (os error 2)' >&2; exit 5"
+	case "missing_standalone":
+		return "printf '%s\\n' 'Error: managed standalone Codex install not found at /Users/test/.codex/packages/standalone/current/codex' >&2; exit 6"
 	case "ok_exit":
 		return "exit 0"
 	case "ok":
@@ -426,6 +471,12 @@ func runCodexAppClientHelperProcess() int {
 		return 2
 	case "fail_exit":
 		return 3
+	case "missing_socket":
+		_, _ = os.Stderr.WriteString("Error: failed to connect to socket at /Users/test/.codex/app-server-control/app-server-control.sock\nCaused by: No such file or directory (os error 2)\n")
+		return 5
+	case "missing_standalone":
+		_, _ = os.Stderr.WriteString("Error: managed standalone Codex install not found at /Users/test/.codex/packages/standalone/current/codex\n")
+		return 6
 	case "ok_exit":
 		return 0
 	case "ok":

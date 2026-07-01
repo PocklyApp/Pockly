@@ -58,9 +58,11 @@ const (
 	SourceProxyFailedFallbackStdio       = "proxy_failed_fallback_stdio"
 	SourceStdioIsolated                  = "stdio_isolated"
 
-	FallbackReasonNone              = ""
-	FallbackReasonProxyFailed       = "proxy_failed"
-	FallbackReasonDaemonStartFailed = "daemon_start_failed"
+	FallbackReasonNone               = ""
+	FallbackReasonProxyFailed        = "proxy_failed"
+	FallbackReasonDaemonStartFailed  = "daemon_start_failed"
+	FallbackReasonProxySocketMissing = "proxy_socket_missing"
+	FallbackReasonStandaloneMissing  = "standalone_install_missing"
 )
 
 type Client struct {
@@ -123,9 +125,11 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	case TransportProxy:
 		return startProxy(ctx, cfg, SourceProxyExisting, FallbackReasonNone)
 	default:
+		var proxyErr error
 		if c, err := startProxy(ctx, cfg, SourceProxyExisting, FallbackReasonNone); err == nil {
 			return c, nil
 		} else {
+			proxyErr = err
 			cfg.Logger("codex app-server proxy unavailable; attempting daemon start: %v", err)
 		}
 		if allowDaemonStart(cfg) {
@@ -134,14 +138,14 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 					return c, nil
 				} else {
 					cfg.Logger("codex app-server proxy still unavailable after daemon start; falling back to stdio: %v", err)
-					return startWithCommand(ctx, 0, cfg, SourceProxyFailedFallbackStdio, FallbackReasonProxyFailed, "app-server", "--listen", "stdio://")
+					return startWithCommand(ctx, 0, cfg, SourceProxyFailedFallbackStdio, classifyFallbackReason(err, FallbackReasonProxyFailed), "app-server", "--listen", "stdio://")
 				}
 			} else {
 				cfg.Logger("codex app-server daemon start failed; falling back to stdio: %v", err)
-				return startWithCommand(ctx, 0, cfg, SourceDaemonStartFailedFallbackStdio, FallbackReasonDaemonStartFailed, "app-server", "--listen", "stdio://")
+				return startWithCommand(ctx, 0, cfg, SourceDaemonStartFailedFallbackStdio, classifyFallbackReason(err, FallbackReasonDaemonStartFailed), "app-server", "--listen", "stdio://")
 			}
 		}
-		return startWithCommand(ctx, 0, cfg, SourceProxyFailedFallbackStdio, FallbackReasonProxyFailed, "app-server", "--listen", "stdio://")
+		return startWithCommand(ctx, 0, cfg, SourceProxyFailedFallbackStdio, classifyFallbackReason(proxyErr, FallbackReasonProxyFailed), "app-server", "--listen", "stdio://")
 	}
 }
 
@@ -160,6 +164,27 @@ func normalizeTransport(transport string) string {
 
 func allowDaemonStart(cfg Config) bool {
 	return cfg.AllowDaemonStart
+}
+
+func classifyFallbackReason(err error, fallback string) string {
+	msg := strings.ToLower(strings.TrimSpace(errorString(err)))
+	switch {
+	case msg == "":
+		return fallback
+	case strings.Contains(msg, "managed standalone codex install not found"):
+		return FallbackReasonStandaloneMissing
+	case strings.Contains(msg, "app-server-control.sock") && (strings.Contains(msg, "no such file") || strings.Contains(msg, "failed to connect")):
+		return FallbackReasonProxySocketMissing
+	default:
+		return fallback
+	}
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func startProxy(ctx context.Context, cfg Config, source, fallbackReason string) (*Client, error) {
@@ -229,8 +254,9 @@ func startWithCommand(ctx context.Context, initTimeout time.Duration, cfg Config
 		Source:         source,
 		FallbackReason: fallbackReason,
 	}
+	stderrRec := newStderrRecorder(8192)
 	go c.readLoop(stdout)
-	go c.drainStderr(stderr)
+	go c.drainStderr(stderr, stderrRec)
 	go c.wait()
 	initCtx := ctx
 	var cancel context.CancelFunc
@@ -241,6 +267,9 @@ func startWithCommand(ctx context.Context, initTimeout time.Duration, cfg Config
 		defer cancel()
 	}
 	if err := c.initialize(initCtx); err != nil {
+		if stderrText := stderrRec.String(); strings.TrimSpace(stderrText) != "" {
+			err = fmt.Errorf("%w: %s", err, strings.TrimSpace(stderrText))
+		}
 		_ = c.Close()
 		return nil, err
 	}
@@ -579,12 +608,51 @@ func (c *Client) handleServerRequest(req ServerRequest) {
 	}
 }
 
-func (c *Client) drainStderr(r io.Reader) {
+func (c *Client) drainStderr(r io.Reader, rec *stderrRecorder) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 0, 4*1024), 1*1024*1024)
 	for scanner.Scan() {
-		c.logf("codex app-server stderr: %s", scanner.Text())
+		text := scanner.Text()
+		if rec != nil {
+			rec.WriteString(text + "\n")
+		}
+		c.logf("codex app-server stderr: %s", text)
 	}
+}
+
+type stderrRecorder struct {
+	mu  sync.Mutex
+	max int
+	buf strings.Builder
+}
+
+func newStderrRecorder(max int) *stderrRecorder {
+	return &stderrRecorder{max: max}
+}
+
+func (r *stderrRecorder) WriteString(s string) {
+	if r == nil || r.max <= 0 || s == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remaining := r.max - r.buf.Len()
+	if remaining <= 0 {
+		return
+	}
+	if len(s) > remaining {
+		s = s[:remaining]
+	}
+	_, _ = r.buf.WriteString(s)
+}
+
+func (r *stderrRecorder) String() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.String()
 }
 
 func (c *Client) logf(format string, args ...any) {

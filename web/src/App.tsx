@@ -7129,8 +7129,8 @@ export function ClaudeCodePillsRow({
   const effortLabel = effortLabelFor(current.effort);
   const permissionLabel = permissionLabelFor(current.permission_mode);
   const pillsDisabled = disabled || !snapshot;
-  const codexAppServerNote = agent === "codex" && snapshot && isCodexIsolatedAppServerSource(snapshot.codex_app_server_source)
-    ? "Codex App may need you to reopen this session to show Pockly-sent messages."
+  const codexAppServerNote = agent === "codex" && snapshot
+    ? codexAppServerStatusNote(snapshot.codex_app_server_source, snapshot.codex_app_server_fallback_reason)
     : "";
 
   return (
@@ -7191,6 +7191,17 @@ export function isCodexIsolatedAppServerSource(source?: string): boolean {
   return source === "stdio_isolated" ||
     source === "proxy_failed_fallback_stdio" ||
     source === "daemon_start_failed_fallback_stdio";
+}
+
+export function codexAppServerStatusNote(source?: string, fallbackReason?: string): string {
+  if (!isCodexIsolatedAppServerSource(source)) return "";
+  if (fallbackReason === "standalone_install_missing") {
+    return "Pockly is using an isolated Codex app-server because the Codex standalone control daemon is not installed. Codex App will not show these live turns until you reopen the session.";
+  }
+  if (fallbackReason === "proxy_socket_missing") {
+    return "Pockly is using an isolated Codex app-server because no Codex control socket is available. Codex App will not show these live turns until you reopen the session.";
+  }
+  return "Pockly is using an isolated Codex app-server. Codex App may need you to reopen this session to show Pockly-sent messages.";
 }
 
 type ConfigOption = { value: string; label: string; active: boolean };
