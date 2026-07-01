@@ -6,6 +6,8 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/PocklyApp/Pockly/daemon/internal/agent/sdkdriver"
@@ -76,5 +78,60 @@ func TestCodexDefaultsFollowConfig(t *testing.T) {
 				t.Errorf("codexDefaultEffort()=%q want %q", got, tc.wantEff)
 			}
 		})
+	}
+}
+
+func TestCodexModelOptionsUsesIsolatedStdio(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell shim uses /bin/sh")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "codex-argv.log")
+	shimPath := filepath.Join(dir, "codex")
+	shim := `#!/bin/sh
+printf '%s\n' "$*" >> "$POCKLY_CODEX_ARGV_LOG"
+case "$*" in
+  "app-server --listen stdio://"*)
+    while IFS= read -r line; do
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/"\1"/p')
+      [ -n "$id" ] || id=null
+      case "$line" in
+        *'"method":"initialize"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
+        *'"method":"model/list"'*) printf '{"id":%s,"result":{"data":[{"id":"codex-test-model","model":"codex-test-model","displayName":"Codex Test","isDefault":true}]}}\n' "$id" ;;
+      esac
+    done
+    ;;
+  *)
+    exit 11
+    ;;
+esac
+`
+	if err := os.WriteFile(shimPath, []byte(shim), 0o755); err != nil {
+		t.Fatalf("write codex shim: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("POCKLY_CODEX_ARGV_LOG", logPath)
+	t.Setenv("CODEX_HOME", filepath.Join(dir, "codex-home"))
+
+	defaultModel, resolvedDefault, models, options := codexModelOptions()
+	if defaultModel != "codex-test-model" || resolvedDefault != "codex-test-model" {
+		t.Fatalf("default=%q resolved=%q, want codex-test-model", defaultModel, resolvedDefault)
+	}
+	if len(models) != 1 || models[0] != "codex-test-model" {
+		t.Fatalf("models=%#v, want codex-test-model", models)
+	}
+	if len(options) != 1 || options[0].Source != "codex_app_server" {
+		t.Fatalf("options=%#v, want one codex_app_server option", options)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read argv log: %v", err)
+	}
+	got := strings.TrimSpace(string(raw))
+	if got != "app-server --listen stdio://" {
+		t.Fatalf("codex argv = %q, want isolated stdio only", got)
+	}
+	if strings.Contains(got, "proxy") || strings.Contains(got, "daemon") {
+		t.Fatalf("model options must not probe proxy or start daemon, argv=%q", got)
 	}
 }

@@ -149,6 +149,10 @@ type Config struct {
 	// CodexAppFactory starts the app-server runtime. nil uses the real
 	// `codex app-server --listen stdio://` client. Tests provide fakes.
 	CodexAppFactory CodexAppFactory
+
+	CodexAppTransport        string
+	CodexAppSocketPath       string
+	CodexAppAllowDaemonStart bool
 }
 
 // Driver owns one claude subprocess + its ExternalSession in
@@ -191,8 +195,10 @@ type Driver struct {
 	// freshly-spawned one re-resumes before the first TurnStart — keying the
 	// skip off the session's bound id instead skipped ThreadResume and made
 	// TurnStart fail with "thread not found".
-	codexThreadID string
-	codexItems    map[string]codexItemState
+	codexThreadID                string
+	codexItems                   map[string]codexItemState
+	codexAppServerSource         string
+	codexAppServerFallbackReason string
 }
 
 var (

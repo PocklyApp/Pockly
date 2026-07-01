@@ -928,6 +928,8 @@ func runServe(args []string) (err error) {
 	}
 	terminalManager := liveterminal.NewManager()
 	cfg.TerminalManager = terminalManager
+	codexAppTransport := os.Getenv("POCKLY_CODEX_APP_SERVER_TRANSPORT")
+	codexAppSocketPath := os.Getenv("POCKLY_CODEX_APP_SERVER_SOCK")
 	// In-memory permission-request broker for the Claude permission
 	// bridge. Pockly does not persist allow rules or make policy
 	// decisions; it only forwards a live Claude prompt to the Web and
@@ -1100,15 +1102,17 @@ func runServe(args []string) (err error) {
 					return sdkdriver.ResolveExecutable("claude")
 				})
 				sdkManager := sdkdriver.NewManager(sdkdriver.ManagerConfig{
-					Terminal:          terminalManager,
-					Logger:            log.Printf,
-					Context:           ctx,
-					DaemonBinaryPath:  daemonExe,
-					DaemonLocalAPIURL: "http://" + *listen,
-					Settings:          sdkSettingsReader{store: agentSettingsStore},
-					Sessions:          sdkSessionResolver{index: idx},
-					EventSink:         sdkTerminalEventForwarder{out: externalTerminalEvents},
-					PermissionStore:   permissionStore,
+					Terminal:           terminalManager,
+					Logger:             log.Printf,
+					Context:            ctx,
+					DaemonBinaryPath:   daemonExe,
+					DaemonLocalAPIURL:  "http://" + *listen,
+					Settings:           sdkSettingsReader{store: agentSettingsStore},
+					Sessions:           sdkSessionResolver{index: idx},
+					EventSink:          sdkTerminalEventForwarder{out: externalTerminalEvents},
+					PermissionStore:    permissionStore,
+					CodexAppTransport:  codexAppTransport,
+					CodexAppSocketPath: codexAppSocketPath,
 				})
 				defer sdkManager.StopAll()
 				// Late-bind the wrapper-unclean-exit recovery hook now
@@ -1148,12 +1152,14 @@ func runServe(args []string) (err error) {
 						Terminal:               terminalManager,
 						Profile:                profile,
 						ExternalTerminalEvents: externalTerminalEvents,
+						CodexAppTransport:      codexAppTransport,
+						CodexAppSocketPath:     codexAppSocketPath,
 						UpdateHandler:          updateHandler,
 						// Forward Nexus-issued permission
 						// decisions into the local permission.Store
 						// (which unblocks the MCP server's /await).
 						PermissionDecider: permissionDeciderAdapter{store: permissionStore},
-						AgentSettings:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
+						AgentSettings:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx, sdkManager: sdkManager},
 						AgentDefaults:     agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						GitDiff:           agentSettingsAdapter{store: agentSettingsStore, terminal: terminalManager, index: idx},
 						SyncHint: func(hint control.SyncHintPush) {
@@ -3671,9 +3677,10 @@ func (a sdkDriverAdapter) EnsureNewDriver(ctx context.Context, sid, cwd string, 
 // sid is bound by both drivers (which shouldn't happen — the sid mutex
 // prevents it — but defense in depth costs nothing).
 type agentSettingsAdapter struct {
-	store    *agentsettings.Store
-	terminal *liveterminal.Manager
-	index    *index.Index
+	store      *agentsettings.Store
+	terminal   *liveterminal.Manager
+	index      *index.Index
+	sdkManager *sdkdriver.Manager
 }
 
 // sdkTSPrefix marks synthetic terminal_session_ids used for sdk_headless
@@ -4102,18 +4109,29 @@ func (a agentSettingsAdapter) codexSettingsSnapshot(requestID string, res agentS
 	if effort == "" {
 		effort = codexDefaultEffort()
 	}
+	appServerSource, appServerFallback := a.codexAppServerInfo(res.claudeSessionID)
 	return control.AgentSettingsResult{
-		RequestID:                requestID,
-		Status:                   "ok",
-		Model:                    model,
-		ResolvedModel:            resolved,
-		PermissionMode:           mode,
-		Effort:                   effort,
-		AvailableModels:          ensureModelsPresent(models, model),
-		AvailableModelOptions:    ensureControlModelOptionsPresent(modelOptions, model),
-		AvailablePermissionModes: codexPermissionModes(),
-		AvailableEfforts:         codexEffortLevels,
+		RequestID:                    requestID,
+		Status:                       "ok",
+		Model:                        model,
+		ResolvedModel:                resolved,
+		PermissionMode:               mode,
+		Effort:                       effort,
+		AvailableModels:              ensureModelsPresent(models, model),
+		AvailableModelOptions:        ensureControlModelOptionsPresent(modelOptions, model),
+		AvailablePermissionModes:     codexPermissionModes(),
+		AvailableEfforts:             codexEffortLevels,
+		CodexAppServerSource:         appServerSource,
+		CodexAppServerFallbackReason: appServerFallback,
 	}
+}
+
+func (a agentSettingsAdapter) codexAppServerInfo(sid string) (string, string) {
+	if a.sdkManager == nil || strings.TrimSpace(sid) == "" {
+		return "", ""
+	}
+	info := a.sdkManager.CodexAppServerInfo(sid)
+	return info.Source, info.FallbackReason
 }
 
 func (a agentSettingsAdapter) codexDefaults(requestID string) control.AgentDefaultsResult {
@@ -4167,17 +4185,20 @@ func (a agentSettingsAdapter) setCodexSettings(req control.AgentSettingsSet, res
 	if effort == "" {
 		effort = codexDefaultEffort()
 	}
+	appServerSource, appServerFallback := a.codexAppServerInfo(res.claudeSessionID)
 	return control.AgentSettingsResult{
-		RequestID:                req.RequestID,
-		Status:                   "ok",
-		Model:                    model,
-		ResolvedModel:            resolved,
-		PermissionMode:           mode,
-		Effort:                   effort,
-		AvailableModels:          ensureModelsPresent(models, model),
-		AvailableModelOptions:    ensureControlModelOptionsPresent(modelOptions, model),
-		AvailablePermissionModes: codexPermissionModes(),
-		AvailableEfforts:         codexEffortLevels,
+		RequestID:                    req.RequestID,
+		Status:                       "ok",
+		Model:                        model,
+		ResolvedModel:                resolved,
+		PermissionMode:               mode,
+		Effort:                       effort,
+		AvailableModels:              ensureModelsPresent(models, model),
+		AvailableModelOptions:        ensureControlModelOptionsPresent(modelOptions, model),
+		AvailablePermissionModes:     codexPermissionModes(),
+		AvailableEfforts:             codexEffortLevels,
+		CodexAppServerSource:         appServerSource,
+		CodexAppServerFallbackReason: appServerFallback,
 	}
 }
 
@@ -4189,7 +4210,7 @@ func codexModelOptions() (defaultModel string, resolvedDefault string, models []
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	app, err := codexapp.Start(ctx, codexapp.Config{BinaryPath: bin, Logger: log.Printf})
+	app, err := codexapp.Start(ctx, codexapp.Config{BinaryPath: bin, Logger: log.Printf, Transport: codexapp.TransportStdio})
 	if err != nil {
 		return cfg.model, cfg.model, codexConfigModels(cfg), codexConfigModelOptions(cfg)
 	}

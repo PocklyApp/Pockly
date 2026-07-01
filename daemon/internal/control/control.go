@@ -255,17 +255,19 @@ type AgentSettingsSet struct {
 // verbatim to the web; the canonical error strings are the same as
 // the inject path ("session_not_attached", "session_drifted current=<sid>").
 type AgentSettingsResult struct {
-	RequestID                string             `json:"request_id"`
-	Status                   string             `json:"status"`
-	Error                    string             `json:"error,omitempty"`
-	Model                    string             `json:"model,omitempty"`
-	ResolvedModel            string             `json:"resolved_model,omitempty"`
-	PermissionMode           string             `json:"permission_mode,omitempty"`
-	Effort                   string             `json:"effort,omitempty"`
-	AvailableModels          []string           `json:"available_models,omitempty"`
-	AvailableModelOptions    []AgentModelOption `json:"available_model_options,omitempty"`
-	AvailablePermissionModes []string           `json:"available_permission_modes,omitempty"`
-	AvailableEfforts         []string           `json:"available_efforts,omitempty"`
+	RequestID                    string             `json:"request_id"`
+	Status                       string             `json:"status"`
+	Error                        string             `json:"error,omitempty"`
+	Model                        string             `json:"model,omitempty"`
+	ResolvedModel                string             `json:"resolved_model,omitempty"`
+	PermissionMode               string             `json:"permission_mode,omitempty"`
+	Effort                       string             `json:"effort,omitempty"`
+	AvailableModels              []string           `json:"available_models,omitempty"`
+	AvailableModelOptions        []AgentModelOption `json:"available_model_options,omitempty"`
+	AvailablePermissionModes     []string           `json:"available_permission_modes,omitempty"`
+	AvailableEfforts             []string           `json:"available_efforts,omitempty"`
+	CodexAppServerSource         string             `json:"codex_app_server_source,omitempty"`
+	CodexAppServerFallbackReason string             `json:"codex_app_server_fallback_reason,omitempty"`
 }
 
 type AgentModelOption struct {
@@ -514,6 +516,12 @@ type Client struct {
 	// SDK mode entirely — inject for non-PTY-bound sessions then fails
 	// fast with session_not_attached as it did under v1.6.1.
 	SDKDriver SDKDriverEnsurer
+	// CodexAppTransport configures how Codex app-server JSON-RPC sessions are
+	// opened for control-owned Codex process terminals. Empty means auto.
+	CodexAppTransport string
+	// CodexAppSocketPath optionally points proxy mode at a specific local
+	// app-server Unix socket. It is never forwarded to Nexus/Web.
+	CodexAppSocketPath string
 }
 
 // SDKDriverEnsurer is the interface the inject path uses to lazily spawn
@@ -544,6 +552,8 @@ type runner struct {
 	terminal            *liveterminal.Manager
 	terminalEvents      chan TerminalEvent
 	sdkDriver           SDKDriverEnsurer
+	codexAppTransport   string
+	codexAppSocketPath  string
 	codexTerminals      map[string]*codexProcessTerminal
 	terminalSubscribers map[string]int
 	// agentSettings is the same handler stored on Client; runStartTask
@@ -577,6 +587,8 @@ func Run(ctx context.Context, cfg Client) error {
 		terminal:            terminalManager,
 		terminalEvents:      make(chan TerminalEvent, 1024),
 		sdkDriver:           cfg.SDKDriver,
+		codexAppTransport:   cfg.CodexAppTransport,
+		codexAppSocketPath:  cfg.CodexAppSocketPath,
 		codexTerminals:      map[string]*codexProcessTerminal{},
 		terminalSubscribers: map[string]int{},
 		agentSettings:       cfg.AgentSettings,
@@ -1811,9 +1823,12 @@ func (r *runner) handleCodexTerminalCreate(parent context.Context, cfg Client, r
 	}
 	ctx, cancel := context.WithCancel(parent)
 	app, err := codexapp.Start(ctx, codexapp.Config{
-		BinaryPath: bin,
-		Cwd:        cwd,
-		Logger:     log.Printf,
+		BinaryPath:       bin,
+		Cwd:              cwd,
+		Logger:           log.Printf,
+		Transport:        firstNonEmpty(r.codexAppTransport, codexapp.TransportAuto),
+		SocketPath:       r.codexAppSocketPath,
+		AllowDaemonStart: true,
 		OnNotification: func(n codexapp.Notification) {
 			r.handleCodexTerminalNotification(req, n)
 		},

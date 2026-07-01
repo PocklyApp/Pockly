@@ -25,6 +25,10 @@ type CodexAppRuntime interface {
 	Close() error
 }
 
+type codexAppRuntimeInfo interface {
+	AppServerSource() (source, fallbackReason string)
+}
+
 type CodexAppFactory func(context.Context, codexapp.Config) (CodexAppRuntime, error)
 
 type codexItemState struct {
@@ -62,9 +66,12 @@ func (d *Driver) startCodexApp(ctx context.Context) error {
 	d.mu.Unlock()
 
 	cfg := codexapp.Config{
-		BinaryPath: d.cfg.BinaryPath,
-		Cwd:        d.cfg.Cwd,
-		Logger:     d.cfg.Logger,
+		BinaryPath:       d.cfg.BinaryPath,
+		Cwd:              d.cfg.Cwd,
+		Logger:           d.cfg.Logger,
+		Transport:        d.cfg.CodexAppTransport,
+		SocketPath:       d.cfg.CodexAppSocketPath,
+		AllowDaemonStart: d.cfg.CodexAppAllowDaemonStart,
 		OnNotification: func(n codexapp.Notification) {
 			d.handleCodexNotification(n)
 		},
@@ -88,7 +95,15 @@ func (d *Driver) startCodexApp(ctx context.Context) error {
 		return nil
 	}
 	d.codex = app
+	if info, ok := app.(codexAppRuntimeInfo); ok {
+		d.codexAppServerSource, d.codexAppServerFallbackReason = info.AppServerSource()
+	} else {
+		d.codexAppServerSource, d.codexAppServerFallbackReason = "", ""
+	}
 	d.mu.Unlock()
+	if d.codexAppServerSource != "" {
+		d.cfg.Logger("sdkdriver: codex app-server source sid=%s source=%s fallback=%s", d.cfg.SessionID, d.codexAppServerSource, d.codexAppServerFallbackReason)
+	}
 	return nil
 }
 
@@ -103,6 +118,8 @@ func (d *Driver) closeCodexApp() {
 	d.mu.Lock()
 	app := d.codex
 	d.codex = nil
+	d.codexAppServerSource = ""
+	d.codexAppServerFallbackReason = ""
 	// The next app-server is a fresh process with no loaded threads, so force
 	// ensureCodexThread to start/resume again before the next TurnStart.
 	d.codexThreadID = ""

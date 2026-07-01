@@ -25,17 +25,43 @@ import (
 
 type ExecFunc func(ctx context.Context, name string, args ...string) *exec.Cmd
 
-const maxJSONRPCLineBytes = 128 * 1024 * 1024
+const (
+	maxJSONRPCLineBytes = 128 * 1024 * 1024
+)
+
+var (
+	transportProbeTimeout = 5 * time.Second
+	daemonStartTimeout    = 10 * time.Second
+)
 
 type Config struct {
-	BinaryPath string
-	Cwd        string
-	Exec       ExecFunc
-	Logger     func(format string, args ...any)
+	BinaryPath       string
+	Cwd              string
+	Exec             ExecFunc
+	Logger           func(format string, args ...any)
+	Transport        string
+	SocketPath       string
+	AllowDaemonStart bool
 
 	OnNotification  func(Notification)
 	OnServerRequest func(context.Context, ServerRequest) (json.RawMessage, error)
 }
+
+const (
+	TransportAuto  = "auto"
+	TransportProxy = "proxy"
+	TransportStdio = "stdio"
+
+	SourceProxyExisting                  = "proxy_existing"
+	SourceDaemonStartedProxy             = "daemon_started_proxy"
+	SourceDaemonStartFailedFallbackStdio = "daemon_start_failed_fallback_stdio"
+	SourceProxyFailedFallbackStdio       = "proxy_failed_fallback_stdio"
+	SourceStdioIsolated                  = "stdio_isolated"
+
+	FallbackReasonNone              = ""
+	FallbackReasonProxyFailed       = "proxy_failed"
+	FallbackReasonDaemonStartFailed = "daemon_start_failed"
+)
 
 type Client struct {
 	cfg Config
@@ -50,6 +76,9 @@ type Client struct {
 	closed  bool
 
 	done chan struct{}
+
+	Source         string
+	FallbackReason string
 }
 
 type Notification struct {
@@ -75,6 +104,9 @@ type rpcError struct {
 }
 
 func Start(ctx context.Context, cfg Config) (*Client, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if strings.TrimSpace(cfg.BinaryPath) == "" {
 		return nil, errors.New("codex app-server binary path required")
 	}
@@ -84,7 +116,83 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = func(string, ...any) {}
 	}
-	cmd := cfg.Exec(ctx, cfg.BinaryPath, "app-server", "--listen", "stdio://")
+	transport := normalizeTransport(cfg.Transport)
+	switch transport {
+	case TransportStdio:
+		return startWithCommand(ctx, 0, cfg, SourceStdioIsolated, FallbackReasonNone, "app-server", "--listen", "stdio://")
+	case TransportProxy:
+		return startProxy(ctx, cfg, SourceProxyExisting, FallbackReasonNone)
+	default:
+		if c, err := startProxy(ctx, cfg, SourceProxyExisting, FallbackReasonNone); err == nil {
+			return c, nil
+		} else {
+			cfg.Logger("codex app-server proxy unavailable; attempting daemon start: %v", err)
+		}
+		if allowDaemonStart(cfg) {
+			if err := runDaemonStart(ctx, cfg); err == nil {
+				if c, err := startProxy(ctx, cfg, SourceDaemonStartedProxy, FallbackReasonNone); err == nil {
+					return c, nil
+				} else {
+					cfg.Logger("codex app-server proxy still unavailable after daemon start; falling back to stdio: %v", err)
+					return startWithCommand(ctx, 0, cfg, SourceProxyFailedFallbackStdio, FallbackReasonProxyFailed, "app-server", "--listen", "stdio://")
+				}
+			} else {
+				cfg.Logger("codex app-server daemon start failed; falling back to stdio: %v", err)
+				return startWithCommand(ctx, 0, cfg, SourceDaemonStartFailedFallbackStdio, FallbackReasonDaemonStartFailed, "app-server", "--listen", "stdio://")
+			}
+		}
+		return startWithCommand(ctx, 0, cfg, SourceProxyFailedFallbackStdio, FallbackReasonProxyFailed, "app-server", "--listen", "stdio://")
+	}
+}
+
+func normalizeTransport(transport string) string {
+	switch strings.ToLower(strings.TrimSpace(transport)) {
+	case "", TransportAuto:
+		return TransportAuto
+	case TransportProxy:
+		return TransportProxy
+	case TransportStdio:
+		return TransportStdio
+	default:
+		return TransportAuto
+	}
+}
+
+func allowDaemonStart(cfg Config) bool {
+	return cfg.AllowDaemonStart
+}
+
+func startProxy(ctx context.Context, cfg Config, source, fallbackReason string) (*Client, error) {
+	args := []string{"app-server", "proxy"}
+	if sock := strings.TrimSpace(cfg.SocketPath); sock != "" {
+		args = append(args, "--sock", sock)
+	}
+	return startWithCommand(ctx, transportProbeTimeout, cfg, source, fallbackReason, args...)
+}
+
+func runDaemonStart(ctx context.Context, cfg Config) error {
+	attemptCtx, cancel := context.WithTimeout(ctx, daemonStartTimeout)
+	defer cancel()
+	cmd := cfg.Exec(attemptCtx, cfg.BinaryPath, "app-server", "daemon", "start")
+	if strings.TrimSpace(cfg.Cwd) != "" {
+		cmd.Dir = cfg.Cwd
+	}
+	cmd.Env = os.Environ()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = io.Discard
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return fmt.Errorf("%w: %s", err, msg)
+		}
+		return err
+	}
+	return nil
+}
+
+func startWithCommand(ctx context.Context, initTimeout time.Duration, cfg Config, source, fallbackReason string, args ...string) (*Client, error) {
+	cmd := cfg.Exec(ctx, cfg.BinaryPath, args...)
 	if strings.TrimSpace(cfg.Cwd) != "" {
 		cmd.Dir = cfg.Cwd
 	}
@@ -117,11 +225,22 @@ func Start(ctx context.Context, cfg Config) (*Client, error) {
 		cmd:     cmd,
 		pending: map[string]chan rpcResponse{},
 		done:    make(chan struct{}),
+
+		Source:         source,
+		FallbackReason: fallbackReason,
 	}
 	go c.readLoop(stdout)
 	go c.drainStderr(stderr)
 	go c.wait()
-	if err := c.initialize(ctx); err != nil {
+	initCtx := ctx
+	var cancel context.CancelFunc
+	if initTimeout > 0 {
+		initCtx, cancel = context.WithTimeout(ctx, initTimeout)
+	}
+	if cancel != nil {
+		defer cancel()
+	}
+	if err := c.initialize(initCtx); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -255,6 +374,13 @@ func (c *Client) ModelList(ctx context.Context) ([]Model, error) {
 		return nil, err
 	}
 	return out.Data, nil
+}
+
+func (c *Client) AppServerSource() (source, fallbackReason string) {
+	if c == nil {
+		return "", ""
+	}
+	return c.Source, c.FallbackReason
 }
 
 func (c *Client) CommandExec(ctx context.Context, params CommandExecParams) (CommandExecResult, error) {

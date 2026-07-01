@@ -118,6 +118,8 @@ type Manager struct {
 	eventSink             TerminalEventSink
 	permissionStore       *permission.Store
 	codexAppFactory       CodexAppFactory
+	codexAppTransport     string
+	codexAppSocketPath    string
 
 	// driverCtx is the long-lived context that owns every SDK
 	// subprocess. Crucially this is NOT the inject handler's ctx —
@@ -187,7 +189,9 @@ type ManagerConfig struct {
 	PermissionStore *permission.Store
 	// CodexAppFactory starts the Codex app-server runtime. nil uses the real
 	// stdio JSON-RPC transport; tests can inject a fake runtime.
-	CodexAppFactory CodexAppFactory
+	CodexAppFactory    CodexAppFactory
+	CodexAppTransport  string
+	CodexAppSocketPath string
 }
 
 var (
@@ -249,6 +253,8 @@ func NewManager(cfg ManagerConfig) *Manager {
 		eventSink:             cfg.EventSink,
 		permissionStore:       cfg.PermissionStore,
 		codexAppFactory:       cfg.CodexAppFactory,
+		codexAppTransport:     cfg.CodexAppTransport,
+		codexAppSocketPath:    cfg.CodexAppSocketPath,
 		driverCtx:             cfg.Context,
 		drivers:               map[string]*entry{},
 		lastSeqBySid:          map[string]int64{},
@@ -351,6 +357,41 @@ func (m *Manager) reapIdleDrivers(now time.Time) {
 	}
 	for _, v := range codexTimeouts {
 		_ = v.drv.timeoutCodexTurnFromReaper(now)
+	}
+}
+
+type CodexAppServerInfo struct {
+	Source         string
+	FallbackReason string
+}
+
+func (m *Manager) CodexAppServerInfo(sid string) CodexAppServerInfo {
+	m.mu.Lock()
+	var drv *Driver
+	e := m.drivers[sid]
+	if e == nil || e.driver == nil {
+		for _, candidate := range m.drivers {
+			if candidate == nil || candidate.driver == nil || candidate.terminalSession == nil {
+				continue
+			}
+			if candidate.terminalSession.ClaudeSessionID() == sid {
+				e = candidate
+				break
+			}
+		}
+	}
+	if e != nil {
+		drv = e.driver
+	}
+	m.mu.Unlock()
+	if drv == nil {
+		return CodexAppServerInfo{}
+	}
+	drv.mu.Lock()
+	defer drv.mu.Unlock()
+	return CodexAppServerInfo{
+		Source:         drv.codexAppServerSource,
+		FallbackReason: drv.codexAppServerFallbackReason,
 	}
 }
 
@@ -517,24 +558,27 @@ func (m *Manager) ensureDriver(ctx context.Context, sid, cwd string, agent Agent
 		resumePath = m.sessions.PathForSession(sid)
 	}
 	driver := New(Config{
-		SessionID:         sid,
-		Agent:             agent,
-		Cwd:               cwd,
-		ResumePath:        resumePath,
-		BinaryPath:        binaryPath,
-		CommandPrefixArgs: commandPrefixArgs,
-		LauncherSource:    launcherSource,
-		DaemonBinaryPath:  m.daemonBin,
-		DaemonLocalAPIURL: m.daemonURL,
-		TerminalSessionID: tsID,
-		Model:             model,
-		PermissionMode:    permissionMode,
-		Effort:            effort,
-		Exec:              m.exec,
-		Logger:            m.logger,
-		NewSession:        newSession,
-		PermissionStore:   m.permissionStore,
-		CodexAppFactory:   m.codexAppFactory,
+		SessionID:                sid,
+		Agent:                    agent,
+		Cwd:                      cwd,
+		ResumePath:               resumePath,
+		BinaryPath:               binaryPath,
+		CommandPrefixArgs:        commandPrefixArgs,
+		LauncherSource:           launcherSource,
+		DaemonBinaryPath:         m.daemonBin,
+		DaemonLocalAPIURL:        m.daemonURL,
+		TerminalSessionID:        tsID,
+		Model:                    model,
+		PermissionMode:           permissionMode,
+		Effort:                   effort,
+		Exec:                     m.exec,
+		Logger:                   m.logger,
+		NewSession:               newSession,
+		PermissionStore:          m.permissionStore,
+		CodexAppFactory:          m.codexAppFactory,
+		CodexAppTransport:        firstNonEmpty(m.codexAppTransport, "auto"),
+		CodexAppSocketPath:       m.codexAppSocketPath,
+		CodexAppAllowDaemonStart: true,
 	}, ext)
 
 	m.drivers[sid] = &entry{driver: driver, terminalSession: ext, terminalSessionID: tsID}

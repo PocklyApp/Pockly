@@ -986,6 +986,8 @@ export type AgentSettingsSnapshot = {
   available_model_options?: AgentModelOption[];
   available_permission_modes: string[];
   available_efforts: string[];
+  codex_app_server_source?: string;
+  codex_app_server_fallback_reason?: string;
 };
 
 export type AgentModelOption = {

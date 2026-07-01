@@ -9,10 +9,20 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	if os.Getenv("POCKLY_CODEXAPP_HELPER") == "1" {
+		os.Exit(runCodexAppClientHelperProcess())
+	}
+	os.Exit(m.Run())
+}
 
 func TestClientInitializeModelListAndNotification(t *testing.T) {
 	clientToServerR, clientToServerW := io.Pipe()
@@ -188,6 +198,147 @@ func TestNotifyOmitsNilParams(t *testing.T) {
 	}
 }
 
+func TestStartAutoUsesExistingProxy(t *testing.T) {
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath:       "codex",
+		Transport:        TransportAuto,
+		AllowDaemonStart: true,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy": "ok",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceProxyExisting || c.FallbackReason != "" {
+		t.Fatalf("source=%q fallback=%q", c.Source, c.FallbackReason)
+	}
+	if got := strings.Join(calls, "|"); got != "app-server proxy" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestStartAutoStartsDaemonThenProxy(t *testing.T) {
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath:       "codex",
+		Transport:        TransportAuto,
+		AllowDaemonStart: true,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy":        "fail_once_then_ok",
+			"app-server daemon start": "ok_exit",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceDaemonStartedProxy || c.FallbackReason != "" {
+		t.Fatalf("source=%q fallback=%q", c.Source, c.FallbackReason)
+	}
+	if got := strings.Join(calls, "|"); got != "app-server proxy|app-server daemon start|app-server proxy" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestStartAutoTimesOutHungProxyAndFallsBack(t *testing.T) {
+	oldProbe := transportProbeTimeout
+	transportProbeTimeout = 30 * time.Millisecond
+	defer func() { transportProbeTimeout = oldProbe }()
+
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath:       "codex",
+		Transport:        TransportAuto,
+		AllowDaemonStart: true,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy":             "hang_once_then_fail",
+			"app-server daemon start":      "ok_exit",
+			"app-server --listen stdio://": "ok",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceProxyFailedFallbackStdio || c.FallbackReason != FallbackReasonProxyFailed {
+		t.Fatalf("source=%q fallback=%q", c.Source, c.FallbackReason)
+	}
+	if got := strings.Join(calls, "|"); got != "app-server proxy|app-server daemon start|app-server proxy|app-server --listen stdio://" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestStartAutoFallsBackToStdioWhenDaemonStartFails(t *testing.T) {
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath:       "codex",
+		Transport:        TransportAuto,
+		AllowDaemonStart: true,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy":             "fail",
+			"app-server daemon start":      "fail_exit",
+			"app-server --listen stdio://": "ok",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceDaemonStartFailedFallbackStdio || c.FallbackReason != FallbackReasonDaemonStartFailed {
+		t.Fatalf("source=%q fallback=%q", c.Source, c.FallbackReason)
+	}
+	if got := strings.Join(calls, "|"); got != "app-server proxy|app-server daemon start|app-server --listen stdio://" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestStartProxyModeDoesNotFallback(t *testing.T) {
+	oldProbe := transportProbeTimeout
+	transportProbeTimeout = 30 * time.Millisecond
+	defer func() { transportProbeTimeout = oldProbe }()
+
+	var calls []string
+	_, err := Start(context.Background(), Config{
+		BinaryPath: "codex",
+		Transport:  TransportProxy,
+		Exec: helperExec(t, map[string]string{
+			"app-server proxy --sock /tmp/codex.sock": "hang",
+			"app-server --listen stdio://":            "ok",
+		}, &calls),
+		SocketPath: "/tmp/codex.sock",
+	})
+	if err == nil {
+		t.Fatal("expected proxy failure")
+	}
+	if got := strings.Join(calls, "|"); got != "app-server proxy --sock /tmp/codex.sock" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
+func TestStartStdioModeDoesNotProbeProxy(t *testing.T) {
+	var calls []string
+	c, err := Start(context.Background(), Config{
+		BinaryPath: "codex",
+		Transport:  TransportStdio,
+		Exec: helperExec(t, map[string]string{
+			"app-server --listen stdio://": "ok",
+		}, &calls),
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer c.Close()
+	if c.Source != SourceStdioIsolated {
+		t.Fatalf("source=%q", c.Source)
+	}
+	if got := strings.Join(calls, "|"); got != "app-server --listen stdio://" {
+		t.Fatalf("calls=%s", got)
+	}
+}
+
 type blockingWriteCloser struct {
 	release chan struct{}
 }
@@ -212,6 +363,82 @@ func TestCommandExecParamsAvoidsMutuallyExclusiveTimeoutAndOutputCap(t *testing.
 	}
 	if raw["processId"] != "proc_1" {
 		t.Fatalf("processId = %#v", raw["processId"])
+	}
+}
+
+func helperExec(t *testing.T, behavior map[string]string, calls *[]string) ExecFunc {
+	t.Helper()
+	counts := map[string]int{}
+	return func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		key := strings.Join(args, " ")
+		*calls = append(*calls, key)
+		counts[key]++
+		mode := behavior[key]
+		if mode == "fail_once_then_ok" && counts[key] > 1 {
+			mode = "ok"
+		}
+		if mode == "hang_once_then_fail" {
+			if counts[key] == 1 {
+				mode = "hang"
+			} else {
+				mode = "fail"
+			}
+		}
+		if runtime.GOOS == "windows" {
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestCodexAppClientHelperProcess$")
+			cmd.Env = append(os.Environ(), "POCKLY_CODEXAPP_HELPER=1", "POCKLY_CODEXAPP_HELPER_MODE="+mode)
+			return cmd
+		}
+		return exec.CommandContext(ctx, "/bin/sh", "-c", helperShellScript(mode))
+	}
+}
+
+func helperShellScript(mode string) string {
+	switch mode {
+	case "hang", "hang_once_then_fail":
+		return "while true; do sleep 1; done"
+	case "fail", "fail_once_then_ok":
+		return "exit 2"
+	case "fail_exit":
+		return "exit 3"
+	case "ok_exit":
+		return "exit 0"
+	case "ok":
+		return "while IFS= read -r line; do case \"$line\" in *'\"method\":\"initialize\"'*) printf '%s\\n' '{\"id\":\"1\",\"result\":{}}';; esac; done"
+	default:
+		return "exit 4"
+	}
+}
+
+func TestCodexAppClientHelperProcess(t *testing.T) {
+	if os.Getenv("POCKLY_CODEXAPP_HELPER") != "1" {
+		return
+	}
+	os.Exit(runCodexAppClientHelperProcess())
+}
+
+func runCodexAppClientHelperProcess() int {
+	mode := os.Getenv("POCKLY_CODEXAPP_HELPER_MODE")
+	switch mode {
+	case "hang", "hang_once_then_fail":
+		select {}
+	case "fail", "fail_once_then_ok":
+		return 2
+	case "fail_exit":
+		return 3
+	case "ok_exit":
+		return 0
+	case "ok":
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, `"method":"initialize"`) {
+				_, _ = os.Stdout.WriteString(`{"id":"1","result":{}}` + "\n")
+			}
+		}
+		return 0
+	default:
+		return 4
 	}
 }
 

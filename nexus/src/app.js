@@ -3291,6 +3291,8 @@ async function sessionAgentSettings(request, store, env, sessionID, url) {
       available_model_options: result.available_model_options || [],
       available_permission_modes: result.available_permission_modes || [],
       available_efforts: result.available_efforts || [],
+      codex_app_server_source: result.codex_app_server_source || "",
+      codex_app_server_fallback_reason: result.codex_app_server_fallback_reason || "",
     });
   } catch (error) {
     return mapControlError(error);

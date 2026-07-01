@@ -7129,6 +7129,9 @@ export function ClaudeCodePillsRow({
   const effortLabel = effortLabelFor(current.effort);
   const permissionLabel = permissionLabelFor(current.permission_mode);
   const pillsDisabled = disabled || !snapshot;
+  const codexAppServerNote = agent === "codex" && snapshot && isCodexIsolatedAppServerSource(snapshot.codex_app_server_source)
+    ? "Codex App may need you to reopen this session to show Pockly-sent messages."
+    : "";
 
   return (
     <div className="composer-pills-row" role="toolbar" aria-label={tx("pills.toolbarAria")}>
@@ -7176,11 +7179,18 @@ export function ClaudeCodePillsRow({
           silent (the retry self-heals) so "daemon offline" never flashes under
           the pills on a flaky connection. */}
       {error && !snapshot ? <div className="composer-pills-error" role="status">{error}</div> : null}
+      {codexAppServerNote ? <div className="composer-pills-error" role="status">{codexAppServerNote}</div> : null}
       {sheetDiffs.length > 0 ? (
         <SessionDiffSheet diffs={sheetDiffs} open={diffsOpen} onClose={() => setDiffsOpen(false)} />
       ) : null}
     </div>
   );
+}
+
+export function isCodexIsolatedAppServerSource(source?: string): boolean {
+  return source === "stdio_isolated" ||
+    source === "proxy_failed_fallback_stdio" ||
+    source === "daemon_start_failed_fallback_stdio";
 }
 
 type ConfigOption = { value: string; label: string; active: boolean };

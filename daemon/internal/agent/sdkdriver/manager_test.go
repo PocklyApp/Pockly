@@ -67,13 +67,24 @@ type fakeCodexAppRuntime struct {
 	signalOnly            bool
 	errorOnly             bool
 	closed                bool
+	source                string
+	fallbackReason        string
 }
 
 func (f *fakeCodexAppRuntime) factory(ctx context.Context, cfg codexapp.Config) (CodexAppRuntime, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cfg = cfg
+	if f.source == "" {
+		f.source = codexapp.SourceProxyExisting
+	}
 	return f, nil
+}
+
+func (f *fakeCodexAppRuntime) AppServerSource() (string, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.source, f.fallbackReason
 }
 
 func (f *fakeCodexAppRuntime) ThreadStart(ctx context.Context, p codexapp.ThreadStartParams) (codexapp.ThreadStartResult, error) {
@@ -381,6 +392,9 @@ func TestManagerCodexUsesAppServerForNewSession(t *testing.T) {
 	}
 	if got := ext.ClaudeSessionID(); got != "codex-thread-real" {
 		t.Fatalf("ExternalSession sid = %q, want codex-thread-real", got)
+	}
+	if info := m.CodexAppServerInfo("codex-thread-real"); info.Source != codexapp.SourceProxyExisting {
+		t.Fatalf("CodexAppServerInfo(real thread) = %+v, want source %q", info, codexapp.SourceProxyExisting)
 	}
 	if len(rec.Snapshot()) != 0 {
 		t.Fatalf("app-server fake should not spawn legacy process, got %+v", rec.Snapshot())
