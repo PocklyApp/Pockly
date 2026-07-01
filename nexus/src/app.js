@@ -43,7 +43,9 @@ const automaticSessionBackfillTurnLimit = 1000;
 const defaultSessionTurnWindowLimit = 100;
 const maxSessionTurnWindowLimit = 500;
 const defaultHostsOnlineCacheMs = 1000;
-const defaultTurnPayloadBatchRawBytes = 1024 * 1024;
+const defaultCatalogChangeDebounceMs = 5000;
+const defaultTurnPayloadBatchRawBytes = 128 * 1024;
+const defaultTurnPayloadBatchMaxAgeMs = 30 * 1000;
 const defaultEdgeRetentionProfile = "standard";
 const defaultHotTurnMaxPayloadBytes = 32 * 1024;
 const defaultGlobalHotTurnPruneIntervalMs = 10 * 60 * 1000;
@@ -1431,12 +1433,23 @@ async function appendSessionCatalogChanges(store, changes, env = null) {
   }));
   if (rows.length === 0) return;
   if (typeof store.appendSessionCatalogChanges === "function") {
-    await store.appendSessionCatalogChanges(rows);
+    const result = await store.appendSessionCatalogChanges(rows, {
+      debounceMs: catalogChangeDebounceMs(env),
+    });
+    const written = Number(result?.written ?? rows.length);
+    const updated = Number(result?.updated ?? 0);
+    recordCostMetric(env, "catalog_changes_written", written);
+    recordCostMetric(env, "catalog_changes_updated", updated);
+    recordCostMetric(env, "catalog_change_rows_written", written + updated);
+    recordCostMetric(env, "catalog_changes_coalesced", Number(result?.coalesced ?? 0));
+    recordCostMetric(env, "catalog_changes_skipped", Number(result?.skipped ?? 0));
     await notifySessionCatalogChanged(env, rows);
     return;
   }
   if (typeof store.appendSessionCatalogChange !== "function") return;
   for (const row of rows) await store.appendSessionCatalogChange(row);
+  recordCostMetric(env, "catalog_changes_written", rows.length);
+  recordCostMetric(env, "catalog_change_rows_written", rows.length);
   await notifySessionCatalogChanged(env, rows);
 }
 
@@ -1774,7 +1787,7 @@ async function listSessionsDelta(request, store, env, url) {
   if (typeof store.listSessionCatalogChanges !== "function") {
     return errorResponse("session catalog delta unavailable", ErrorCode.NotSupported, { status: 501 });
   }
-  if (await sessionCatalogCursorExpired(store, user.user_id, since)) {
+  if (await sessionCatalogCursorExpired(store, user.user_id, since, env)) {
     return await sessionCatalogInitialPageResponse(store, user.user_id, limit, "", { reset: true });
   }
   const changes = await store.listSessionCatalogChanges(user.user_id, { since, limit: limit + 1 });
@@ -1835,11 +1848,25 @@ async function sessionCatalogInitialPageResponse(store, userID, limit, rawPageCu
   });
 }
 
-async function sessionCatalogCursorExpired(store, userID, since) {
+async function sessionCatalogCursorExpired(store, userID, since, env = {}) {
   if (!since || since === "sc_0000000000000_000000_000000") return false;
   if (typeof store.sessionCatalogCursorBounds !== "function") return false;
   const bounds = await store.sessionCatalogCursorBounds(userID);
-  return Boolean(bounds.oldest && since < bounds.oldest);
+  if (!bounds.oldest || since >= bounds.oldest) return false;
+  const sinceMs = sessionCatalogCursorMillis(since);
+  const oldestMs = sessionCatalogCursorMillis(bounds.oldest);
+  const debounceGraceMs = Math.max(1000, catalogChangeDebounceMs(env));
+  if (Number.isFinite(sinceMs) && Number.isFinite(oldestMs) && oldestMs - sinceMs <= debounceGraceMs) {
+    return false;
+  }
+  return true;
+}
+
+function sessionCatalogCursorMillis(cursor) {
+  const match = String(cursor || "").match(/^sc_(\d{13})_/);
+  if (!match) return NaN;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? value : NaN;
 }
 
 function sessionCatalogDeltaLimit(params) {
@@ -2556,6 +2583,7 @@ function createRequestRuntime(env = {}, ctx = {}) {
   });
   const runtimeEnv = {
     ...env,
+    ...(costTracker ? { POCKLY_COST_TRACKER: costTracker } : {}),
     ...(providers.controlHub ? { POCKLY_CONTROL_HUB: providers.controlHub } : {}),
     ...(!providers.controlHub && controlHubFactory ? { POCKLY_CONTROL_HUB_FACTORY: controlHubFactory } : {}),
     POCKLY_BROWSER_COMMAND_HANDLER: createBrowserRealtimeCommandHandler(requireNexusProvider(providers, "store"), env),
@@ -3607,6 +3635,15 @@ function createEndpointCostTracker() {
     object_reads: 0,
     object_writes: 0,
     control_requests: 0,
+    catalog_changes_written: 0,
+    catalog_changes_updated: 0,
+    catalog_change_rows_written: 0,
+    catalog_changes_coalesced: 0,
+    catalog_changes_skipped: 0,
+    history_blob_puts: 0,
+    history_blob_raw_bytes: 0,
+    history_blob_encoded_bytes: 0,
+    turn_rows_written: 0,
   };
 }
 
@@ -3682,6 +3719,15 @@ async function recordEndpointCostTelemetry(provider, request, response, fields =
     object_writes: Number(costTracker.object_writes || 0),
     control_requests: Number(costTracker.control_requests || 0),
     do_requests: Number(costTracker.control_requests || 0),
+    catalog_changes_written: Number(costTracker.catalog_changes_written || 0),
+    catalog_changes_updated: Number(costTracker.catalog_changes_updated || 0),
+    catalog_change_rows_written: Number(costTracker.catalog_change_rows_written || 0),
+    catalog_changes_coalesced: Number(costTracker.catalog_changes_coalesced || 0),
+    catalog_changes_skipped: Number(costTracker.catalog_changes_skipped || 0),
+    history_blob_puts: Number(costTracker.history_blob_puts || 0),
+    history_blob_raw_bytes: Number(costTracker.history_blob_raw_bytes || 0),
+    history_blob_encoded_bytes: Number(costTracker.history_blob_encoded_bytes || 0),
+    turn_rows_written: Number(costTracker.turn_rows_written || 0),
     timestamp: new Date().toISOString(),
   };
   const payload = JSON.stringify({ events: [event] });
@@ -4867,7 +4913,14 @@ async function externalizeTurnPayloads(turns, env = {}, providers = {}) {
   const threshold = turnPayloadBlobThreshold(env);
   const blobStore = providers.historyBlobStore;
   if (!blobStore || threshold <= 0 || !turns.length) return await applyHotTurnPayloadPolicy(turns, env);
-  return await externalizeTurnPayloadBatch(turns, blobStore, threshold, turnPayloadBatchRawBytes(env));
+  return await externalizeTurnPayloadBatch(
+    turns,
+    blobStore,
+    threshold,
+    turnPayloadBatchRawBytes(env),
+    turnPayloadBatchMaxAgeMs(env),
+    env,
+  );
 }
 
 async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
@@ -4880,6 +4933,7 @@ async function upsertChangedTurns(store, turns, env = {}, providers = {}) {
   const changed = await filterChangedTurnRecords(store, candidates);
   if (!changed.length) return { changedTurns: [], prunedSessions: [] };
   await store.upsertTurns(useHistoryBlobStorage ? await externalizeTurnPayloads(changed, env, providers) : changed);
+  recordCostMetric(env, "turn_rows_written", changed.length);
   let prunedSessions = [];
   if (typeof store.pruneHotTurnCache === "function") {
     const perUser = hotTurnsPerUser(env);
@@ -5015,7 +5069,7 @@ function turnSessionKey(turn) {
   return `${userID}\x00${deviceID}\x00${sessionID}`;
 }
 
-async function externalizeTurnPayloadBatch(turns, blobStore, threshold, maxBatchRawBytes) {
+async function externalizeTurnPayloadBatch(turns, blobStore, threshold, maxBatchRawBytes, maxBatchAgeMs, env = {}) {
   const out = [...turns];
   const candidates = [];
   for (let index = 0; index < turns.length; index += 1) {
@@ -5028,34 +5082,50 @@ async function externalizeTurnPayloadBatch(turns, blobStore, threshold, maxBatch
       turn,
       payload,
       bytes: utf8ByteLength(payload),
+      timestampMs: Date.parse(turn.timestamp || ""),
       sessionKey: `${turn.user_id}\x00${turn.device_id}\x00${turn.session_id}`,
     });
   }
-  const singles = [];
   for (const group of groupedPayloadCandidates(candidates)) {
     let batch = [];
     let batchBytes = 0;
+    let batchStartedAt = 0;
     const flush = async () => {
-      if (batch.length === 1) {
-        singles.push(batch[0]);
-      } else if (batch.length > 1) {
-        const pointers = await externalizeTurnPayloadCandidateBatch(batch, blobStore);
+      if (batch.length > 0) {
+        const pointers = await externalizeTurnPayloadCandidateBatch(batch, blobStore, env);
         for (const [index, pointer] of pointers) out[index] = { ...out[index], payload: JSON.stringify(pointer) };
       }
       batch = [];
       batchBytes = 0;
+      batchStartedAt = 0;
     };
     for (const candidate of group) {
-      if (batch.length > 0 && batchBytes + candidate.bytes > maxBatchRawBytes) await flush();
+      if (
+        batch.length > 0 &&
+        (batchBytes + candidate.bytes > maxBatchRawBytes ||
+          payloadBatchAgeExceeded(batchStartedAt, candidate.timestampMs, maxBatchAgeMs))
+      ) {
+        await flush();
+      }
       batch.push(candidate);
       batchBytes += candidate.bytes;
+      if ((!Number.isFinite(batchStartedAt) || batchStartedAt <= 0) && Number.isFinite(candidate.timestampMs)) {
+        batchStartedAt = candidate.timestampMs;
+      }
     }
     await flush();
   }
-  await Promise.all(singles.map(async (candidate) => {
-    out[candidate.index] = await externalizeTurnPayload(candidate.turn, blobStore, threshold);
-  }));
   return out;
+}
+
+function payloadBatchAgeExceeded(startedAt, nextAt, maxBatchAgeMs) {
+  return (
+    Number.isFinite(startedAt) &&
+    startedAt > 0 &&
+    Number.isFinite(nextAt) &&
+    nextAt > startedAt &&
+    nextAt - startedAt > maxBatchAgeMs
+  );
 }
 
 function groupedPayloadCandidates(candidates) {
@@ -5068,7 +5138,7 @@ function groupedPayloadCandidates(candidates) {
   return [...groups.values()].map((group) => group.sort((left, right) => Number(left.turn.seq) - Number(right.turn.seq)));
 }
 
-async function externalizeTurnPayloadCandidateBatch(candidates, blobStore) {
+async function externalizeTurnPayloadCandidateBatch(candidates, blobStore, env = {}) {
   const items = [];
   for (const candidate of candidates) {
     items.push({
@@ -5094,6 +5164,9 @@ async function externalizeTurnPayloadCandidateBatch(candidates, blobStore) {
       ...(encoded.encoding ? { contentEncoding: encoded.encoding } : {}),
     },
   });
+  recordCostMetric(env, "history_blob_puts", 1);
+  recordCostMetric(env, "history_blob_raw_bytes", items.reduce((sum, item) => sum + item.bytes, 0));
+  recordCostMetric(env, "history_blob_encoded_bytes", encoded.byteLength);
   return new Map(candidates.map((candidate, index) => [candidate.index, {
     pockly_payload_ref: "blob_batch",
     version: turnPayloadBlobPointerVersion,
@@ -5132,6 +5205,14 @@ async function externalizeTurnPayload(turn, blobStore, threshold) {
       ...(encoded.encoding ? { encoding: encoded.encoding } : {}),
     }),
   };
+}
+
+function recordCostMetric(env = {}, field, amount = 1) {
+  const tracker = env?.POCKLY_COST_TRACKER;
+  if (!tracker || !field) return;
+  const value = Number(amount || 0);
+  if (!Number.isFinite(value) || value === 0) return;
+  tracker[field] = Number(tracker[field] || 0) + value;
 }
 
 async function resolveTurnPayload(payload, providers = {}, blobCache = new Map(), turn = null) {
@@ -5247,6 +5328,12 @@ function historyBlobStorageEnabled(env = {}) {
   return value === true || value === "1" || value === "true";
 }
 
+function catalogChangeDebounceMs(env = {}) {
+  const value = Number(env?.POCKLY_CATALOG_CHANGE_DEBOUNCE_MS ?? defaultCatalogChangeDebounceMs);
+  if (!Number.isFinite(value) || value < 0) return defaultCatalogChangeDebounceMs;
+  return Math.floor(value);
+}
+
 async function applyHotTurnPayloadPolicy(turns, env = {}) {
   const maxPayloadBytes = hotTurnMaxPayloadBytes(env);
   if (maxPayloadBytes <= 0) return turns;
@@ -5330,6 +5417,12 @@ function localOnlyPayloadText(bytes, payload) {
 function turnPayloadBatchRawBytes(env = {}) {
   const value = Number(env.POCKLY_TURN_PAYLOAD_BATCH_RAW_BYTES ?? defaultTurnPayloadBatchRawBytes);
   if (!Number.isFinite(value) || value <= 0) return defaultTurnPayloadBatchRawBytes;
+  return Math.max(1, Math.floor(value));
+}
+
+function turnPayloadBatchMaxAgeMs(env = {}) {
+  const value = Number(env.POCKLY_TURN_PAYLOAD_BATCH_MAX_AGE_MS ?? defaultTurnPayloadBatchMaxAgeMs);
+  if (!Number.isFinite(value) || value <= 0) return defaultTurnPayloadBatchMaxAgeMs;
   return Math.max(1, Math.floor(value));
 }
 

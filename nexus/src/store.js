@@ -432,23 +432,69 @@ export class InMemoryNexusStore {
       .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)));
   }
 
-  async appendSessionCatalogChange(change) {
+  async appendSessionCatalogChange(change, options = {}) {
     const next = normalizeSessionCatalogChange(change);
-    this.appendSessionCatalogChangeRows([next]);
+    const result = this.appendSessionCatalogChangeRows([next], options);
+    next.coalesced = result.coalesced;
+    next.updated = result.updated;
+    next.skipped = result.skipped;
     return next;
   }
 
-  async appendSessionCatalogChanges(changes = []) {
+  async appendSessionCatalogChanges(changes = [], options = {}) {
     const out = changes.map(normalizeSessionCatalogChange);
-    this.appendSessionCatalogChangeRows(out);
-    return out;
+    return this.appendSessionCatalogChangeRows(out, options);
   }
 
-  appendSessionCatalogChangeRows(rows) {
-    this.sessionCatalogChanges.push(...rows);
+  appendSessionCatalogChangeRows(rows, options = {}) {
+    const debounceMs = positiveInteger(options.debounceMs ?? options.debounce_ms, 0);
+    const inputCount = rows.length;
+    rows = coalesceSessionCatalogChangeRowsForWrite(rows, debounceMs);
+    let written = 0;
+    let coalesced = inputCount - rows.length;
+    let skipped = 0;
+    let updated = 0;
+    const recentBySession = new Map();
+    for (const row of rows) {
+      const key = catalogChangeSessionKey(row);
+      const inCallRecent = recentBySession.get(key) || null;
+      const recent = row.change_type === "upsert" && debounceMs > 0
+        ? inCallRecent || this.findRecentSessionCatalogChange(row, debounceMs)
+        : null;
+      if (recent?.change_type === "upsert") {
+        Object.assign(recent, row);
+        updated += 1;
+      } else {
+        this.sessionCatalogChanges.push(row);
+        written += 1;
+        recentBySession.set(key, row);
+      }
+    }
     if (this.sessionCatalogChanges.length > 10_000) {
       this.sessionCatalogChanges.splice(0, this.sessionCatalogChanges.length - 10_000);
     }
+    return { rows, written, updated, coalesced, skipped };
+  }
+
+  findRecentSessionCatalogChange(row, debounceMs) {
+    const rowMs = Date.parse(row.created_at || "");
+    if (!Number.isFinite(rowMs)) return null;
+    const cutoff = rowMs - debounceMs;
+    for (let index = this.sessionCatalogChanges.length - 1; index >= 0; index -= 1) {
+      const existing = this.sessionCatalogChanges[index];
+      const existingMs = Date.parse(existing.created_at || "");
+      if (
+        existing.user_id === row.user_id &&
+        existing.device_id === row.device_id &&
+        existing.session_id === row.session_id &&
+        Number.isFinite(existingMs) &&
+        existingMs >= cutoff &&
+        existingMs <= rowMs
+      ) {
+        return existing;
+      }
+    }
+    return null;
   }
 
   async listSessionCatalogChanges(userID, options = {}) {
@@ -859,6 +905,7 @@ export class SQLNexusStore {
   constructor(db, options = {}) {
     this.db = db;
     this.sessionEventPruneByUser = new Map();
+    this.catalogChangeDebounceBatchSize = positiveInteger(options.catalogChangeDebounceBatchSize, 100);
     this.sessionUpsertBatchSize = positiveInteger(options.sessionUpsertBatchSize, 40);
     this.turnUpsertBatchSize = positiveInteger(options.turnUpsertBatchSize, 100);
   }
@@ -1674,25 +1721,53 @@ export class SQLNexusStore {
     return (result.results ?? []).map(normalizeSessionRow);
   }
 
-  async appendSessionCatalogChange(change) {
+  async appendSessionCatalogChange(change, options = {}) {
     const row = normalizeSessionCatalogChange(change);
-    await this._appendSessionCatalogChangeStatement(row).run();
-    await this.pruneSessionCatalogChangesIfDue(row.user_id);
-    return row;
+    const result = await this.writeSessionCatalogChangeRows([row], options);
+    if (result.written > 0) await this.pruneSessionCatalogChangesIfDue(row.user_id);
+    return { ...row, coalesced: result.coalesced, updated: result.updated, skipped: result.skipped };
   }
 
-  async appendSessionCatalogChanges(changes = []) {
+  async appendSessionCatalogChanges(changes = [], options = {}) {
     if (!changes.length) return [];
-    const out = [];
-    const userIDs = new Set();
-    for (const change of changes) {
-      const row = normalizeSessionCatalogChange(change);
-      await this._appendSessionCatalogChangeStatement(row).run();
-      out.push(row);
-      if (row.user_id) userIDs.add(row.user_id);
+    const rows = changes.map(normalizeSessionCatalogChange);
+    const result = await this.writeSessionCatalogChangeRows(rows, options);
+    if (result.written > 0) {
+      const userIDs = new Set(rows.map((row) => row.user_id).filter(Boolean));
+      for (const userID of userIDs) await this.pruneSessionCatalogChangesIfDue(userID);
     }
-    for (const userID of userIDs) await this.pruneSessionCatalogChangesIfDue(userID);
-    return out;
+    return result;
+  }
+
+  async writeSessionCatalogChangeRows(rows, options = {}) {
+    const debounceMs = positiveInteger(options.debounceMs ?? options.debounce_ms, 0);
+    const inputCount = rows.length;
+    rows = coalesceSessionCatalogChangeRowsForWrite(rows, debounceMs);
+    let written = 0;
+    let coalesced = inputCount - rows.length;
+    let skipped = 0;
+    let updated = 0;
+    const recentBySession = new Map();
+    for (let i = 0; i < rows.length; i += this.catalogChangeDebounceBatchSize) {
+      const chunk = rows.slice(i, i + this.catalogChangeDebounceBatchSize);
+      for (const row of chunk) {
+        const key = catalogChangeSessionKey(row);
+        const inCallRecent = recentBySession.get(key) || null;
+        const recent = row.change_type === "upsert" && debounceMs > 0
+          ? inCallRecent || await this.recentSessionCatalogChange(row, debounceMs)
+          : null;
+        if (recent?.change_type === "upsert") {
+          if (recent.change_id) await this._updateSessionCatalogChangeStatement(recent.change_id, row).run();
+          else Object.assign(recent, row);
+          updated += 1;
+        } else {
+          await this._appendSessionCatalogChangeStatement(row).run();
+          written += 1;
+          recentBySession.set(key, row);
+        }
+      }
+    }
+    return { rows, written, updated, coalesced, skipped };
   }
 
   _appendSessionCatalogChangeStatement(change) {
@@ -1708,6 +1783,43 @@ export class SQLNexusStore {
       change.session_row,
       change.created_at,
     );
+  }
+
+  _updateSessionCatalogChangeStatement(changeID, change) {
+    return this.db.prepare(`
+      UPDATE session_catalog_changes
+      SET change_id = ?, session_row = ?, created_at = ?
+      WHERE change_id = ?
+    `).bind(
+      change.change_id,
+      change.session_row,
+      change.created_at,
+      changeID,
+    );
+  }
+
+  async recentSessionCatalogChange(change, debounceMs) {
+    const createdAtMs = Date.parse(change.created_at || "");
+    if (!Number.isFinite(createdAtMs)) return null;
+    const cutoff = new Date(createdAtMs - debounceMs).toISOString();
+    const upper = new Date(createdAtMs).toISOString();
+    return await this.db.prepare(`
+      SELECT change_id, change_type, created_at
+      FROM session_catalog_changes
+      WHERE user_id = ?
+        AND device_id = ?
+        AND session_id = ?
+        AND created_at >= ?
+        AND created_at <= ?
+      ORDER BY created_at DESC, change_id DESC
+      LIMIT 1
+    `).bind(
+      change.user_id,
+      change.device_id,
+      change.session_id,
+      cutoff,
+      upper,
+    ).first();
   }
 
   async listSessionCatalogChanges(userID, options = {}) {
@@ -2772,6 +2884,36 @@ function normalizeSessionCatalogChange(change) {
       ? change.session_row ?? null
       : JSON.stringify(change.session_row),
   };
+}
+
+function coalesceSessionCatalogChangeRowsForWrite(rows = [], debounceMs = 0) {
+  if (!debounceMs || rows.length <= 1) return rows;
+  const out = [];
+  const indexBySession = new Map();
+  for (const row of rows) {
+    const key = catalogChangeSessionKey(row);
+    const existingIndex = row.change_type === "upsert" ? indexBySession.get(key) : undefined;
+    const existing = existingIndex === undefined ? null : out[existingIndex];
+    if (existing && existing.change_type === "upsert" && catalogChangeRowsWithinDebounce(existing, row, debounceMs)) {
+      out[existingIndex] = row;
+      continue;
+    }
+    out.push(row);
+    if (row.change_type === "upsert") indexBySession.set(key, out.length - 1);
+    else indexBySession.delete(key);
+  }
+  return out;
+}
+
+function catalogChangeSessionKey(row) {
+  return `${row.user_id}\x00${row.device_id}\x00${row.session_id}`;
+}
+
+function catalogChangeRowsWithinDebounce(left, right, debounceMs) {
+  const leftMs = Date.parse(left.created_at || "");
+  const rightMs = Date.parse(right.created_at || "");
+  if (!Number.isFinite(leftMs) || !Number.isFinite(rightMs)) return false;
+  return rightMs >= leftMs && rightMs - leftMs <= debounceMs;
 }
 
 function emptyCatalogChangeCursor() {

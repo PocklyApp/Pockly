@@ -79,6 +79,133 @@ describe("Node self-hosted Nexus storage adapters", () => {
     }
   });
 
+  it("updates repeated SQL catalog change rows within the debounce window", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-catalog-debounce-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      await store.upsertUser({
+        user_id: "usr_catalog_debounce",
+        email: "catalog-debounce@example.local",
+        name: "Catalog Debounce User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+
+      const first = await store.appendSessionCatalogChanges([{
+        user_id: "usr_catalog_debounce",
+        device_id: "dd_catalog_debounce",
+        session_id: "sess_catalog_debounce",
+        change_type: "upsert",
+        session_row: { session_id: "sess_catalog_debounce", title: "first" },
+        created_at: "2026-06-06T00:00:00.000Z",
+      }], { debounceMs: 5000 });
+      assert.equal(first.written, 1);
+      assert.equal(first.skipped, 0);
+
+      const cursor = await store.currentSessionCatalogCursor("usr_catalog_debounce");
+      const second = await store.appendSessionCatalogChanges([{
+        user_id: "usr_catalog_debounce",
+        device_id: "dd_catalog_debounce",
+        session_id: "sess_catalog_debounce",
+        change_type: "upsert",
+        session_row: { session_id: "sess_catalog_debounce", title: "second" },
+        created_at: "2026-06-06T00:00:04.000Z",
+      }], { debounceMs: 5000 });
+      assert.equal(second.written, 0);
+      assert.equal(second.updated, 1);
+      assert.equal(second.skipped, 0);
+
+      const changes = await store.listSessionCatalogChanges("usr_catalog_debounce", { since: "", limit: 10 });
+      assert.equal(changes.length, 1);
+      assert.notEqual(changes[0].change_id, cursor);
+      assert.match(changes[0].session_row, /second/);
+      const updatedChanges = await store.listSessionCatalogChanges("usr_catalog_debounce", { since: cursor, limit: 10 });
+      assert.equal(updatedChanges.length, 1);
+      assert.match(updatedChanges[0].session_row, /second/);
+
+      const deleted = await store.appendSessionCatalogChanges([{
+        user_id: "usr_catalog_debounce",
+        device_id: "dd_catalog_debounce",
+        session_id: "sess_catalog_debounce",
+        change_type: "delete",
+        session_row: null,
+        created_at: "2026-06-06T00:00:04.500Z",
+      }], { debounceMs: 5000 });
+      assert.equal(deleted.written, 1);
+      assert.equal(deleted.skipped, 0);
+
+      const recreated = await store.appendSessionCatalogChanges([{
+        user_id: "usr_catalog_debounce",
+        device_id: "dd_catalog_debounce",
+        session_id: "sess_catalog_debounce",
+        change_type: "upsert",
+        session_row: { session_id: "sess_catalog_debounce", title: "recreated" },
+        created_at: "2026-06-06T00:00:05.000Z",
+      }], { debounceMs: 5000 });
+      assert.equal(recreated.written, 1);
+      assert.equal(recreated.skipped, 0);
+
+      const finalChanges = await store.listSessionCatalogChanges("usr_catalog_debounce", { since: cursor, limit: 10 });
+      assert.deepEqual(finalChanges.map((change) => change.change_type), ["upsert", "delete", "upsert"]);
+      assert.match(finalChanges[0].session_row, /second/);
+      assert.match(finalChanges[2].session_row, /recreated/);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps SQL catalog delete and recreate in the same debounce batch", async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-catalog-recreate-"));
+    const databasePath = path.join(dir, "nexus.sqlite");
+    const store = createSQLiteNexusStore({ databasePath });
+    try {
+      await store.upsertUser({
+        user_id: "usr_catalog_recreate",
+        email: "catalog-recreate@example.local",
+        name: "Catalog Recreate User",
+        created_at: "2026-06-06T00:00:00Z",
+        updated_at: "2026-06-06T00:00:00Z",
+      });
+
+      await store.appendSessionCatalogChanges([{
+        user_id: "usr_catalog_recreate",
+        device_id: "dd_catalog_recreate",
+        session_id: "sess_catalog_recreate",
+        change_type: "upsert",
+        session_row: { session_id: "sess_catalog_recreate", title: "first" },
+        created_at: "2026-06-06T00:00:00.000Z",
+      }], { debounceMs: 5000 });
+      const cursor = await store.currentSessionCatalogCursor("usr_catalog_recreate");
+
+      const result = await store.appendSessionCatalogChanges([{
+        user_id: "usr_catalog_recreate",
+        device_id: "dd_catalog_recreate",
+        session_id: "sess_catalog_recreate",
+        change_type: "delete",
+        session_row: null,
+        created_at: "2026-06-06T00:00:04.000Z",
+      }, {
+        user_id: "usr_catalog_recreate",
+        device_id: "dd_catalog_recreate",
+        session_id: "sess_catalog_recreate",
+        change_type: "upsert",
+        session_row: { session_id: "sess_catalog_recreate", title: "recreated" },
+        created_at: "2026-06-06T00:00:04.500Z",
+      }], { debounceMs: 5000 });
+      assert.equal(result.written, 2);
+      assert.equal(result.skipped, 0);
+
+      const changes = await store.listSessionCatalogChanges("usr_catalog_recreate", { since: cursor, limit: 10 });
+      assert.deepEqual(changes.map((change) => change.change_type), ["delete", "upsert"]);
+      assert.match(changes[1].session_row, /recreated/);
+    } finally {
+      store.close();
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("supersedes SQL daemon devices and migrates session state", async () => {
     const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pockly-nexus-supersede-"));
     const databasePath = path.join(dir, "nexus.sqlite");
