@@ -1102,8 +1102,6 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     return errorResponse("daemon device mismatch", ErrorCode.Forbidden, { status: 403 });
   }
   const now = new Date().toISOString();
-  await store.touchDevice(device.device_id, now);
-  timings.mark("touch_device");
   const sessions = Array.isArray(body.sessions) ? body.sessions : [];
   const turns = Array.isArray(body.turns) ? body.turns : [];
   const sessionIDs = sessions.map((session) => String(session?.session_id || "").trim()).filter(Boolean);
@@ -1286,6 +1284,15 @@ async function daemonSync(request, store, env = {}, providers = {}) {
   const knownWindows = turns.length === 0
     ? await knownSessionWindows(store, user.user_id, device.device_id, knownWindowSessions)
     : [];
+  const durableWriteCount = changedTurns.length +
+    changedSessionCount +
+    repairedPrunedSessions.length +
+    deletedSessionCount +
+    Number(openedBackfillSessionIDs.size || 0);
+  if (shouldTouchDeviceForDaemonSync(env, durableWriteCount)) {
+    await store.touchDevice(device.device_id, now);
+  }
+  timings.mark("touch_device");
   return jsonResponse({
     ok: true,
     session_count: sessions.length,
@@ -1300,6 +1307,11 @@ async function daemonSync(request, store, env = {}, providers = {}) {
     timings_ms: timings.finish(),
     ...(knownWindows.length ? { known_windows: knownWindows } : {}),
   });
+}
+
+function shouldTouchDeviceForDaemonSync(env = {}, durableWriteCount = 0) {
+  if (Number(durableWriteCount || 0) > 0) return true;
+  return String(env.POCKLY_NEXUS_RUNTIME || env.NEXUS_RUNTIME || "").trim() !== "managed";
 }
 
 function mergeSessionRecordsByID(base = [], updates = []) {

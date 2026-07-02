@@ -908,6 +908,7 @@ export class SQLNexusStore {
     this.catalogChangeDebounceBatchSize = positiveInteger(options.catalogChangeDebounceBatchSize, 100);
     this.sessionUpsertBatchSize = positiveInteger(options.sessionUpsertBatchSize, 40);
     this.turnUpsertBatchSize = positiveInteger(options.turnUpsertBatchSize, 100);
+    this.deviceTouchMinIntervalMs = positiveInteger(options.deviceTouchMinIntervalMs, 60_000);
   }
 
   async upsertUser(user) {
@@ -1213,7 +1214,7 @@ export class SQLNexusStore {
   async touchDevice(deviceID, at) {
     const device = await this.getDevice(deviceID);
     if (!device) return null;
-    if (!shouldPersistDeviceTouch(device.last_seen_at, at)) return device;
+    if (!shouldPersistDeviceTouch(device.last_seen_at, at, this.deviceTouchMinIntervalMs)) return device;
     await this.db.prepare(`UPDATE devices SET last_seen_at = ?, updated_at = ? WHERE device_id = ?`).bind(at, at, deviceID).run();
     if (device?.computer_id && device.device_type === "daemon") {
       await this.db.prepare(`
@@ -2944,11 +2945,11 @@ function sessionCatalogRowAfterCursor(session, cursor) {
   return row.session_id > after.session_id;
 }
 
-function shouldPersistDeviceTouch(previous, next) {
+function shouldPersistDeviceTouch(previous, next, minIntervalMs = 60_000) {
   const previousMs = Date.parse(previous || "");
   const nextMs = Date.parse(next || "");
   if (!Number.isFinite(previousMs) || !Number.isFinite(nextMs)) return true;
-  return nextMs - previousMs >= 60_000;
+  return nextMs - previousMs >= Math.max(60_000, Number(minIntervalMs) || 0);
 }
 
 function positiveInteger(value, fallback) {

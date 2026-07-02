@@ -23,8 +23,8 @@ import (
 	"github.com/PocklyApp/Pockly/daemon/internal/device"
 )
 
-// Device access tokens from /api/device-challenge/verify are short-lived
-// (Nexus TTL ~15m), but every authenticated daemon→Nexus call
+// Daemon control tokens from /api/device-challenge/verify are short-lived
+// (Nexus daemon-ws TTL ~60m), but every authenticated daemon→Nexus call
 // (SyncHistory, …) used to re-run the full challenge→verify handshake. The
 // Nexus rate-limits /api/device-challenge per-device + per-IP, so the 2s
 // Nexus sync loop could blow past the limit within a minute and every sync
@@ -35,7 +35,8 @@ import (
 // failure so a Nexus restart — which rotates Nexus token signing
 // key and invalidates every outstanding token — self-heals on the next
 // call instead of failing for the whole TTL.
-const deviceAccessTokenTTL = 10 * time.Minute
+const daemonAccessTokenTTL = 55 * time.Minute
+const defaultDeviceAccessTokenTTL = 10 * time.Minute
 
 type cachedDeviceToken struct {
 	token     string
@@ -66,8 +67,15 @@ func storeDeviceToken(deviceID, audience, token string) {
 	defer deviceTokenMu.Unlock()
 	deviceTokenCache[deviceTokenCacheKey(deviceID, audience)] = cachedDeviceToken{
 		token:     token,
-		expiresAt: time.Now().Add(deviceAccessTokenTTL),
+		expiresAt: time.Now().Add(deviceAccessTokenTTL(audience)),
 	}
+}
+
+func deviceAccessTokenTTL(audience string) time.Duration {
+	if audience == audienceDaemonWS {
+		return daemonAccessTokenTTL
+	}
+	return defaultDeviceAccessTokenTTL
 }
 
 func invalidateDeviceToken(deviceID, audience string) {

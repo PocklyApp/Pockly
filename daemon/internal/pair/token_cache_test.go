@@ -45,6 +45,18 @@ func TestDeviceTokenCache(t *testing.T) {
 	invalidateDeviceToken(dev, aud)
 }
 
+func TestDeviceAccessTokenTTLByAudience(t *testing.T) {
+	if got := deviceAccessTokenTTL(audienceDaemonWS); got != daemonAccessTokenTTL {
+		t.Fatalf("daemon-ws TTL = %v, want %v", got, daemonAccessTokenTTL)
+	}
+	if got := deviceAccessTokenTTL(audienceDaemonPairing); got != defaultDeviceAccessTokenTTL {
+		t.Fatalf("daemon-pairing TTL = %v, want %v", got, defaultDeviceAccessTokenTTL)
+	}
+	if got := deviceAccessTokenTTL("browser-ws"); got != defaultDeviceAccessTokenTTL {
+		t.Fatalf("browser-ws TTL = %v, want %v", got, defaultDeviceAccessTokenTTL)
+	}
+}
+
 func TestIsAuthFailure(t *testing.T) {
 	cases := []struct {
 		errStr string

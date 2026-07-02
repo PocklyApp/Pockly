@@ -7,6 +7,7 @@ import { ErrorCode, errorResponse } from "./contract.js";
 
 export const SESSION_COOKIE = "pockly_session";
 export const DEVICE_TOKEN_TTL_SECONDS = 15 * 60;
+export const DAEMON_DEVICE_TOKEN_TTL_SECONDS = 60 * 60;
 export const WEB_SESSION_TTL_SECONDS = 30 * 24 * 60 * 60;
 export const CHALLENGE_TTL_SECONDS = 5 * 60;
 
@@ -21,7 +22,7 @@ export async function sha256Base64URL(value) {
 
 export async function issueDeviceToken(store, device, audience, now = new Date()) {
   const token = await createOpaqueToken("dt");
-  const expiresAt = new Date(now.getTime() + DEVICE_TOKEN_TTL_SECONDS * 1000).toISOString();
+  const expiresAt = new Date(now.getTime() + deviceTokenTTLSeconds(audience) * 1000).toISOString();
   await store.createDeviceToken({
     token_hash: await sha256Base64URL(token),
     user_id: device.user_id,
@@ -31,6 +32,10 @@ export async function issueDeviceToken(store, device, audience, now = new Date()
     created_at: now.toISOString(),
   });
   return token;
+}
+
+export function deviceTokenTTLSeconds(audience) {
+  return audience === "daemon-ws" ? DAEMON_DEVICE_TOKEN_TTL_SECONDS : DEVICE_TOKEN_TTL_SECONDS;
 }
 
 export async function requireWebUser(request, store) {

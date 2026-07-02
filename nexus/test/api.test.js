@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { base64Url, challengeMessage } from "../src/auth.js";
+import { base64Url, challengeMessage, sha256Base64URL } from "../src/auth.js";
 import { createBrowserRealtimeCommandHandler, handleRequest } from "../src/app.js";
 import { InMemoryControlHub } from "../src/control.js";
 import { InMemoryNexusStore } from "../src/store.js";
@@ -142,6 +142,7 @@ describe("Nexus api", () => {
     const verifiedBody = await verified.json();
     assert.equal(verifiedBody.verified, true);
     assert.match(verifiedBody.device_access_token, /^dt_/);
+    assert.equal(deviceTokenTTLMinutes(await deviceTokenRecord(env, verifiedBody.device_access_token)), 15);
 
     const sessions = await call(env, "GET", "/api/sessions", null, {
       authorization: `Bearer ${verifiedBody.device_access_token}`,
@@ -302,6 +303,37 @@ describe("Nexus api", () => {
       signature,
     });
     assert.equal(verified.status, 401);
+  });
+
+  it("issues longer-lived daemon-ws tokens without extending browser or pairing tokens", async () => {
+    const env = testEnv();
+    const cookie = await loginCookie(env);
+    const pairingKeys = await generateSigningKeyPair();
+    const daemon = await loginDaemonWithIdentity(env, cookie, {
+      daemonDeviceID: "dd_token_ttl",
+      returnKeys: true,
+    });
+    const browserKeys = await generateSigningKeyPair();
+    const browser = await registerBrowser(env, cookie, browserKeys.publicKey);
+
+    const daemonToken = await authenticateDevice(env, daemon.daemon_device_id, "daemon-ws", daemon.keys);
+    const browserToken = await authenticateDevice(env, browser.browser_device_id, "browser-ws", browserKeys);
+
+    const createPairing = await call(env, "POST", "/api/pairing-grants", {
+      daemon_device_id: "dd_token_pairing",
+      daemon_pubkey: pairingKeys.publicKey,
+      relay_url: base,
+      device_name: "TTL Pair Host",
+      hostname: "ttl-pair-host",
+      os: "linux",
+      computer_id: "dc_token_pairing",
+    });
+    assert.equal(createPairing.status, 200);
+    const pairingToken = await authenticateDevice(env, "dd_token_pairing", "daemon-pairing", pairingKeys);
+
+    assert.equal(deviceTokenTTLMinutes(await deviceTokenRecord(env, daemonToken)), 60);
+    assert.equal(deviceTokenTTLMinutes(await deviceTokenRecord(env, browserToken)), 15);
+    assert.equal(deviceTokenTTLMinutes(await deviceTokenRecord(env, pairingToken)), 15);
   });
 
   it("does not merge same-host daemon devices without a valid machine fingerprint", async () => {
@@ -1491,7 +1523,7 @@ describe("Nexus api", () => {
 
   it("fast-paths repeated hot-window sync without stats reads or session writes", async () => {
     const store = new CountingNexusStore();
-    const env = testEnv({ store });
+    const env = testEnv({ store, extra: { POCKLY_NEXUS_RUNTIME: "managed" } });
     const cookie = await loginCookie(env);
     const daemon = await loginDaemon(env, cookie);
     const daemonAuth = { authorization: `Bearer ${daemon.device_access_token}` };
@@ -1542,6 +1574,23 @@ describe("Nexus api", () => {
     assert.equal(store.counts.getSessionTurnStats, 0);
     assert.equal(store.counts.upsertSessionRows, 0);
     assert.equal(store.counts.appendSessionCatalogChangeRows, 0);
+    assert.equal(store.counts.touchDevice, 0);
+  });
+
+  it("keeps self-hosted empty daemon sync as a liveness touch", async () => {
+    const store = new CountingNexusStore();
+    const env = testEnv({ store });
+    const cookie = await loginCookie(env);
+    const daemon = await loginDaemon(env, cookie);
+    store.resetCounts();
+
+    const sync = await call(env, "POST", "/api/daemon/sync", {
+      hello: { device_id: daemon.daemon_device_id, version: "0.1.0-test" },
+      sessions: [],
+      turns: [],
+    }, { authorization: `Bearer ${daemon.device_access_token}` });
+    assert.equal(sync.status, 200);
+    assert.equal(store.counts.touchDevice, 1);
   });
 
   it("updates catalog metadata when a repeated hot-window sync changes the session row", async () => {
@@ -5838,6 +5887,15 @@ async function authenticateDevice(env, deviceId, audience, keyPair) {
   return body.device_access_token;
 }
 
+async function deviceTokenRecord(env, token) {
+  return await env.POCKLY_NEXUS_STORE.getDeviceToken(await sha256Base64URL(token));
+}
+
+function deviceTokenTTLMinutes(record) {
+  assert.ok(record, "device token record exists");
+  return Math.round((Date.parse(record.expires_at) - Date.parse(record.created_at)) / 60_000);
+}
+
 async function call(env, method, path, body, headers = {}, ctx = {}) {
   return await callWithContext(env, method, path, body, headers, ctx);
 }
@@ -6036,6 +6094,7 @@ class CountingNexusStore extends InMemoryNexusStore {
       appendSessionCatalogChangeRows: 0,
       appendSessionEvents: 0,
       appendSessionEventRows: 0,
+      touchDevice: 0,
       listDevicesForUser: 0,
       listSessionsForUser: 0,
       countSessionsByDeviceForUser: 0,
@@ -6088,6 +6147,11 @@ class CountingNexusStore extends InMemoryNexusStore {
     this.counts.pruneHotTurnCache += 1;
     this.pruneHotTurnCacheOptions.push(options);
     return await super.pruneHotTurnCache(options);
+  }
+
+  async touchDevice(deviceID, at) {
+    this.counts.touchDevice += 1;
+    return await super.touchDevice(deviceID, at);
   }
 
   async listDeviceSessions(...args) {
