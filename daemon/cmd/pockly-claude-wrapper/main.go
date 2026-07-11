@@ -80,33 +80,180 @@ func main() {
 }
 
 func parseArgs() config {
-	fs := flag.NewFlagSet("pockly-claude-wrapper", flag.ExitOnError)
+	fs := flag.NewFlagSet("pockly-claude-wrapper", flag.ContinueOnError)
 	cwd := fs.String("cwd", "", "working directory for Claude; default current directory")
 	alt := fs.Bool("alt-screen", false, "run inside terminal alternate screen; disables normal terminal scrollback")
 	noRaw := fs.Bool("no-raw", false, "do not put this terminal in raw mode")
 	clear := fs.Bool("clear", true, "clear visible screen before drawing Claude")
-	debug := fs.Bool("debug", false, "print wrapper diagnostics to stderr")
+	// NOTE: wrapper diagnostics are gated by the POCKLY_WRAPPER_DEBUG env
+	// var, NOT a --debug flag. --debug is a real claude flag
+	// (`-d, --debug [filter]`); if the wrapper owned that name it would
+	// swallow `claude --debug` and hard-error on `claude --debug=api,hooks`
+	// (bool parse). The wrapper must not shadow any claude flag name.
 	attachLatest := fs.Bool("attach-latest", false, "attach to the newest Pockly-managed live Claude PTY instead of launching Claude")
 	daemonURL := fs.String("daemon-url", defaultDaemonURL(), "local pockly-daemon URL used with --attach-latest or external registration")
 	register := fs.Bool("register", true, "register this transparent Claude PTY with local pockly-daemon")
 	real := fs.String("real", "", "real Claude executable path; default PATH lookup")
 	pass := fs.Bool("pass", false, "force direct exec without PTY wrapping")
-	noIndicator := fs.Bool("no-indicator", false, "hide the bottom-right \"Pockly attached\" status indicator")
+	// A persistent overlay cannot safely share the last terminal row with
+	// Claude's Ink TUI: when Claude scrolls, the painted badge becomes normal
+	// screen content and can land beside the prompt. Keep the legacy overlay
+	// opt-in only; the Claude statusLine is the stable default presentation.
+	noIndicator := fs.Bool("no-indicator", !wrapperIndicatorEnabled(), "hide the experimental bottom-right Pockly status indicator (default)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage:
+		// Write to fs.Output() (not os.Stderr) so SetOutput(io.Discard)
+		// below can silence it. Otherwise a malformed *wrapper* flag would
+		// flash this banner before claude's TUI even though we recover and
+		// launch claude anyway.
+		fmt.Fprintf(fs.Output(), `Usage:
+  pockly-claude-wrapper [wrapper flags] [claude args...]
   pockly-claude-wrapper [wrapper flags] -- [claude args...]
+
+The wrapper is transparent: it consumes only the leading wrapper flags it
+recognizes and forwards everything else to claude, so an alias of
+'claude' can run e.g. 'claude --resume <id>' with no '--' separator. Use
+'--' to force the boundary when a claude arg would collide with a wrapper
+flag name.
 
 Examples:
   pockly-claude-wrapper
-  pockly-claude-wrapper -- --resume <session-id>
+  pockly-claude-wrapper --resume <session-id>
   pockly-claude-wrapper --alt-screen -- --resume <session-id>
 
 Wrapper flags:
 `)
 		fs.PrintDefaults()
 	}
-	_ = fs.Parse(os.Args[1:])
-	return config{cwd: *cwd, altScreen: *alt, rawMode: !*noRaw, clear: *clear, debug: *debug, pass: *pass, attachLatest: *attachLatest, daemonURL: *daemonURL, register: *register, real: *real, noIndicator: *noIndicator, args: fs.Args()}
+	// Split leading wrapper flags from the claude argv that follows. Go's
+	// flag package would abort on the first token it doesn't own (e.g.
+	// --resume), which breaks the transparent `claude` alias. See
+	// splitWrapperArgs.
+	wrapperArgs, claudeArgs := splitWrapperArgs(os.Args[1:])
+	// ContinueOnError (not ExitOnError): wrapperArgs is flags-only by
+	// construction, but a malformed value on a genuine wrapper flag
+	// (e.g. --register=maybe) must not hard-exit the wrapper with a usage
+	// dump — claude never even gets a chance. Swallow the parse error and
+	// keep going with whatever bound; claude is the source of truth for
+	// arg validation.
+	fs.SetOutput(io.Discard)
+	_ = fs.Parse(wrapperArgs)
+	// Deliberately do NOT merge fs.Args() into the claude argv. splitWrapperArgs
+	// already owns the boundary: claudeArgs is the first non-wrapper token
+	// onward, and wrapperArgs is flags-only by construction, so on success
+	// fs.Args() is empty. On a parse error (e.g. --register=maybe) Go's flag
+	// package aborts mid-scan and leaves the *remaining wrapper flags* in
+	// fs.Args() (e.g. a trailing --pass); appending those would leak wrapper
+	// flags to claude. claudeArgs is the sole source of claude's argv.
+	return config{cwd: *cwd, altScreen: *alt, rawMode: !*noRaw, clear: *clear, debug: wrapperDebugEnabled(), pass: *pass, attachLatest: *attachLatest, daemonURL: *daemonURL, register: *register, real: *real, noIndicator: *noIndicator, args: claudeArgs}
+}
+
+// wrapperValueFlags are wrapper flags that take a separate value argument
+// (--real PATH). wrapperBoolFlags are standalone (--pass). Any other
+// token — a claude flag like --resume, a positional, or an explicit `--`
+// — ends wrapper-flag parsing and begins claude's argv. Keep these in
+// sync with the flags registered in parseArgs.
+//
+// CRITICAL: no name here may collide with a real claude flag, or the
+// wrapper would swallow it (claude never sees it) and possibly hard-fail
+// on its value. `--debug` was such a collision (claude's `-d, --debug
+// [filter]`); wrapper diagnostics moved to the POCKLY_WRAPPER_DEBUG env
+// var. Before adding a flag, check it against `claude --help`.
+var wrapperValueFlags = map[string]bool{
+	"cwd":        true,
+	"daemon-url": true,
+	"real":       true,
+}
+
+var wrapperBoolFlags = map[string]bool{
+	"alt-screen":    true,
+	"no-raw":        true,
+	"clear":         true,
+	"attach-latest": true,
+	"register":      true,
+	"pass":          true,
+	"no-indicator":  true,
+}
+
+// splitWrapperArgs separates the leading run of recognized wrapper flags
+// from the claude argv that follows. It stops at the first token that is
+// an explicit `--` separator, a positional, or a flag the wrapper does
+// not own (e.g. --resume), returning that token and everything after it
+// as claudeArgs. This makes the wrapper transparent so `claude --resume
+// <id>` (via the shell alias) forwards cleanly instead of tripping Go's
+// flag parser.
+func splitWrapperArgs(argv []string) (wrapperArgs, claudeArgs []string) {
+	i := 0
+	for i < len(argv) {
+		tok := argv[i]
+		if tok == "--" {
+			// Explicit separator: drop it, claude owns the rest.
+			return argv[:i], argv[i+1:]
+		}
+		name, hasInlineValue := wrapperFlagName(tok)
+		switch {
+		case name == "":
+			// Positional or unrecognized shape → claude's.
+		case wrapperBoolFlags[name]:
+			i++
+			continue
+		case wrapperValueFlags[name]:
+			if hasInlineValue {
+				i++ // --real=PATH
+				continue
+			}
+			if i+1 < len(argv) {
+				i += 2 // --real PATH
+				continue
+			}
+			i++ // dangling value flag; let fs.Parse surface it
+			continue
+		}
+		break // first token claude should own
+	}
+	return argv[:i], argv[i:]
+}
+
+// wrapperFlagName extracts the flag name from a token like "-real",
+// "--real", or "--real=X", reporting whether an inline `=value` was
+// present. It returns ("", false) for non-flag tokens ("foo", "-", "--").
+func wrapperFlagName(tok string) (name string, hasInlineValue bool) {
+	if len(tok) < 2 || tok[0] != '-' {
+		return "", false
+	}
+	s := tok[1:]
+	if s[0] == '-' {
+		s = s[1:] // second leading dash
+	}
+	if s == "" {
+		return "", false // bare "-" or "--"
+	}
+	if eq := strings.IndexByte(s, '='); eq >= 0 {
+		return s[:eq], true
+	}
+	return s, false
+}
+
+// wrapperDebugEnabled reports whether the wrapper should print its own
+// diagnostics to stderr. Gated by an env var rather than a --debug flag
+// because --debug is a real claude flag the wrapper must forward, not own.
+func wrapperDebugEnabled() bool {
+	return wrapperEnvEnabled("POCKLY_WRAPPER_DEBUG")
+}
+
+// wrapperIndicatorEnabled keeps the legacy ANSI overlay available for users
+// without a statusLine, but only by explicit opt-in. The overlay writes into
+// Claude's screen buffer and therefore cannot be made scroll-safe.
+func wrapperIndicatorEnabled() bool {
+	return wrapperEnvEnabled("POCKLY_WRAPPER_INDICATOR")
+}
+
+func wrapperEnvEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "", "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 func defaultDaemonURL() string {
@@ -364,21 +511,14 @@ func run(cfg config) error {
 					indicator.schedulePaint(120 * time.Millisecond)
 				}
 				//
-				// Intentionally NOT calling indicator.maybePaint() here.
-				// Repainting the "Pockly attached" badge on every PTY
-				// read can split a Claude ANSI sequence mid-stream (for
+				// Do not paint inline with this PTY chunk. Interleaving the
+				// badge can split a Claude ANSI sequence mid-stream (for
 				// example, one read ends in "\x1b[10;" and the next starts
 				// "5HHello"). Inserting our own cursor sequence between
 				// those halves corrupts the terminal frame.
-				// fragmented Claude's cursor state and left ghost text
-				// scattered across the screen ("r imits sage kills,…").
-				// Now the indicator only paints on startup, resize, and
-				// SetAttached state flips — none of which race the Claude
-				// TUI's streaming repaints. claude-integrate's statusLine
-				// already shows live Pockly status inline ("◆ Pockly ·
-				// ⚡ PTY duplex · 1 paired"), so the bottom-right badge
-				// is mostly redundant anyway; we keep it for users who
-				// don't have the statusLine installed.
+				// The opt-in legacy indicator is only scheduled after a
+				// short quiet period. Normal installs never create it and
+				// use claude-integrate's statusLine instead.
 			}
 			if err != nil {
 				done <- err
@@ -1285,7 +1425,6 @@ func newestJSONLAfter(projectDir string, startedAt time.Time) (string, string, b
 //   - On final failure, stash in `pending` (capped at 200) and log to
 //     stderr. The wrapper indicator goes yellow but the event isn't
 //     lost — next Emit or 10s keepalive tick drains the queue.
-//
 func (b *daemonBridge) Emit(kind, sessionStatus, turnStatus, payload, errorText string) {
 	if b == nil {
 		return
@@ -2882,14 +3021,14 @@ func stripFlags(args []string, names []string) []string {
 	return out
 }
 
-// --- Bottom-right "Pockly attached" status indicator ---
+// --- Optional bottom-right "Pockly attached" status indicator ---
 //
-// We paint ANSI escape sequences directly to the user's terminal to show a
-// small cyan badge in the bottom-right corner. The wrapper does not own the
-// screen — Claude (Ink/React) drives most of it — so the indicator gets
-// overwritten as Claude redraws. We re-paint right after each PTY output
-// chunk (throttled to ~5 fps) so the indicator naturally tracks Claude's
-// own paint cadence without polling.
+// This legacy overlay is disabled by default. The wrapper does not own the
+// screen: Claude (Ink/React) drives and scrolls the entire terminal, including
+// the last row. Any text painted there can later scroll into the prompt/content
+// area, so cursor save/restore alone cannot make a persistent overlay safe.
+// POCKLY_WRAPPER_INDICATOR=1 explicitly opts into the old behavior; normal
+// installs use the Claude statusLine integration instead.
 //
 // Cursor save/restore uses DECSC (\x1b7) / DECRC (\x1b8). Ink-based TUIs
 // drive the cursor via CUP rather than these registers, so clobbering the
