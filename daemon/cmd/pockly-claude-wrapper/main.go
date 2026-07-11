@@ -812,6 +812,7 @@ type daemonBridge struct {
 	cwd    string
 	done   chan struct{}
 	pid    int // claude child pid; 0 if not yet known
+	debug  bool
 
 	mu        sync.RWMutex
 	id        string // mutates on re-register
@@ -880,6 +881,7 @@ func maybeStartDaemonBridge(cfg config, cwd string, invocation claudeInvocation,
 		lockedSessionID: lockedSID,
 		cwd:             cwd,
 		pid:             childPID,
+		debug:           cfg.debug,
 		done:            make(chan struct{}),
 	}
 	bridge.permissionWatcher = newTUIPermissionWatcher(bridge, writePTY)
@@ -1812,7 +1814,9 @@ func (w *tuiPermissionWatcher) Feed(chunk []byte) {
 		w.driftReported = false
 	case !w.driftReported:
 		w.driftReported = true
-		fmt.Fprintln(os.Stderr, "[pockly-wrapper] a permission prompt is awaiting but was not recognized — Claude Code's prompt copy may have changed; web approval is unavailable for this one (the wrapper detector needs updating).")
+		if w.bridge.debug {
+			fmt.Fprintln(os.Stderr, "[pockly-wrapper] a permission prompt is awaiting but was not recognized — Claude Code's prompt copy may have changed; web approval is unavailable for this one (the wrapper detector needs updating).")
+		}
 	}
 	w.mu.Unlock()
 	if ok {
@@ -2206,7 +2210,7 @@ func detectClaudeGenericToolApproval(rec map[string]any) (tuiPermissionPrompt, b
 		}
 		name, _ := part["name"].(string)
 		name = strings.TrimSpace(name)
-		if name == "" || name == "Bash" || fileToolRequiresApproval(name) {
+		if name == "" || name == "Bash" || fileToolRequiresApproval(name) || toolOwnsInteractiveUserInput(name) {
 			continue
 		}
 		input, _ := part["input"].(map[string]any)
@@ -2230,6 +2234,21 @@ func detectClaudeGenericToolApproval(rec map[string]any) (tuiPermissionPrompt, b
 		}, true
 	}
 	return tuiPermissionPrompt{}, false
+}
+
+// toolOwnsInteractiveUserInput identifies tools whose native UI collects a
+// structured answer from the local user. They are not permission prompts and
+// cannot be represented by Pockly's allow/deny bridge. Claude 2.1.202 reports
+// AskUserQuestion as waitingFor="permission prompt", so the structured status
+// gate alone is not enough to distinguish it from an approval sheet.
+func toolOwnsInteractiveUserInput(name string) bool {
+	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", " ", "").Replace(strings.TrimSpace(name)))
+	switch normalized {
+	case "askuserquestion", "askuserquestions":
+		return true
+	default:
+		return false
+	}
 }
 
 func detectClaudeToolResultIDs(rec map[string]any) []string {
@@ -2353,13 +2372,18 @@ func (w *tuiPermissionWatcher) handle(prompt tuiPermissionPrompt) {
 	}
 	reqID := "req-pty-" + strings.ReplaceAll(newUUIDv4(), "-", "")
 	if err := w.bridge.registerPermissionRequest(reqID, prompt.ToolName, input); err != nil {
-		fmt.Fprintf(os.Stderr, "[pockly-wrapper] PTY permission register failed: %v\n", err)
+		if w.bridge.debug {
+			fmt.Fprintf(os.Stderr, "[pockly-wrapper] PTY permission register failed: %v\n", err)
+		}
 		return
 	}
 	w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, "pending", "awaiting web approval (PTY)")
 	out, err := w.bridge.awaitPermissionDecision(reqID, w.timeout)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[pockly-wrapper] PTY permission await failed: %v\n", err)
+		if w.bridge.debug {
+			fmt.Fprintf(os.Stderr, "[pockly-wrapper] PTY permission await failed: %v\n", err)
+		}
+		w.bridge.emitPermissionEvent(prompt.ToolName, input, reqID, "deny", "permission bridge unavailable (PTY)")
 		return
 	}
 	if out.Reason == "timeout" {
@@ -2473,6 +2497,12 @@ func (b *daemonBridge) awaitPermissionDecision(reqID string, timeout time.Durati
 		return permissionAwaitOutcome{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusGatewayTimeout {
+		// The daemon represents an expired pending request as HTTP 504. Map it
+		// back to the structured outcome expected by handle(), so the web card
+		// resolves and no internal HTTP error is printed into Claude's TUI.
+		return permissionAwaitOutcome{Decision: "deny", Reason: "timeout"}, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		buf, _ := io.ReadAll(resp.Body)
 		return permissionAwaitOutcome{}, fmt.Errorf("daemon %d: %s", resp.StatusCode, truncateBridgeLog(string(buf), 160))

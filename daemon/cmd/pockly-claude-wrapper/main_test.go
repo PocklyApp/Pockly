@@ -863,6 +863,31 @@ func TestDetectClaudeGenericToolApprovalSkipsSpecializedTools(t *testing.T) {
 	}
 }
 
+func TestDetectClaudeGenericToolApprovalSkipsAskUserQuestion(t *testing.T) {
+	for _, name := range []string{"AskUserQuestion", "ask_user_question", "AskUserQuestions"} {
+		rec := map[string]any{
+			"type": "assistant",
+			"message": map[string]any{
+				"content": []any{
+					map[string]any{
+						"type": "tool_use",
+						"name": name,
+						"id":   "toolu_question",
+						"input": map[string]any{
+							"questions": []any{
+								map[string]any{"question": "Continue?", "multiSelect": false},
+							},
+						},
+					},
+				},
+			},
+		}
+		if _, ok := detectClaudeGenericToolApproval(rec); ok {
+			t.Fatalf("generic detector must not treat interactive tool %s as an allow/deny permission prompt", name)
+		}
+	}
+}
+
 func TestTUIPermissionDecisionKeyUsesClaudeOneTimeOptions(t *testing.T) {
 	if got := tuiPermissionDecisionKey("allow"); got != "1\r" {
 		t.Fatalf("allow key = %q, want one-time option 1", got)
@@ -1062,6 +1087,28 @@ func TestTUIPermissionWatcherScheduledFallbackClearsTimerWhenSuppressed(t *testi
 	}
 	if w.toolUseFallback[prompt.ToolUseID] != "" {
 		t.Fatal("scheduled fallback should remove stale tool-use mapping even when start is suppressed")
+	}
+}
+
+func TestAwaitPermissionDecisionMapsGatewayTimeout(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/dev/permission-requests/req-timeout/await", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("timeout") != "30" {
+			t.Errorf("timeout query = %q, want 30", r.URL.Query().Get("timeout"))
+		}
+		w.WriteHeader(http.StatusGatewayTimeout)
+		_, _ = w.Write([]byte(`{"error":"request timed out"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	bridge := &daemonBridge{client: srv.Client(), base: srv.URL}
+	out, err := bridge.awaitPermissionDecision("req-timeout", 30*time.Second)
+	if err != nil {
+		t.Fatalf("awaitPermissionDecision returned error for daemon timeout: %v", err)
+	}
+	if out.Decision != "deny" || out.Reason != "timeout" {
+		t.Fatalf("outcome = %#v, want deny/timeout", out)
 	}
 }
 
