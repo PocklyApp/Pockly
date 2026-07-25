@@ -18,6 +18,7 @@ import {
   listSessionsDelta,
   markSessionOpened,
   reportWebTelemetry,
+  safeTelemetryErrorCode,
   subscribeToSession,
   createTerminalSession,
   decidePermissionRequest,
@@ -70,6 +71,32 @@ test("web telemetry is network-disabled by default", () => {
     globals.window = originalWindow;
     globals.fetch = originalFetch;
   }
+});
+
+test("telemetry error codes fail closed on anything that is not an enum token", () => {
+  // Enumerated codes pass through unchanged.
+  for (const code of ["daemon_offline", "network", "error_type_error", "http.503", "a"]) {
+    assert.equal(safeTelemetryErrorCode(code), code);
+  }
+  // Anything that could carry user or environment data is replaced, not
+  // truncated. Truncation would still leak the first 80 characters.
+  for (const raw of [
+    "Failed to fetch https://nexus.example/api/sessions?token=REDACTED",
+    "ENOENT: no such file or directory, open '/Users/example/notes.md'",
+    "Unexpected token < in JSON at position 0",
+    "authorization header rejected: Bearer REDACTED",
+    "TypeError: Cannot read properties of undefined",
+    "错误",
+    "code with spaces",
+    "UPPERCASE_CODE",
+  ]) {
+    assert.equal(safeTelemetryErrorCode(raw), "unspecified_error", raw);
+  }
+  // Empty stays empty so the field can be omitted rather than faked.
+  assert.equal(safeTelemetryErrorCode(undefined), "");
+  assert.equal(safeTelemetryErrorCode("   "), "");
+  // Over-long enum-shaped values are rejected rather than silently cut.
+  assert.equal(safeTelemetryErrorCode("a".repeat(200)), "unspecified_error");
 });
 
 test("polling fallback event budget matches long-running agent turns", () => {

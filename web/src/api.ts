@@ -2546,6 +2546,23 @@ async function readSSEStream<TEvent>(body: ReadableStream<Uint8Array>, onEvent: 
 // IMPORTANT: do NOT call this from inside event-loop hot paths (e.g. each
 // message_added render). Only call on transition events — first inject
 // failure for a session, SSE disconnect, gap detection, render error.
+// safeTelemetryErrorCode is the last line of defense on the diagnostics wire
+// format. Callers are expected to pass an enumerated code, but a caller that
+// forwards a raw exception message would otherwise ship whatever that message
+// contains — a path, a URL with a query string, a token in an upstream error.
+//
+// Rather than blocklisting substrings (which fails open on anything unforeseen),
+// this fails closed: the value must look like an enum token, or it is replaced.
+// Keep this in sync with docs/security-model.md.
+export function safeTelemetryErrorCode(value: string | undefined) {
+  const code = (value ?? "").trim();
+  if (!code) return "";
+  // Enumerated codes only: lowercase words joined by _ . : - and digits.
+  // Anything with whitespace, quotes, slashes, @, or non-ASCII is not an enum.
+  if (!/^[a-z0-9][a-z0-9_.:-]{0,63}$/.test(code)) return "unspecified_error";
+  return code;
+}
+
 let lastTelemetryErrLog = 0;
 export function reportWebTelemetry(input: {
   name: "web_sse_disconnected" | "web_sse_visibility_resume" | "web_inject_attempt" | "web_inject_error" | "web_presence_refresh_failed" | "web_stream_gap_detected" | "web_page_error" | "web_bootstrap" | "web_bootstrap_phase";
@@ -2578,7 +2595,7 @@ export function reportWebTelemetry(input: {
             name: input.name,
             path: input.path ?? location.pathname,
             status: input.status ?? "error",
-            error_code: (input.errorCode ?? "").slice(0, 80),
+            error_code: safeTelemetryErrorCode(input.errorCode),
             session_id: input.sessionId ?? "",
             duration_ms: input.durationMs ?? 0,
             timestamp: new Date().toISOString(),

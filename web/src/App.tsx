@@ -3489,7 +3489,7 @@ setPairStatus(`${tx("common.connected")} ${connected.daemon_device_id}.`);
       reportWebTelemetry({
         name: "web_sse_disconnected",
         sessionId: session.session_id,
-        errorCode: error instanceof Error ? error.message.slice(0, 80) : "stream_failed",
+        errorCode: error instanceof Error ? normalizeTelemetryError(error.message) : "stream_failed",
       });
       const nextAttempt = attempt + 1;
       const delayMs = Math.min(1000 * Math.pow(2, attempt), SSE_RECONNECT_MAX_BACKOFF_MS);
