@@ -8,6 +8,11 @@
 - [Testing](./testing.md)
 - [Troubleshooting](./troubleshooting.md)
 
-These documents cover the public open-source repository. Operator-specific
-hosting, routing, billing, account policy, and release distribution setups are
-intentionally out of scope.
+These documents cover this repository: the Pockly web app, daemon, and
+self-hosted Nexus runtime.
+
+Choices that belong to whoever runs a deployment are out of scope here: hosting,
+DNS, TLS, reverse proxy configuration, identity providers, email delivery,
+registration policy, and release distribution. [Self-hosting
+Nexus](./self-hosting.md) says what the default runtime does and does not do, so
+you can decide what to put in front of it.

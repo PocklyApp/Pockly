@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- Node.js 20 or newer.
-- npm 10 or newer.
+- Node.js 20 or newer (enforced by `engines`).
+- npm 10 or newer, which ships with Node 20.
 - Go 1.23 or newer.
 - Docker, optional for containerized Nexus.
 - Claude Code or Codex CLI, optional for real-agent testing.
@@ -50,21 +50,32 @@ Terminal 3, daemon:
 ./daemon/bin/pockly-daemon serve --connect-nexus --nexus-url http://127.0.0.1:8787
 ```
 
+`./.local/nexus` keeps development state inside the checkout, where `.gitignore`
+already covers it. Delete the directory to start over. The production default is
+`~/.pockly/nexus`; see [self-hosting.md](./self-hosting.md).
+
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
 Create a local account in the web UI. The default self-hosted Nexus runtime
 uses password-based accounts and signs you in after account creation. It does
-not send outbound email in local development.
+not send outbound email, so there is no email verification or password reset.
 
 ## Common Checks
+
+These are what CI runs:
 
 ```bash
 npm test
 npm run web:lint
 npm run web:typecheck
 npm run web:build
-npm --workspace nexus run validate
 cd daemon && go test ./...
+```
+
+Renderer end-to-end tests need a running dev server and are not part of CI:
+
+```bash
+npm run web:test:e2e
 ```
 
 ## Working With Agents

@@ -284,6 +284,14 @@ async function registerAccount(request, store) {
   });
 }
 
+// Email verification is an extension point, not a shipped feature. This runtime
+// bundles no email transport, so registration signs the user in directly and
+// these two routes always answer 503.
+//
+// They exist, and the web client keeps a matching `verification_required`
+// branch, so a deployment that injects an email provider can require
+// verification without forking the client. Until something calls the provider
+// hook, that UI is unreachable by design. See docs/self-hosting.md.
 async function verifyRegistration(request) {
   if (request.method !== "POST") return methodNotAllowed("POST");
   await readJSON(request);

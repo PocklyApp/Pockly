@@ -27,6 +27,7 @@
     "web:lint": "npm --workspace web run lint",
     "web:build": "npm --workspace web run build",
     "web:typecheck": "npm --workspace web run typecheck",
+    "web:test:e2e": "npm --workspace web run test:e2e",
     "nexus:test": "npm --workspace nexus test",
     "nexus:validate": "npm --workspace nexus run validate"
   },

@@ -7,8 +7,9 @@ forking client behavior for a specific deployment platform. Nexus handles
 browser and daemon auth, setup, sessions, history sync, permissions,
 terminal streams, release metadata, and optional push/STT/telemetry providers.
 
-The old `relay` name remains only as a compatibility alias for legacy
-environment variables and API paths during the migration window.
+The old `relay` name survives only as a fallback for `POCKLY_RELAY_*`
+environment variables. Request paths are `/api/*` only; there are no legacy
+`/api/relay/*` routes.
 
 ## Current Scope
 
@@ -55,38 +56,49 @@ Not implemented yet:
 `/api/runtime` reports neutral Nexus capabilities:
 
 - `runtime`: `self_hosted`
-- `realtime`, `terminal`, `web_push`, `stt`, `release_update`
 - `contract_version`
+- realtime and control: `realtime`, `browser_realtime`,
+  `browser_realtime_control`, `control_streaming`
+- terminal: `terminal`, `terminal_streaming`
+- optional providers: `web_push`, `stt`, `release_update`
 
 It only advertises capabilities that are explicitly enabled via environment
 flags and matching runtime bindings. HTTP catalog sync and session reads are
 available even when realtime is disabled.
 
-Operator-specific hosting runbooks and infrastructure details are configured
-separately by each deployment. The public Nexus Contract and client UI should
-only depend on the neutral runtime capabilities above.
+`nexus/test/public-boundary.test.js` fails the build if a capability key is added
+without documenting it here and in `docs/deployment.md`.
+
+Hosting runbooks and infrastructure details belong to whoever runs the
+deployment and are not tracked here. The Nexus Contract and client UI depend only
+on the neutral runtime capabilities above.
 
 ## Local Validation
 
+`test` and `validate` are the same command; use either.
+
 ```bash
 npm test
-npm run validate
 ```
 
 ## Self-Hosted Node Runtime
 
 Default self-hosted Nexus runs on Node.js 20 with SQLite, local release blob
-storage, and an in-process WebSocket control hub:
+storage, and an in-process WebSocket control hub. Run it from a checkout of this
+monorepo:
 
 ```bash
-npx @pockly/nexus serve --host 0.0.0.0 --port 8787 --data-dir ~/.pockly/nexus
+npm --workspace nexus exec -- pockly-nexus serve \
+  --host 127.0.0.1 --port 8787 --data-dir ~/.pockly/nexus
 ```
 
-From this monorepo checkout:
+`@pockly/nexus` is not published to npm yet, so `npx @pockly/nexus` does not
+resolve. Every example below uses the workspace form.
 
-```bash
-npm --workspace nexus exec -- pockly-nexus serve --host 0.0.0.0 --port 8787
-```
+`--host` defaults to `127.0.0.1` and `--data-dir` defaults to `~/.pockly/nexus`.
+Binding to `0.0.0.0` exposes a runtime that ships without TLS, rate limiting, or
+origin checks; read [../docs/self-hosting.md](../docs/self-hosting.md) before
+doing that.
 
 Docker:
 
@@ -111,13 +123,13 @@ Production self-hosted metadata can use Postgres:
 
 ```bash
 POCKLY_NEXUS_DATABASE_URL="postgres://pockly:REPLACE_ME@db.example:5432/pockly" \
-  npx @pockly/nexus serve --host 0.0.0.0 --port 8787
+  npm --workspace nexus exec -- pockly-nexus serve --port 8787
 ```
 
 Equivalent CLI flags:
 
 ```bash
-npx @pockly/nexus serve \
+npm --workspace nexus exec -- pockly-nexus serve \
   --database-url "postgres://pockly:REPLACE_ME@db.example:5432/pockly" \
   --postgres-ssl true
 ```
@@ -131,13 +143,13 @@ one Node instance:
 
 ```bash
 POCKLY_NEXUS_REDIS_URL="redis://redis.example:6379" \
-  npx @pockly/nexus serve --host 0.0.0.0 --port 8787
+  npm --workspace nexus exec -- pockly-nexus serve --port 8787
 ```
 
 Equivalent CLI flags:
 
 ```bash
-npx @pockly/nexus serve \
+npm --workspace nexus exec -- pockly-nexus serve \
   --redis-url redis://redis.example:6379 \
   --redis-prefix pockly:nexus
 ```
@@ -155,18 +167,55 @@ POCKLY_NEXUS_S3_ENDPOINT="https://s3.example.com" \
 POCKLY_NEXUS_S3_REGION="auto" \
 POCKLY_NEXUS_S3_ACCESS_KEY_ID="..." \
 POCKLY_NEXUS_S3_SECRET_ACCESS_KEY="..." \
-  npx @pockly/nexus serve --host 0.0.0.0 --port 8787
+  npm --workspace nexus exec -- pockly-nexus serve --port 8787
 ```
 
 Equivalent CLI flags are available for non-secret values:
 
 ```bash
-npx @pockly/nexus serve \
+npm --workspace nexus exec -- pockly-nexus serve \
   --s3-bucket example-release-bucket \
   --s3-endpoint https://s3.example.com \
   --s3-region auto \
   --s3-prefix releases
 ```
 
+## CLI Environment Variables
+
+Every `serve` flag has an environment-variable equivalent. Flags win when both
+are set.
+
+| Variable | Flag | Default |
+| --- | --- | --- |
+| `POCKLY_NEXUS_HOST` | `--host` | `127.0.0.1` |
+| `POCKLY_NEXUS_PORT` | `--port` | `8787` |
+| `POCKLY_NEXUS_DATA_DIR` | `--data-dir` | `~/.pockly/nexus` |
+| `POCKLY_NEXUS_SQLITE_PATH` | `--sqlite-path` | `<data-dir>/nexus.sqlite` |
+| `POCKLY_NEXUS_DATABASE_URL` | `--database-url` | unset (use SQLite) |
+| `POCKLY_NEXUS_POSTGRES_SSL` | `--postgres-ssl` | unset |
+| `POCKLY_NEXUS_POSTGRES_MAX_CONNECTIONS` | none | `10` |
+| `POCKLY_NEXUS_REDIS_URL` | `--redis-url` | unset (in-process hub) |
+| `POCKLY_NEXUS_REDIS_PREFIX` | `--redis-prefix` | `pockly:nexus` |
+| `POCKLY_NEXUS_S3_BUCKET` | `--s3-bucket` | unset (local files) |
+| `POCKLY_NEXUS_S3_ENDPOINT` | `--s3-endpoint` | unset |
+| `POCKLY_NEXUS_S3_REGION` | `--s3-region` | unset |
+| `POCKLY_NEXUS_S3_PREFIX` | `--s3-prefix` | unset |
+| `POCKLY_NEXUS_S3_FORCE_PATH_STYLE` | `--s3-force-path-style` | unset |
+| `POCKLY_NEXUS_S3_ACCESS_KEY_ID` | none | unset |
+| `POCKLY_NEXUS_S3_SECRET_ACCESS_KEY` | none | unset |
+| `POCKLY_NEXUS_S3_SESSION_TOKEN` | none | unset |
+| `POCKLY_NEXUS_RUNTIME` | none | `self_hosted` |
+| `POCKLY_NEXUS_ENVIRONMENT` | none | `self_hosted` |
+| `POCKLY_NEXUS_DEV_LOGIN_ENABLED` | none | off |
+
+Unprefixed `DATABASE_URL`, `REDIS_URL`, `S3_BUCKET`, `S3_ENDPOINT`,
+`S3_FORCE_PATH_STYLE`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN` are also honored as fallbacks.
+Ambient AWS credentials in the environment therefore take effect without being
+named in a Pockly-specific variable.
+
+Feature flags and provider configuration are documented in
+[../docs/self-hosting.md](../docs/self-hosting.md).
+
 Do not commit real account IDs, database IDs, bucket names, production domains,
-or secrets.
+or secrets. See [../CONTRIBUTING.md](../CONTRIBUTING.md).

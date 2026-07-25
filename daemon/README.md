@@ -29,16 +29,25 @@ Install a specific tag:
       POCKLY_DAEMON_BASE_URL=https://your-nexus.example/pockly-daemon \
       POCKLY_DAEMON_VERSION=v0.1.0 bash
 
+The install scripts run `setup` immediately after installing. Set
+`POCKLY_DAEMON_NO_SETUP=1` to install without it and run setup later. Setup
+targets `http://127.0.0.1:8787` unless `POCKLY_NEXUS_URL` says otherwise.
+
+`POCKLY_DAEMON_BASE_URL` is required; the scripts fail with a usage message if it
+is unset. There is no built-in download host.
+
 ## Build
 
-Local platform:
+`make build` produces two binaries: the daemon and `pockly-claude-wrapper`, a
+shim the daemon launches to drive Claude Code's PTY flows.
 
     make build
     ./bin/pockly-daemon --version
     ./bin/pockly-daemon setup --nexus-url http://127.0.0.1:8787 --install-service=false
     ./bin/pockly-daemon serve --connect-nexus --nexus-url http://127.0.0.1:8787
 
-All three target platforms × architectures:
+Cross-compile both binaries for all six ship targets (darwin, linux, and windows
+on arm64 and amd64), producing 12 files:
 
     make cross
     ls bin/
@@ -49,11 +58,19 @@ Run:
 
     ./bin/pockly-daemon serve
 
-Endpoints:
+Endpoints, all restricted to same-machine non-browser callers by a loopback
+Host/Origin guard:
 
     GET /healthz
+    GET /api/status
     GET /api/projects
     GET /api/sessions/<session_id>/blocks
+    GET /api/sessions/<session_id>/blocks/stream
+
+Registered only when the corresponding subsystem is active:
+
+    /api/dev/terminal-sessions, /api/dev/terminal-sessions/<id>
+    /api/dev/permission-requests, /api/dev/permission-requests/<id>
 
 Flags:
 
@@ -77,12 +94,29 @@ For remote/headless installs, use the terminal authorization URL or QR code. The
 
 The local loopback callback URL is an internal implementation detail and should not be copied as a user-facing setup URL.
 
+## Overrides That Weaken Security
+
+These exist for automated testing and constrained environments. Each removes a
+defense; do not set them on a shared machine. `docs/security-model.md` has the
+full list.
+
+| Variable | Effect |
+| --- | --- |
+| `POCKLY_AUTO_CONFIRM_PAIR=1` | Skips the local `[y/N]` pairing confirmation described above. That prompt is what stops someone remote from walking a user through approving a pairing they did not start. |
+| `POCKLY_ALLOW_PLAINTEXT_KEY=1` | Writes the daemon Ed25519 private key as cleartext into `device.json` instead of using the OS keyring. |
+| `POCKLY_FORCE_LOCAL_INSTALL=1` / `POCKLY_FORCE_REMOTE_INSTALL=1` | Override the local-vs-remote detection that decides whether the confirmation prompt is shown at all. |
+
 ## Diagnostics
 
-The open-source daemon does not send network telemetry by default. It writes
-local logs and can optionally send minimal operational diagnostics to a
-self-hosted Nexus telemetry provider that you configure yourself. Diagnostics
-never include prompts, cwd paths, session content, tool results, or tokens.
+The daemon does not send network telemetry by default. It writes local logs and
+can optionally send minimal operational diagnostics to a self-hosted Nexus
+telemetry provider that you configure yourself.
+
+Diagnostic events carry a fixed set of scalar fields with no free-text payload,
+and error text is mapped onto a fixed vocabulary before it is sent (unrecognized
+errors become `redacted_error` or `path_error`). The intent is that prompts, cwd
+paths, session content, tool results, and tokens never leave the machine; see
+`docs/security-model.md` for how strongly that is enforced.
 
 After your self-hosted Nexus has a diagnostics provider, enable daemon uploads
 explicitly with:
@@ -98,16 +132,34 @@ not enable uploads; keep `POCKLY_TELEMETRY=on` in the environment:
 
 ## Layout
 
-    cmd/pockly-daemon/   entry point
-    internal/api/        local HTTP API
-    internal/agent/      shared block schema + per-agent parsers
-    internal/device/     persisted daemon device identity
-    internal/pair/       Nexus setup client
-    internal/version/    semver + ldflags-injected commit/date
-    bin/                 build output (gitignored)
+    cmd/pockly-daemon/          entry point
+    cmd/pockly-claude-wrapper/  PTY shim for Claude Code
+    cmd/fake-claude/            test double used by Go tests
+    cmd/gen-password-hash/      local E2E helper for seeding a Nexus password
+
+    internal/agent/         shared block schema + per-agent parsers
+    internal/agentexec/     agent process launch
+    internal/agentsettings/ model and permission settings discovery
+    internal/api/           local HTTP API
+    internal/claudelauncher/ Claude Code launch paths
+    internal/control/       Nexus control-channel request handling
+    internal/device/        persisted daemon device identity
+    internal/index/         warm session index
+    internal/localsetup/    loopback setup callback server
+    internal/pair/          Nexus setup client
+    internal/permission/    native permission request relay
+    internal/relay/         catalog and turn sync to Nexus
+    internal/runner/        long-lived process supervision
+    internal/telemetry/     opt-in diagnostics
+    internal/terminal/      PTY session management
+    internal/version/       semver + ldflags-injected commit/date
+
+    bin/                    build output (gitignored)
 
 ## Conventions
 
 - Go 1.23, stdlib-first. New deps only when there's a concrete reason — list rationale in PR.
 - Module path: `github.com/PocklyApp/Pockly/daemon`
-- All long-lived processes pass through context cancellation; no `os.Exit` outside `main`.
+- Long-lived processes pass through context cancellation. Keep `os.Exit` at
+  process boundaries: `main`, and the Windows restart and wrapper exit paths that
+  must propagate a specific exit code.

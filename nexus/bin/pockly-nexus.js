@@ -72,5 +72,6 @@ function printUsage() {
                      [--s3-region region] [--s3-prefix releases]
 
 Legacy relay compatibility:
-  API paths and POCKLY_RELAY_* fallbacks remain supported during migration.`);
+  POCKLY_RELAY_* environment variables remain supported as fallbacks.
+  There are no legacy /api/relay/* request paths.`);
 }

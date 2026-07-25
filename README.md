@@ -19,9 +19,10 @@ nexus/     Self-hosted Pockly Nexus Node.js runtime.
 docs/      Architecture, development, self-hosting, testing, and troubleshooting.
 ```
 
-This repository contains the open-source product code and self-hosted Nexus runtime.
-Operator-specific hosting, routing, account policy, billing, and release
-distribution setups are configured separately by each deployment.
+This repository contains the product code and the self-hosted Nexus runtime.
+Choices that belong to a specific deployment are out of scope here: hosting, DNS,
+TLS, reverse proxy configuration, identity providers, email delivery, and
+registration policy. Each deployment configures those itself.
 
 ## Supported Agents
 
@@ -119,10 +120,15 @@ Run it directly:
 
 ```bash
 npm --workspace nexus exec -- pockly-nexus serve \
-  --host 0.0.0.0 \
+  --host 127.0.0.1 \
   --port 8787 \
   --data-dir ~/.pockly/nexus
 ```
+
+It binds to `127.0.0.1` by default. The default runtime ships with open
+registration, no rate limiting, no origin checks, and no TLS, so read
+[docs/self-hosting.md](./docs/self-hosting.md) before exposing it on a network
+address. Nexus is a control plane for shells on your machines.
 
 Run it with Docker:
 

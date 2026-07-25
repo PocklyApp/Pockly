@@ -1,7 +1,7 @@
 # Contributing To Pockly
 
-Thank you for contributing. This repository is intended to be usable from a
-clean public checkout without operator-specific deployment context.
+Thank you for contributing. This repository is meant to be usable from a clean
+checkout, with no deployment-specific context required.
 
 ## Before You Start
 
@@ -45,15 +45,24 @@ npm run web:build
 cd daemon && go test ./...
 ```
 
+CI runs exactly these on every pull request.
+
 Real Claude Code or Codex tests are optional. They must be clearly marked as
-credential-required and skipped by default.
+credential-required and skipped by default. [docs/testing.md](./docs/testing.md)
+lists the tiers and the environment variables that enable them.
 
 ## Pull Request Guidelines
 
 - Keep public terminology consistent: use **Pockly Nexus** for the connection
   layer. Use `relay` only for explicit legacy compatibility.
-- Do not add operator-specific domains, provider implementation details,
-  account IDs, bucket names, or secrets to public files.
+- Do not add deployment-specific domains, provider implementation details,
+  account IDs, bucket names, or secrets. Use RFC 2606 reserved names
+  (`example.com`, `.example`, `.invalid`, `.test`) and loopback addresses in
+  docs, fixtures, and tests. `nexus/test/public-boundary.test.js` enforces this
+  and runs as part of `npm test`.
+- Use generic personas in fixtures that need a filesystem path or an email
+  address: `/Users/me`, `/Users/example`, `dev@example.local`. Do not commit your
+  own home directory path or email address.
 - Do not claim a browser-only secrecy boundary for session history. Nexus
   stores synced history for the account.
 - Treat browsers as authenticated access clients, not user-visible computers.
