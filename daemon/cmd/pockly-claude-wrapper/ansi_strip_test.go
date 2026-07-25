@@ -88,17 +88,17 @@ func TestIncompleteTailLen(t *testing.T) {
 		{"empty", []byte{}, 0},
 		{"plain ascii", []byte("hello"), 0},
 		{"bare trailing ESC", []byte("ab\x1b"), 1},
-		{"split CSI mid-params", []byte("ab\x1b[5"), 3},      // ESC [ 5  (no final yet)
-		{"split CSI just opened", []byte("ab\x1b["), 2},      // ESC [
-		{"complete CSI", []byte("ab\x1b[5G"), 0},             // final 'G' present
+		{"split CSI mid-params", []byte("ab\x1b[5"), 3}, // ESC [ 5  (no final yet)
+		{"split CSI just opened", []byte("ab\x1b["), 2}, // ESC [
+		{"complete CSI", []byte("ab\x1b[5G"), 0},        // final 'G' present
 		{"complete SGR", []byte("\x1b[38;5;9m"), 0},
 		{"split OSC (no terminator)", []byte("x\x1b]0;title"), 9}, // ESC + "]0;title" (9 bytes held)
 		{"complete OSC (BEL)", []byte("x\x1b]0;t\x07"), 0},
 		{"trailing CR (maybe \\r\\n split)", []byte("ab\r"), 1},
 		{"complete two-byte ESC", []byte("\x1b="), 0},
-		{"split 3-byte UTF-8 (1 byte)", []byte("ab\xe4"), 1},        // 你 leader, 0/2 continuations
-		{"split 3-byte UTF-8 (2 bytes)", []byte("ab\xe4\xbd"), 2},   // 你 leader + 1 continuation
-		{"complete 3-byte UTF-8", []byte("ab\xe4\xbd\xa0"), 0},      // 你
+		{"split 3-byte UTF-8 (1 byte)", []byte("ab\xe4"), 1},      // 你 leader, 0/2 continuations
+		{"split 3-byte UTF-8 (2 bytes)", []byte("ab\xe4\xbd"), 2}, // 你 leader + 1 continuation
+		{"complete 3-byte UTF-8", []byte("ab\xe4\xbd\xa0"), 0},    // 你
 		{"split 2-byte UTF-8", []byte("ab\xc3"), 1},
 		{"oversized unterminated escape is let through", append([]byte("\x1b]"), make([]byte, ansiCarryLimit+10)...), 0},
 	}
@@ -161,11 +161,11 @@ func TestStripANSI_DoesNotPanicOnRandomGarbage(t *testing.T) {
 		{0x1b},
 		{0x1b, '['},
 		{0x1b, '[', ';'},
-		{0x1b, '['},                    // CSI start, no terminator
-		{0x1b, ']'},                    // OSC start, no terminator
-		{0x1b, ']', '0', ';', 'x'},     // OSC missing terminator
-		{0x1b, 'P', 'a'},               // DCS missing terminator
-		{0xff, 0xfe, 0xfd},             // raw garbage bytes
+		{0x1b, '['},                // CSI start, no terminator
+		{0x1b, ']'},                // OSC start, no terminator
+		{0x1b, ']', '0', ';', 'x'}, // OSC missing terminator
+		{0x1b, 'P', 'a'},           // DCS missing terminator
+		{0xff, 0xfe, 0xfd},         // raw garbage bytes
 	}
 	for _, in := range inputs {
 		_ = stripANSI(in)

@@ -377,7 +377,7 @@ func TestStripTerminalEscapes(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain text", "plain text"},
 		{"Set model to \x1b[1mOpus 4.8\x1b[22m and saved", "Set model to Opus 4.8 and saved"},
-		{"a\x1b[2Gb\x1b[5Gc", "abc"},     // CHA positioning
+		{"a\x1b[2Gb\x1b[5Gc", "abc"}, // CHA positioning
 		{"\x1b[31mred\x1b[0m done", "red done"},
 		{"no escapes", "no escapes"},
 	}

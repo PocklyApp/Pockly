@@ -7,8 +7,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/PocklyApp/Pockly/daemon/internal/agentsettings"
 	"github.com/PocklyApp/Pockly/daemon/internal/agent/sdkdriver"
+	"github.com/PocklyApp/Pockly/daemon/internal/agentsettings"
 )
 
 // End-to-end check of BOTH model-lineup branches with the EXACT resolver

@@ -88,9 +88,9 @@ func TestWriteInjectAttachmentsEmptyCaption(t *testing.T) {
 func TestSafeAttachmentName(t *testing.T) {
 	cases := map[string]string{
 		"plain.txt":          "plain.txt",
-		"../../evil.sh":       "evil.sh",
-		"a/b/c.png":           "c.png",
-		"":                    "attachment-1",
+		"../../evil.sh":      "evil.sh",
+		"a/b/c.png":          "c.png",
+		"":                   "attachment-1",
 		"weird\x00name.json": "weird_name.json",
 	}
 	for in, want := range cases {

@@ -152,7 +152,7 @@ func (b *terminalEventBatcher) DropTerminal(terminalSessionID string) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-		// Seal pending output into the daemon-local ring without waking the remote
+	// Seal pending output into the daemon-local ring without waking the remote
 	// stream. If a terminal panel opens later, SnapshotUndeliveredTerminal can
 	// replay only the bytes that were never forwarded.
 	_ = b.takeLocked(terminalSessionID)

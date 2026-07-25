@@ -11,10 +11,10 @@ import (
 func TestDetectClaudeAlias(t *testing.T) {
 	notFound := errors.New("not found")
 	cases := []struct {
-		name     string
-		env      map[string]string
-		path     map[string]string // command -> resolved path; missing means lookup fails
-		want     Alias
+		name string
+		env  map[string]string
+		path map[string]string // command -> resolved path; missing means lookup fails
+		want Alias
 	}{
 		{
 			name: "env_override_wins_even_with_other_signals",

@@ -73,7 +73,7 @@ func TestExtractMessageEventsHidesModelCommandRecords(t *testing.T) {
 			"type": "user",
 			"uuid": "stdout",
 			"message": map[string]any{
-					"content": "<local-command-stdout>Set model to \x1b[1manthropic-compatible-fast\x1b[22m and saved as your default for new sessions</local-command-stdout>",
+				"content": "<local-command-stdout>Set model to \x1b[1manthropic-compatible-fast\x1b[22m and saved as your default for new sessions</local-command-stdout>",
 			},
 		},
 	}

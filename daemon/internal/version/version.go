@@ -12,8 +12,8 @@ import "fmt"
 
 var (
 	Version = "0.0.0-dev"
-	Commit = "dev"
-	Date   = "unknown"
+	Commit  = "dev"
+	Date    = "unknown"
 )
 
 // String returns "pockly-daemon vX.Y.Z (commit, date)".
