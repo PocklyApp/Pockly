@@ -13,6 +13,17 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Tooling that runs in Node, not the browser.
+    files: ["scripts/**/*.mjs", "*.config.{js,ts}"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      globals: {
+        console: "readonly",
+        process: "readonly",
+      },
+    },
+  },
+  {
     files: ["public/sw.js"],
     languageOptions: {
       ecmaVersion: 2022,
