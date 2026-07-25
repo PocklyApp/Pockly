@@ -1,0 +1,85 @@
+name: CI
+
+# Runs the Tier 1 checks from docs/testing.md: everything that needs no
+# credentials, no provider access, and no live infrastructure. Keep this in sync
+# with the command list in CONTRIBUTING.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Nexus and web
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # public-boundary.test.js scans git-tracked files, so it needs the
+          # index, not just a snapshot of the working tree.
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      # Includes nexus/test/public-boundary.test.js, which fails the build on
+      # leaked deployment detail or documentation that no longer matches code.
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run web:lint
+
+      - name: Typecheck
+        run: npm run web:typecheck
+
+      - name: Build
+        run: npm run web:build
+
+  daemon:
+    name: Daemon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.23'
+          cache-dependency-path: daemon/go.sum
+
+      - name: Verify gofmt
+        working-directory: daemon
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "gofmt needed on:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet
+        working-directory: daemon
+        run: go vet ./...
+
+      # Real-agent tests skip themselves when their POCKLY_* variables are
+      # unset, so this stays credential-free. See docs/testing.md.
+      - name: Test
+        working-directory: daemon
+        run: go test ./...
+
+      - name: Build
+        working-directory: daemon
+        run: make build
