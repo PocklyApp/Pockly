@@ -135,7 +135,7 @@ test.describe("composer run-config pills — stale daemon-offline self-heal", ()
   });
 
   test("does not request live diff until the diff drawer is opened", async ({ page }) => {
-    let phase: Phase = "ok";
+    const phase: Phase = "ok";
     let diffRequests = 0;
     await installRoutes(page, () => phase, { onDiff: () => { diffRequests += 1; } });
 

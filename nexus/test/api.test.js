@@ -992,6 +992,11 @@ describe("Nexus api", () => {
         POCKLY_HOT_TURNS_PER_SESSION: "20",
         POCKLY_HOT_TURNS_PER_USER: "6",
         POCKLY_FORCE_GLOBAL_HOT_TURN_PRUNE: "1",
+        // This test isolates the per-user cap. The fixture timestamps below are
+        // fixed, so leave the age-based TTL leg of the prune out of it —
+        // otherwise the assertions silently change meaning once wall-clock time
+        // moves past the default TTL window.
+        POCKLY_HOT_TURN_TTL_DAYS: "36500",
       },
     });
     const cookie = await loginCookie(env);

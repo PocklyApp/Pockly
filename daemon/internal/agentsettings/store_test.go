@@ -382,7 +382,7 @@ func TestReadModelOptionDetailsUsesClaudeSettingsEnv(t *testing.T) {
 		switch opt.Value {
 		case "opus":
 			opus = opt
-			case "anthropic-compatible-fast":
+		case "anthropic-compatible-fast":
 			settingsDefault = opt
 		}
 	}
@@ -494,8 +494,13 @@ func TestApplyRejectsNoSession(t *testing.T) {
 
 // Without a custom Anthropic-compatible provider, the menu is the OFFICIAL
 // Claude Code lineup (what the CLI's own /model picker shows), not the bare
-// alias trio. Env-dependent like its sibling tests: a dev machine whose
-// ~/.claude settings configure a custom provider flips the branch.
+// alias trio.
+//
+// Clearing the process env is not enough to reach that branch: ReadSettingsEnv
+// also reads ~/.claude/settings.json, so a contributor whose real settings point
+// claude at a gateway would see the alias trio and fail here. Point
+// CLAUDE_CONFIG_DIR at an empty temp dir so the test observes a fresh install
+// regardless of the machine it runs on.
 func TestReadModelOptionsOfficialLineupWithoutCustomProvider(t *testing.T) {
 	for _, key := range []string{
 		"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_AUTH_TOKEN",
@@ -503,6 +508,7 @@ func TestReadModelOptionsOfficialLineupWithoutCustomProvider(t *testing.T) {
 	} {
 		t.Setenv(key, "")
 	}
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
 	got := ReadModelOptions(t.TempDir())
 	for _, want := range []string{"claude-fable-5", "claude-fable-5[1m]", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"} {
 		found := false
