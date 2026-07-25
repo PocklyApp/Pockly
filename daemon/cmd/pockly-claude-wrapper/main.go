@@ -316,17 +316,17 @@ func run(cfg config) error {
 			fmt.Fprintf(os.Stderr, "[pockly wrapper] permission MCP enabled via %s\n", mcpConfigPath)
 		}
 	}
-	// Install a compatibility PreToolUse hook entry into the user's
-	// ~/.claude/settings.json. It is a fallback diagnostics/bridge path
-	// for Claude prompts that do not reach the permission-prompt-tool
-	// flow. Cleanup defer removes only Pockly-owned entries on wrapper
-	// exit and self-heals stale entries from prior wrapper crashes.
-	// Disabled when POCKLY_DISABLE_PERMISSION_HOOK=1.
+	// Remove any PreToolUse hook entry an older wrapper version installed
+	// into the user's ~/.claude/settings.json. We no longer install one:
+	// Claude's native permission model is authoritative and we bridge via
+	// permission-prompt-tool instead. This only strips Pockly-owned
+	// entries, leaving adjacent user-owned hooks untouched.
+	// Skipped when POCKLY_DISABLE_PERMISSION_HOOK=1.
 	hookCleanup, hookErr := setupHookBridge(resolvePocklyDaemonPath())
 	if hookErr != nil && cfg.debug {
-		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge setup: %v\n", hookErr)
+		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge cleanup: %v\n", hookErr)
 	} else if hookErr == nil && cfg.debug {
-		fmt.Fprintf(os.Stderr, "[pockly wrapper] hook bridge installed in claude settings.json\n")
+		fmt.Fprintf(os.Stderr, "[pockly wrapper] stale hook entries cleared from claude settings.json\n")
 	}
 	if hookCleanup != nil {
 		defer hookCleanup()

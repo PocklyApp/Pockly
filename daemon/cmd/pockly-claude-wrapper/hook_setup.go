@@ -19,14 +19,14 @@ import (
 // the settings.json shape pure to claude's published spec — anyone
 // (claude itself, a different tool, the user) reading the file just
 // sees a normal hook config they can edit freely without breaking
-// claude. We only ever REMOVE matches on cleanup, never overwrite
-// adjacent user-owned entries.
+// claude. Newer wrappers no longer write these entries at all; we only
+// ever REMOVE matches, never overwrite adjacent user-owned entries.
 const hookSentinel = "pockly-daemon hook-bridge"
 
-// hookEnvDisable is the env var the user sets to suppress hook
-// installation entirely. Honored even when daemonBin resolves —
-// gives a fast off-switch when something goes wrong without
-// reverting wrapper code.
+// hookEnvDisable is the env var the user sets to skip touching
+// settings.json entirely, including the stale-entry cleanup below.
+// Honored even when daemonBin resolves — gives a fast off-switch when
+// something goes wrong without reverting wrapper code.
 const hookEnvDisable = "POCKLY_DISABLE_PERMISSION_HOOK"
 
 // setupHookBridge no longer installs Pockly as a Claude permission hook.
@@ -35,16 +35,15 @@ const hookEnvDisable = "POCKLY_DISABLE_PERMISSION_HOOK"
 // only removes stale hook entries left by older wrapper versions.
 //
 // Returns:
-//   - no-op cleanup func; stale entries are removed immediately
+//   - no-op cleanup func; stale entries are removed immediately, so
+//     there is nothing left to undo on exit
 //   - error if reading / writing settings.json failed; caller logs +
-//     continues silently (claude still runs, just w/o auto-mode)
+//     continues silently (claude still runs, just with the stale entry
+//     left in place)
 //
 // Atomic write: temp file in same dir + rename. Even if the wrapper
 // crashes mid-write, the worst case is a leftover temp file — never
 // a half-written settings.json.
-//
-// If a prior wrapper crashed without cleanup, the next wrapper's cleanup
-// removes its stale entry too — self-healing.
 //
 // Skipped silently when POCKLY_DISABLE_PERMISSION_HOOK=1 or when
 // daemonBin can't be located.
